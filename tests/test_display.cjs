@@ -1,0 +1,2379 @@
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+const ui = require('../site/app.js');
+const data = JSON.parse(fs.readFileSync(path.join(__dirname, '../dist/data.json'), 'utf8'));
+const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
+  (_, entity) => ({amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'"})[entity]);
+
+// A small fixture for the markup this renderer produces. It does not model
+// layout; it resolves real rendered tags and models programmatic focus, including
+// detached nodes, disabled controls, and explicit negative tabindex on headings.
+function renderedDocument(events, focusLog) {
+  let html = '', generation = 0, nodes = [];
+  const body = {tagName: 'BODY'};
+  const document = {activeElement: body};
+  function matches(node, selector) {
+    const tagged = selector.match(/^([a-z][\w-]*)(\[.*\])?$/i);
+    if (tagged) return node.tagName === tagged[1].toUpperCase() && (!tagged[2] || matches(node, tagged[2]));
+    if (selector.startsWith('#')) return node.getAttribute('id') === selector.slice(1);
+    if (/^\.[\w-]+$/.test(selector)) return (node.getAttribute('class') || '').split(/\s+/).includes(selector.slice(1));
+    const attribute = selector.match(/^\[([\w-]+)(?:=["']([^"']*)["'])?\]$/);
+    return !!attribute && (attribute[2] === undefined
+      ? node.hasAttribute(attribute[1]) : node.getAttribute(attribute[1]) === attribute[2]);
+  }
+  function findAll(selector, scope) {
+    return nodes.filter(node => (!scope || (node.offset >= scope.contentStart && node.offset < scope.contentEnd))
+      && matches(node, selector));
+  }
+  function find(selector, scope) {
+    const node = findAll(selector, scope)[0] || null;
+    if (node) node.lastSelector = selector;
+    return node;
+  }
+  const page = {
+    contains(node) { return nodes.includes(node); },
+    get innerHTML() { return html; },
+    set innerHTML(value) {
+      html = value; generation++; document.activeElement = body;
+      nodes = [...html.matchAll(/<([a-z][\w:-]*)\b([^<>]*?)>/gi)].map(match => {
+        const attributes = new Map([...match[2].matchAll(/([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g)]
+          .map(([, name, double, single, bare]) => [name.toLowerCase(), decode(double ?? single ?? bare ?? '')]));
+        const tag = match[1].toUpperCase(), renderedGeneration = generation;
+        const contentStart = match.index + match[0].length;
+        const closing = html.indexOf('</' + match[1].toLowerCase() + '>', contentStart);
+        return {
+          tagName: tag, offset: match.index, contentStart, contentEnd: closing < 0 ? contentStart : closing,
+          dataset: Object.fromEntries([...attributes].filter(([name]) => name.startsWith('data-'))
+            .map(([name, val]) => [name.slice(5).replace(/-([a-z])/g, (_, char) => char.toUpperCase()), val])),
+          textContent: decode(closing < 0 ? '' : html.slice(contentStart, closing).replace(/<[^>]*>/g, '')),
+          getAttribute(name) { return attributes.get(name) ?? null; },
+          hasAttribute(name) { return attributes.has(name); },
+          setAttribute(name, val) { attributes.set(name, String(val)); },
+          querySelector(selector) { return find(selector, this); },
+          // Controller tests dispatch directly from rendered controls.
+          closest(selector) { return matches(this, selector) ? this : null; },
+          getBoundingClientRect() { return {top: 0, width: 360}; },
+          scrollIntoView() {},
+          focus(options) {
+            const control = ['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(tag);
+            const native = control || (tag === 'A' && attributes.has('href'));
+            const explicit = /^-?\d+$/.test(attributes.get('tabindex') ?? '');
+            if (renderedGeneration !== generation || attributes.has('hidden') || attributes.has('inert')
+                || (control && attributes.has('disabled')) || (tag === 'INPUT' && attributes.get('type') === 'hidden')
+                || (!native && !explicit)) return;
+            document.activeElement = this;
+            focusLog.push({selector: this.lastSelector, generation: renderedGeneration, options});
+          },
+        };
+      });
+    },
+    get generation() { return generation; },
+  };
+  Object.assign(document, {
+    querySelector: selector => selector === '#app' ? page : find(selector),
+    querySelectorAll: selector => findAll(selector),
+    getElementById: id => find('#' + id),
+    addEventListener(type, callback) { events.set(type, callback); },
+  });
+  return {document, page};
+}
+
+// Test the real controller without source rewriting or a browser-only VM.
+function application(search = '', dataset = data, defaultDesign = '1', release = null) {
+  const events = new Map(), windowEvents = new Map(), focusLog = [];
+  const {document, page} = renderedDocument(events, focusLog);
+  const location = {search, hash: '', assign() {}, reload() {}};
+  const entries = [search]; let position = 0;
+  function applyLocation(value) {
+    const parsed = new URL(value || '', 'https://example.test/');
+    location.search = parsed.search; location.hash = parsed.hash;
+  }
+  applyLocation(search);
+  const browser = {
+    DEFAULT_DESIGN: defaultDesign,
+    location, document,
+    navigator: {clipboard: {async writeText() {}}},
+    history: {
+      pushState(_state, _title, url) { entries.splice(++position); entries.push(url); applyLocation(url); },
+      replaceState(_state, _title, url) { entries[position] = url; applyLocation(url); },
+    },
+    addEventListener(type, callback) { windowEvents.set(type, callback); }, scrollTo() {}, scrollBy() {},
+  };
+  const app = ui.createObservatory(dataset, browser, release);
+  function travel(delta) {
+    assert.ok(position + delta >= 0 && position + delta < entries.length, 'history entry exists');
+    position += delta; applyLocation(entries[position]); windowEvents.get('popstate')();
+  }
+  return {app, page, browser, events, windowEvents, focusLog, back: () => travel(-1), forward: () => travel(1)};
+}
+function chart(id, dataset = data) { return dataset.charts.find(c => c.id === id); }
+function element(width = 360) {
+  const attributes=new Map();
+  return {getBoundingClientRect() { return {width}; }, innerHTML: '',
+    setAttribute(name,value) { attributes.set(name,String(value)); },
+    getAttribute(name) { return attributes.get(name)??null; }};
+}
+function click(controller, selector, expectedData = {}, modifiers = {}) {
+  const {document} = controller.browser;
+  const control = document.querySelectorAll(selector).find(node =>
+    Object.entries(expectedData).every(([key, value]) => node.dataset[key] === value));
+  assert.ok(control, `No rendered control for ${selector} ${JSON.stringify(expectedData)}`);
+  assert.ok(['A', 'BUTTON', 'INPUT'].includes(control.tagName), 'Click target must be an interactive control');
+  assert.ok(control.tagName !== 'A' || control.hasAttribute('href'), 'Clicked link must have a destination');
+  assert.ok(!control.hasAttribute('disabled') && !control.hasAttribute('hidden') && !control.hasAttribute('inert'),
+    'Click target must be enabled');
+  control.focus({preventScroll: true});
+  controller.events.get('click')({target: control, button: 0, preventDefault() {}, ...modifiers});
+}
+
+// These expectations come from the source metric/label contract, not from
+// parsing the displayed PromQL or reconstructing the implementation's map.
+const expectedSelectors = new Map([
+  ['transport_rejections','tor_relay_dos_total{type=~"concurrent_conn_rejected|conn_rejected"}'],
+  ['circuit_rejections','tor_relay_dos_total{type="circuit_rejected"}'],
+  ['directory_requests','tor_relay_begindir_request_total{type=~"hs_get|hs_post|no_request"}'],
+  ['introduction_rejections','tor_relay_dos_total{type="introduce2_rejected"}'],
+  ['queue_limit_circuits','tor_relay_dos_total{type=~"circuit_killed_max_cell|circuit_killed_max_cell_outq"}'],
+  ['protocol_closes','tor_relay_circ_proto_violation_total'],
+  ['onionskin_drops','tor_relay_load_onionskins_total{action="dropped",type=~"fast|ntor|tap"}'],
+  ['directory_rejections','tor_relay_dos_total{type=~"begindir_hsdir_rejected|begindir_rate_rejected|begindir_rejected"}'],
+  ['hsdir_fetches','tor_relay_hsdir_fetch_total{action=~"not_found|refused|single_hop|success"}'],
+  ['hsdir_uploads','tor_relay_hsdir_upload_total{action=~"bad_url|invalid|not_newer|refused|single_hop|success"}'],
+  ['directory_waiting','tor_relay_begindir_connections{state="command_wait"}'],
+  ['open_circuits','tor_relay_circuits_total{state="opened"}'],
+  ['exit_stream_rejections','tor_relay_dos_total{type="stream_rejected"}'],
+]);
+const selectorTokens = (c, series) => ui.metricSelectorTokens(c, series);
+const selectorStrings = (c, series) => selectorTokens(c,series).map(tokens=>tokens.map(token=>token.text).join(''));
+const displayedSeries = c => c.series.filter(series=>c.display_keys.includes(series.key));
+function selectorMarkup(html) {
+  return [...html.matchAll(/<code class="metric-selector">([\s\S]*?)<\/code>/g)].map(([,body])=>({
+    html:body, text:decode(body.replace(/<[^>]*>/g,'')),
+    values:[...body.matchAll(/<span class="metric-selector-value">([\s\S]*?)<\/span>/g)].map(([,text])=>decode(text)),
+  }));
+}
+assert.equal(expectedSelectors.size,13);
+const ranges = data.time_ranges.periods.map(period => period.id);
+const defaultRange = data.time_ranges.default_range;
+for (const [id,expected] of expectedSelectors) {
+  const c=chart(id),series=displayedSeries(c),before=JSON.stringify(c);
+  assert.deepEqual(selectorStrings(c,series),[expected],id+' selects the actual source labels');
+  assert.equal(JSON.stringify(c),before,'selector preparation does not mutate release data');
+  const values=[...expected.matchAll(/(?:=|=~)"([^"]+)"/g)].flatMap(([,value])=>value.split('|'));
+  const tokens=selectorTokens(c,series)[0];
+  assert.deepEqual(tokens.filter(token=>token.highlight).map(token=>token.text),values,id+' highlights values only');
+  assert.ok(tokens.every(token=>typeof token.text==='string'&&(!token.breakAfter||!token.highlight)),
+    'line-break opportunities occur at selector boundaries, not inside highlighted values');
+  for (const range of ranges) {
+    const html=application('?view=explorer&chart='+id+'&range='+range).app.markup();
+    const rendered=selectorMarkup(html);
+    assert.deepEqual(rendered.map(item=>item.text),[expected],id+' Explorer subtitle matches plotted series');
+    assert.deepEqual(rendered[0].values,values);
+    assert.equal(rendered[0].text,expected,'highlight and wbr tags add no formatting whitespace');
+    if(expected.includes('{'))assert.match(rendered[0].html,/<wbr>/,'selectors have mobile wrap opportunities');
+    const queries=[...html.matchAll(/<pre>([\s\S]*?)<\/pre>/g)].map(([,text])=>decode(text));
+    assert.equal(queries[0],c.history_queries.daily.value,'the full reproduction query is unchanged');
+    assert.equal(queries[1],c.history_queries.daily.eligible,'coverage query is unchanged');
+  }
+}
+for (const range of ranges) for (const layout of ['full','grid']) {
+  const html=application('?view=overview&range='+range+'&layout='+layout+'&band=1&series=concurrent_conn_rejected').app.markup();
+  assert.deepEqual(selectorMarkup(html).map(item=>item.text),data.families.map(family=>expectedSelectors.get(family.primary)),
+    'overview uses every plotted series, independently of Explorer selection or band state');
+}
+
+const transportSource=chart('transport_rejections');
+const rate=transportSource.series.find(series=>series.key==='conn_rejected');
+const concurrent=transportSource.series.find(series=>series.key==='concurrent_conn_rejected');
+assert.deepEqual(selectorStrings(transportSource,[rate,concurrent,rate]),
+  ['tor_relay_dos_total{type=~"conn_rejected|concurrent_conn_rejected"}'],'deduplication preserves first plotted order');
+assert.deepEqual(selectorStrings(chart('onionskin_drops'),[{key:'ntor'}]),
+  ['tor_relay_load_onionskins_total{action="dropped",type="ntor"}'],'ntor is not expanded to ntor_v3');
+assert.deepEqual(selectorStrings(chart('queue_limit_circuits'),[{key:'circuit_killed_max_cell'}]),
+  ['tor_relay_dos_total{type="circuit_killed_max_cell"}'],'the total is a real counter, not a sum of both types');
+for (const [id,key,expected] of [
+  ['circuit_rejections','circuit_rejections','tor_relay_dos_total{type="circuit_rejected"}'],
+  ['introduction_rejections','introduction_rejections','tor_relay_dos_total{type="introduce2_rejected"}'],
+  ['exit_stream_rejections','exit_stream_rejections','tor_relay_dos_total{type="stream_rejected"}'],
+  ['hsdir_uploads','invalid','tor_relay_hsdir_upload_total{action="invalid"}'],
+  ['hsdir_fetches','refused','tor_relay_hsdir_fetch_total{action="refused"}'],
+  ['directory_requests','circuit_dead','tor_relay_begindir_request_total{type="circuit_dead"}'],
+]) assert.deepEqual(selectorStrings(chart(id),[{key}]),[expected]);
+for (const [c,series] of [
+  [{...transportSource,id:'constructor'},displayedSeries(transportSource)],
+  [{...transportSource,metrics:['different_metric']},displayedSeries(transportSource)],
+  [{...transportSource,metrics:['tor_relay_dos_total','second_metric']},displayedSeries(transportSource)],
+  [transportSource,[rate,{key:'constructor'}]], [transportSource,[{key:'__proto__'}]],
+  [transportSource,[{key:'conn_rejected|.*'}]], [transportSource,[]],
+  [chart('directory_waiting'),[{key:'unknown'}]],
+]) {
+  assert.deepEqual(selectorStrings(c,series),c.metrics,'unrecognized source bindings retain bare metric names');
+  assert.ok(selectorTokens(c,series).flat().every(token=>!token.highlight),'fallback does not invent or highlight labels');
+}
+
+const selectorBandData=structuredClone(data);
+for (const c of selectorBandData.charts) for (const series of c.series) {
+  Object.assign(series.reference.day,{n:100,p10_per_relay:0,p50_per_relay:1,p90_per_relay:2});
+}
+for (const range of ranges) for (const [id,key,focused] of [
+  ['transport_rejections','conn_rejected','tor_relay_dos_total{type="conn_rejected"}'],
+  ['hsdir_fetches','single_hop','tor_relay_hsdir_fetch_total{action="single_hop"}'],
+  ['onionskin_drops','ntor','tor_relay_load_onionskins_total{action="dropped",type="ntor"}'],
+]) {
+  const full=application('?view=explorer&chart='+id+'&range='+range+'&series='+key,selectorBandData).app.markup();
+  assert.deepEqual(selectorMarkup(full).map(item=>item.text),[expectedSelectors.get(id)],'headline-only selection leaves all plot selectors');
+  const active=application('?view=explorer&chart='+id+'&range='+range+'&series='+key+'&band=1',selectorBandData).app.markup();
+  assert.deepEqual(selectorMarkup(active).map(item=>item.text),[focused],'an available band focuses the selector with the plot');
+  for (const cause of ['too-few','flat']) {
+    const unavailable=structuredClone(selectorBandData),series=chart(id,unavailable).series.find(series=>series.key===key);
+    if(cause==='too-few')series.reference.day.n=1;
+    else series.reference.day.p90_per_relay=0;
+    const html=application('?view=explorer&chart='+id+'&range='+range+'&series='+key+'&band=1',unavailable).app.markup();
+    assert.deepEqual(selectorMarkup(html).map(item=>item.text),[expectedSelectors.get(id)],'an unavailable band still plots all selectors');
+  }
+}
+const selectorController=application('?view=explorer&chart=transport_rejections&range=all',selectorBandData);
+selectorController.app.start();
+const selectorSelect=selectorController.browser.document.querySelector('[data-series-select]');
+selectorSelect.value='concurrent_conn_rejected';selectorController.events.get('change')({target:selectorSelect});
+assert.deepEqual(selectorMarkup(selectorController.page.innerHTML).map(item=>item.text),[expectedSelectors.get('transport_rejections')]);
+click(selectorController,'[data-band-toggle]');
+assert.deepEqual(selectorMarkup(selectorController.page.innerHTML).map(item=>item.text),['tor_relay_dos_total{type="concurrent_conn_rejected"}']);
+click(selectorController,'[data-band-toggle]');
+assert.deepEqual(selectorMarkup(selectorController.page.innerHTML).map(item=>item.text),[expectedSelectors.get('transport_rejections')]);
+
+const hostileSelector=structuredClone(data),hostileMetric='metric<svg onload="alert(1)">&value';
+chart('transport_rejections',hostileSelector).metrics=[hostileMetric,'second"metric'];
+const escapedSelectors=selectorMarkup(application('?view=explorer&chart=transport_rejections',hostileSelector).app.markup());
+assert.deepEqual(escapedSelectors.map(item=>item.text),[hostileMetric,'second"metric']);
+assert.ok(escapedSelectors.every(item=>item.values.length===0));
+assert.match(escapedSelectors[0].html,/&lt;svg onload=&quot;alert\(1\)&quot;&gt;&amp;value/);
+assert.doesNotMatch(escapedSelectors.map(item=>item.html).join(''),/<svg|onload="|class="metric-selector-value"/);
+const unknownSelector=structuredClone(data),unknownChart=chart('transport_rejections',unknownSelector);
+unknownChart.id='constructor';
+for (const family of unknownSelector.families) {
+  family.children=family.children.map(id=>id==='transport_rejections'?'constructor':id);
+  if(family.primary==='transport_rejections')family.primary='constructor';
+}
+assert.deepEqual(selectorMarkup(application('?view=explorer&chart=constructor',unknownSelector).app.markup()).map(item=>item.text),
+  ['tor_relay_dos_total'],'newer unknown charts remain renderable without fabricated selectors');
+const unknownSeriesData=structuredClone(data),unknownSeriesChart=chart('transport_rejections',unknownSeriesData);
+unknownSeriesChart.series[0].key='constructor';
+unknownSeriesChart.display_keys[0]='constructor';
+assert.deepEqual(selectorMarkup(application('?view=explorer&chart=transport_rejections',unknownSeriesData).app.markup()).map(item=>item.text),
+  ['tor_relay_dos_total'],'one unknown plotted class makes the whole source selector fall back');
+
+assert.equal(ui.number(451.82), '452');
+assert.equal(ui.number(0.044), '<1');
+assert.equal(ui.number(0), '0');
+for (const value of [null, NaN, Infinity, '42']) assert.equal(ui.number(value), 'Unavailable');
+assert.equal(ui.axisNumber(2.5), '2.5');
+for (const [value, expected] of [
+  [0.00009, '9e-5'], [0.0001, '0.0001'], [0.01234, '0.012'],
+  [0.9999, '1'], [1.234, '1.23'], [999.999, '1,000'], [1000.1, '1,000'],
+  [1e6, '1M'], [1234567, '1.2M'], [1e12, '1e+12'], [-1234, '-1,234'],
+]) assert.equal(ui.axisNumber(value), expected);
+const tickStart=Date.UTC(2026,9,26)/1000,tickEnd=Date.UTC(2026,10,18)/1000;
+for(const width of [240,262]){
+  const ticks=ui.xAxisTicks(tickStart,tickEnd,width,62,12,'all');
+  assert.deepEqual(ticks.map(t=>t.label),['26 Oct 2026','18 Nov 2026'],
+    'a narrow short-history chart retains full endpoint dates without an overlapping interior tick');
+  assert.deepEqual(ticks.map(t=>t.t),[tickStart,tickEnd]);
+}
+for(const width of [262,360,481.6,1100,1920])for(const days of [1,2,23,120,121,365]){
+  const end=tickStart+days*86400,ticks=ui.xAxisTicks(tickStart,end,width,62,12,'all');
+  assert.equal(ticks[0].t,tickStart);assert.equal(ticks.at(-1).t,end);
+  assert.ok(ticks.length>=2&&ticks.length<=9);
+  assert.ok(ticks.slice(1).every((tick,i)=>tick.label!==ticks[i].label),'adjacent date/month labels are distinct');
+  if(ticks.length>2){
+    const boxes=ticks.map(tick=>{
+      const position=62+(tick.t-tickStart)/(end-tickStart)*(width-74),size=tick.label.length*8;
+      const start=position-(tick.anchor==='end'?size:tick.anchor==='middle'?size/2:0);
+      return [start,start+size];
+    });
+    assert.ok(boxes.slice(1).every((box,i)=>box[0]-boxes[i][1]>=8),'interior ticks leave the conservative eight-pixel gap');
+  }
+}
+assert.equal(ui.xAxisTicks(tickStart,tickStart+86400,1920,62,12,'all').length,2,
+  'one daily interval does not generate repeated same-day ticks');
+const monthTicks=ui.xAxisTicks(Date.UTC(2026,0,1)/1000,Date.UTC(2026,4,2)/1000,1920,62,12,'all');
+assert.ok(monthTicks.length<9,'month formatting reduces a preferred count that would repeat month labels');
+assert.ok(monthTicks.every(t=>/^[A-Za-z]+ 2026$/.test(t.label)));
+const yearTicks=ui.xAxisTicks(Date.UTC(2025,0,1)/1000,Date.UTC(2026,0,1)/1000,1920,62,12,'all');
+assert.equal(yearTicks.length,9);assert.equal(yearTicks[0].label,'Jan 2025');assert.equal(yearTicks.at(-1).label,'Jan 2026');
+const thirtyDayTicks=ui.xAxisTicks(tickEnd-30*86400,tickEnd,1920,62,12,'1mo').map(t=>t.label);
+assert.equal(thirtyDayTicks.length,9);
+assert.equal(thirtyDayTicks[0],'19 Oct 2026');
+assert.equal(thirtyDayTicks.at(-1),'18 Nov 2026');
+assert.equal(new Set(thirtyDayTicks).size,thirtyDayTicks.length,'30d charts use distinct UTC date labels across both endpoints');
+assert.deepEqual(ui.niceScale(913).ticks, [0, 250, 500, 750, 1000]);
+assert.equal(ui.ordinal(11), '11th');
+assert.equal(ui.ordinal(23), '23rd');
+assert.equal(ui.percentile({n: 200, current_percentile: 0}).text, '0th percentile');
+assert.equal(ui.percentile({n: 200, current_percentile: 0}).rank, 0);
+assert.equal(ui.percentile({n: 200, current_percentile: 0.2}).text, '<1st percentile');
+assert.equal(ui.percentile({n: 100, flat_zero: true}).className, 'flat');
+assert.equal(ui.percentile({n: 100, reference_all_zero: true, flat_zero: false, current_percentile: 100}).rank, 100);
+assert.equal(ui.percentile({n: 23, current_percentile: 100}).className, 'unknown');
+assert.equal(ui.percentile({n: 100, current_percentile: 99}).text, '99th percentile');
+for (const count of [0, -1, 1.5, '100', Infinity]) {
+  assert.equal(ui.percentile({n: count, current_percentile: 99}).rank, null);
+}
+assert.equal(ui.percentile({n: 100, current_percentile: 89.8}).text, '<90th percentile');
+assert.equal(ui.percentile({n: 100, current_percentile: 99, display_rank: 99}).text, '99th percentile');
+assert.equal(ui.percentile({n: 100, current_percentile: 99, display_rank: '2'}).text, '99th percentile');
+for (const [rank, stale, expected] of [
+  [0, '<1', '0th percentile'],
+  [0.2, '0', '<1st percentile'],
+  [99, '>99', '99th percentile'],
+  [99.5, '100', '>99th percentile'],
+  [99.2, '<99', '99th percentile'],
+  [89.8, '90', '<90th percentile'],
+  [94.8, '95', '<95th percentile'],
+  [98.8, '99', '<99th percentile'],
+  [100, '>99', '100th percentile'],
+]) assert.equal(ui.percentile({n: 100, current_percentile: rank, display_rank: stale}).text, expected);
+
+// Finite extremes must produce a finite, increasing linear axis, including
+// numbers whose division underflows or whose rounded-up ceiling overflows.
+for (const maximum of [Number.MIN_VALUE, 1e-320, 1e-307, 1e307, Number.MAX_VALUE]) {
+  const axis = ui.niceScale(maximum);
+  assert.ok(Number.isFinite(axis.max) && axis.max >= maximum);
+  assert.equal(axis.ticks[0], 0);
+  assert.equal(axis.ticks.at(-1), axis.max);
+  assert.ok(axis.ticks.length >= 2 && axis.ticks.length <= 6);
+  assert.ok(axis.ticks.every((value, index) => Number.isFinite(value) && (!index || value > axis.ticks[index - 1])));
+  assert.ok(ui.axisNumber(maximum).length < 20, 'extreme tick labels remain readable');
+}
+
+const deep = application('?view=explorer&family=exit&all=directory,exit').app.getState();
+assert.equal(deep.chartId, 'exit_stream_rejections');
+assert.equal(deep.range, 'all');
+assert.equal(deep.layout, 'full');
+assert.equal(application('?view=invalid&family=invalid&series=%22bad').app.getState().view, 'overview');
+assert.equal(application('?view=explorer&family=exit&chart=invalid').app.getState().chartId, 'exit_stream_rejections');
+assert.equal(application('', data, '2').app.getState().range, 'all');
+assert.equal(application('', data, '3').app.getState().view, 'explorer');
+assert.equal(application('?range=24h&all=transport&layout=grid').app.getState().range, '1mo');
+assert.equal(application('?range=30d&all=transport&layout=grid').app.getState().range, '1mo');
+assert.equal(application('?range=1m&all=transport&layout=grid').app.getState().range, '1mo');
+assert.equal(application('?range=6m').app.getState().range, '6mo');
+assert.equal(application('?range=7d').app.getState().range, '7d');
+assert.equal(application('?range=12mo').app.getState().range, '12mo');
+assert.equal(application('?range=all&all=&layout=grid').app.getState().range, 'all');
+for (const value of ['stack','invalid','']) assert.equal(application('?layout='+value).app.getState().layout, 'full');
+assert.equal(application('?all=unknown').app.getState().range, defaultRange);
+assert.doesNotMatch(application().app.markup(), /Earlier running versions are not recorded/);
+
+const ids = data.families.map(f => f.id);
+// Every legacy per-card combination migrates to one explicit global period.
+for (let mask = 0; mask < 64; mask++) {
+  const expanded = ids.filter((_, i) => mask & (1 << i));
+  const oldLink = application('?layout=grid&all=' + expanded.join(',')).app;
+  assert.equal(oldLink.getState().range, mask ? 'all' : defaultRange);
+  assert.equal(oldLink.getState().layout, 'grid');
+  const params = new URLSearchParams(oldLink.url('overview').slice(1));
+  assert.equal(params.get('range'), mask ? 'all' : defaultRange);
+  assert.equal(params.get('layout'), 'grid');
+  assert.equal(params.has('all'), false);
+}
+function assertOverview(controller, expectedLayout, expectedRange) {
+  const state = controller.app.getState(), html = controller.page.innerHTML;
+  assert.equal(state.layout, expectedLayout); assert.equal(state.range, expectedRange);
+  const articles = [...html.matchAll(/<article\b[^>]*>/g)].map(([tag]) => ({
+    id: tag.match(/\bid="family-([^"]+)"/)[1],
+    range: tag.match(/\bdata-family-range="([^"]+)"/)[1],
+  }));
+  assert.deepEqual(articles.map(a => a.id), ids);
+  assert.ok(articles.every(a => a.range === expectedRange));
+  assert.match(html, new RegExp('class="chart-stack chart-' + expectedLayout + '"'));
+  assert.equal(controller.browser.document.querySelectorAll('[data-all-range]').length, ranges.length);
+  assert.equal(controller.browser.document.querySelectorAll('[data-layout]').length, 2);
+  assert.doesNotMatch(html, /data-card-range|data-card-family|data-range-select/);
+}
+for (const layout of ['full','grid']) for (const range of ranges) {
+  const controller = application('?view=overview&layout=' + layout + '&range=' + range);
+  controller.app.start(); assertOverview(controller, layout, range);
+  for (const family of data.families) {
+    const before = controller.app.getState();
+    click(controller, '[data-explore]', {explore: family.id, chart: family.primary});
+    assert.equal(controller.app.getState().familyId, family.id);
+    assert.equal(controller.app.getState().chartId, family.primary);
+    assert.equal(controller.app.getState().range, before.range);
+    assert.equal(controller.app.getState().layout, before.layout);
+    assert.equal(controller.browser.document.activeElement.textContent, 'Evidence explorer');
+    assert.equal(controller.browser.document.querySelectorAll('[data-all-range]').length, ranges.length);
+    assert.equal(controller.browser.document.querySelectorAll('[data-layout]').length, 0);
+    for (const link of controller.browser.document.querySelectorAll('[data-child]')) {
+      const params = new URLSearchParams(link.getAttribute('href').slice(1));
+      assert.equal(params.get('range'), before.range); assert.equal(params.get('layout'), layout);
+    }
+    const nextRange = ranges[(ranges.indexOf(before.range) + 1) % ranges.length];
+    click(controller, '[data-all-range]', {allRange: nextRange});
+    assert.equal(controller.app.getState().range, nextRange);
+    assert.equal(controller.app.getState().layout, layout);
+    assert.equal(controller.browser.document.activeElement, controller.browser.document.querySelector('[data-all-range="' + nextRange + '"]'));
+    click(controller, '[data-view]', {view: 'overview'});
+    assertOverview(controller, layout, nextRange);
+  }
+  const before = controller.app.getState(), nextLayout = layout === 'grid' ? 'full' : 'grid';
+  click(controller, '[data-layout]', {layout: nextLayout});
+  assertOverview(controller, nextLayout, before.range);
+  assert.equal(controller.browser.document.activeElement, controller.browser.document.querySelector('[data-layout="' + nextLayout + '"]'));
+  controller.back(); assertOverview(controller, layout, before.range);
+  assert.equal(controller.browser.document.activeElement.textContent, 'Overview');
+  controller.forward(); assertOverview(controller, nextLayout, before.range);
+  const parsed = ui.parseLocation(data, controller.browser.location.search, controller.browser.location.hash);
+  assert.deepEqual(parsed, controller.app.getState(), 'URL reconstructs global settings and selected family');
+}
+
+// Selected series/band survive global controls, view navigation and history.
+const controller = application('?view=explorer&chart=transport_rejections&range=all&layout=grid&series=concurrent_conn_rejected&band=1');
+controller.app.start();
+const selectedState = controller.app.getState();
+click(controller, '[data-all-range]', {allRange: '1mo'});
+assert.equal(controller.app.getState().seriesKey, selectedState.seriesKey);
+assert.equal(controller.app.getState().bandEnabled, true);
+click(controller, '[data-view]', {view: 'overview'});
+assertOverview(controller, 'grid', '1mo');
+assert.deepEqual(ui.parseLocation(data, controller.browser.location.search), controller.app.getState());
+click(controller, '[data-methods]', {});
+assert.equal(controller.browser.document.activeElement, controller.browser.document.getElementById('reference'));
+assert.equal(controller.browser.document.activeElement.tagName, 'H3');
+assert.equal(controller.browser.document.activeElement.textContent, '18-month reference');
+assert.equal(controller.browser.document.activeElement.getAttribute('tabindex'), '-1');
+assert.equal(controller.browser.document.querySelector('[data-view="methods"]').getAttribute('aria-current'), 'page');
+controller.back(); assertOverview(controller, 'grid', '1mo');
+controller.back();
+assert.equal(controller.app.getState().view, 'explorer');
+assert.equal(controller.app.getState().seriesKey, selectedState.seriesKey);
+assert.equal(controller.app.getState().bandEnabled, true);
+assert.equal(controller.browser.document.activeElement.textContent, 'Evidence explorer');
+controller.back(); assert.deepEqual(controller.app.getState(), selectedState);
+controller.forward(); assert.equal(controller.app.getState().range, '1mo');
+assert.throws(() => click(controller, '[data-layout]', {layout: 'full'}), /No rendered control/);
+assert.throws(() => click(controller, '[data-methods]', {}), /No rendered control/);
+
+// The static header/footer live outside #app; their links still carry settings
+// when opened in another tab instead of intercepted by the click handler.
+const outsideLinks = application('?range=all&layout=grid');
+const footer = {dataset:{view:'methods'},attributes:new Map(),setAttribute(key,value){this.attributes.set(key,value);}};
+const internalLinks = outsideLinks.browser.document.querySelectorAll;
+outsideLinks.browser.document.querySelectorAll = selector => selector==='[data-view]'
+  ? [...internalLinks(selector),footer] : internalLinks(selector);
+outsideLinks.app.start();
+assert.equal(footer.attributes.get('href'),outsideLinks.app.url('methods'));
+click(outsideLinks,'[data-all-range]',{allRange:'1mo'});
+const footerParams = new URLSearchParams(footer.attributes.get('href').slice(1));
+assert.equal(footerParams.get('range'),'1mo'); assert.equal(footerParams.get('layout'),'grid');
+
+// The shared navigation wraps on tablets and expands on mobile. Its measured
+// height must be reflected before a heading scroll, not just at initial load.
+const headerView=application('?view=overview'),headerStyles=new Map(),navClasses=new Set(),menuAttributes=new Map();
+let closedHeaderHeight=104,headerOffsetAtScroll=null;
+const nav={getBoundingClientRect:()=>({height:navClasses.has('show')?400:closedHeaderHeight})};
+const navLinks={classList:{remove:key=>navClasses.delete(key),contains:key=>navClasses.has(key),
+  toggle(key){if(navClasses.has(key))navClasses.delete(key);else navClasses.add(key);}}};
+const navToggle={setAttribute:(key,value)=>menuAttributes.set(key,String(value))};
+const headerQuery=headerView.browser.document.querySelector;
+headerView.browser.document.querySelector=selector=>({'.nav':nav,'.nav-links':navLinks,'.nav-toggle':navToggle}[selector]||headerQuery(selector));
+headerView.browser.document.documentElement={style:{setProperty:(key,value)=>headerStyles.set(key,value)}};
+const headerElement=headerView.browser.document.getElementById;
+headerView.browser.document.getElementById=id=>{
+  const node=headerElement(id);
+  if(node)node.scrollIntoView=()=>{headerOffsetAtScroll=headerStyles.get('--header-offset');};
+  return node;
+};
+const toggleHeader=()=>headerView.events.get('click')({target:{closest:selector=>selector==='.nav-toggle'?navToggle:null},button:0});
+headerView.app.start();
+assert.equal(headerStyles.get('--header-offset'),'120px');
+toggleHeader();assert.equal(headerStyles.get('--header-offset'),'416px');assert.equal(menuAttributes.get('aria-expanded'),'true');
+toggleHeader();assert.equal(headerStyles.get('--header-offset'),'120px');assert.equal(menuAttributes.get('aria-expanded'),'false');
+closedHeaderHeight=170.5;headerView.windowEvents.get('resize')();
+assert.equal(headerStyles.get('--header-offset'),'186.5px','resize immediately updates the anchor clearance');
+toggleHeader();click(headerView,'[data-methods]');
+assert.equal(headerOffsetAtScroll,'186.5px','the closed header is measured before scrolling to #reference');
+assert.equal(navClasses.has('show'),false);assert.equal(menuAttributes.get('aria-expanded'),'false');
+closedHeaderHeight=87;click(headerView,'[data-view]',{view:'overview'});
+assert.equal(headerStyles.get('--header-offset'),'103px','a render measures the current header geometry');
+for(const invalidHeight of [undefined,NaN,Infinity,-1]){
+  closedHeaderHeight=invalidHeight;headerView.windowEvents.get('resize')();
+  assert.equal(headerStyles.get('--header-offset'),'103px','invalid fake geometry does not write invalid CSS');
+}
+
+function relayRows(controller, familyId) {
+  let html = controller.page.innerHTML;
+  if (familyId) {
+    html = html.slice(html.indexOf('<article id="family-'+familyId+'"'));
+    html = html.slice(0,html.indexOf('</article>'));
+  }
+  return [...html.matchAll(/<div class="relay-population"([^>]*)>([\s\S]*?)<\/div>/g)]
+    .map(([,attributes,body])=>({text:decode(body.replace(/<[^>]*>/g,'')),
+      pairs:[...body.matchAll(/<span class="relay-count">([\s\S]*?)<\/span>/g)].map(([,text])=>decode(text)),
+      title:decode(attributes.match(/title="([^"]*)"/)?.[1] || '')}));
+}
+function roleSummary(total, guard, middle_only, exit, hsdir, v2dir, windows=1) {
+  return {total,guard,middle_only,exit,hsdir,v2dir,measured_windows:windows,
+    classified_windows:windows,relay_windows:total*windows,
+    classified_relay_windows:total*windows,coverage:1,role_bounds:null};
+}
+const roleData = structuredClone(data), roleChart = chart('transport_rejections',roleData);
+const rolePrimary = roleChart.series.find(series=>series.key===roleChart.primary_series);
+const roleSecondary = roleChart.series.find(series=>series.key!==roleChart.primary_series);
+rolePrimary.relay_counts = {
+  day:roleSummary(101,80,1,0,90,95),
+  seven_days:roleSummary(151,11,21,1,31,41,7),
+  one_month:roleSummary(202,12,22,2,32,42,31),
+  three_months:roleSummary(252,19,29,9,39,49,92),
+  six_months:roleSummary(303,13,23,3,33,43,177),
+  twelve_months:roleSummary(353,16,26,6,36,46,365),
+  all_time:roleSummary(404,14,24,4,34,44,517),
+};
+roleSecondary.relay_counts = {
+  day:roleSummary(505,15,25,5,35,45),
+  seven_days:roleSummary(555,11,21,1,31,41,7),
+  one_month:roleSummary(606,16,26,6,36,46,31),
+  three_months:roleSummary(656,12,22,2,32,42,92),
+  six_months:roleSummary(707,17,27,7,37,47,177),
+  twelve_months:roleSummary(757,13,23,3,33,43,365),
+  all_time:roleSummary(808,18,28,8,38,48,517),
+};
+const dynamicSlotPeriod = range => {
+  const active = data.time_ranges.card_slots.fixed.includes(range)
+    ? data.time_ranges.card_slots.fallback_dynamic : range;
+  return data.time_ranges.periods.find(p => p.id === active);
+};
+const expectedRowText = summaryKey => {
+  const c = rolePrimary.relay_counts[summaryKey];
+  const prefix = summaryKey === 'day' ? '• Relays' : '• Relays (avg)';
+  return `${prefix}: ${c.total} total · ${c.guard} guard · ${c.middle_only} middle-only · ${c.exit} exit · ${c.hsdir} HSDir · ${c.v2dir} V2Dir`;
+};
+for (const layout of ['full','grid']) for (const range of ranges) for (const view of ['overview','explorer']) {
+  const controller = application('?view='+view+'&range='+range+'&layout='+layout+'&chart=transport_rejections',roleData);
+  controller.app.start();
+  const rows = relayRows(controller,view==='overview'?'transport':null);
+  const dynamicPeriod = dynamicSlotPeriod(range);
+  const expectedRows = ['day', dynamicPeriod.summary_key, 'six_months', 'all_time'].map(expectedRowText);
+  assert.deepEqual(rows.map(row=>row.text),expectedRows,
+    'each statistic uses its own contributor population across the adaptive 2x2 grid');
+  for(const row of rows)assert.deepEqual(row.pairs,row.text.split(': ')[1].split(' · '),
+    'each complete count/role pair wraps together without changing its visible text');
+  assert.match(rows[0].title,/Recorded flag coverage: 100%/);
+  assert.match(rows[0].title,/flag groups can overlap/);
+  assert.match(rows[1].title,new RegExp(`Mean daily contributing relays across ${rolePrimary.relay_counts[dynamicPeriod.summary_key].measured_windows} measured days`));
+  assert.match(rows[2].title,/Mean daily contributing relays across 177 measured days/);
+  if (view==='explorer') {
+    const select = controller.browser.document.querySelector('[data-series-select]');
+    select.value = roleSecondary.key;
+    controller.events.get('change')({target:select});
+    const selected = relayRows(controller);
+    assert.match(selected[0].text,/505 total · 15 guard · 25 middle-only · 5 exit · 35 HSDir · 45 V2Dir/);
+    assert.match(selected[1].text,new RegExp(`${roleSecondary.relay_counts[dynamicPeriod.summary_key].total} total`));
+    assert.match(selected[2].text,/707 total/);
+    assert.match(selected[3].text,/808 total/);
+    assert.equal(controller.browser.document.activeElement,controller.browser.document.querySelector('[data-series-select]'));
+    assert.equal(controller.app.getState().layout,layout); assert.equal(controller.app.getState().range,range);
+  }
+}
+const expectedPrimaryRows = ['day', 'one_month', 'six_months', 'all_time'].map(expectedRowText);
+const unknownRoles = structuredClone(roleData), unknownSeries = chart('transport_rejections',unknownRoles).series.find(series=>series.key===roleChart.primary_series);
+unknownSeries.relay_counts.day = roleSummary(0,0,0,0,0,0);
+unknownSeries.current.day.relays = 0;
+for (const role of ['guard','middle_only','exit','hsdir','v2dir']) unknownSeries.relay_counts.one_month[role] = null;
+unknownSeries.relay_counts.one_month.classified_windows = 0;
+unknownSeries.relay_counts.one_month.classified_relay_windows = 0;
+unknownSeries.relay_counts.one_month.coverage = 0;
+unknownSeries.relay_counts.six_months = roleSummary(null,null,null,null,null,null,177);
+unknownSeries.historical_averages.six_months.status = 'insufficient_data';
+const unknownView = application('?view=explorer&chart=transport_rejections&range=all',unknownRoles);
+unknownView.app.start();
+const unknownRows = relayRows(unknownView);
+assert.equal(unknownRows[0].text,'• Relays: 0 total · 0 guard · 0 middle-only · 0 exit · 0 HSDir · 0 V2Dir');
+assert.equal(unknownRows[1].text,'• Relays (avg): 202 total · — guard · — middle-only · — exit · — HSDir · — V2Dir');
+assert.match(unknownRows[1].title,/Recorded flag coverage: 0%/);
+assert.equal(unknownRows[2].text,'• Relays: —','unavailable six-month metric leaves its average population unavailable');
+assert.deepEqual(unknownRows[2].pairs,[],'the unavailable population case remains unchanged');
+assert.equal(unknownRows[3].text,expectedPrimaryRows[3]);
+const partialRoles = structuredClone(roleData), partialSeries = chart('transport_rejections',partialRoles).series.find(series=>series.key===roleChart.primary_series);
+const partial = partialSeries.relay_counts.all_time;
+for (const role of ['guard','middle_only','exit','hsdir','v2dir']) partial[role] = null;
+partial.role_bounds = {guard:[14.25,16.75],middle_only:[24,26.5],exit:[0.1,2.6],hsdir:[34.7,37.2],v2dir:[44.99,47.49]};
+partial.classified_windows = 481;
+partial.classified_relay_windows -= 627;
+partial.coverage = partial.classified_relay_windows/partial.relay_windows;
+for (const layout of ['full','grid']) {
+  const bounded = application('?view=explorer&chart=transport_rejections&range=all&layout='+layout,partialRoles); bounded.app.start();
+  const row = relayRows(bounded)[3];
+  assert.equal(row.text,'• Relays (avg): 404 total · 14–17 guard · 24–27 middle-only · 0–3 exit · 34–38 HSDir · 44–48 V2Dir',
+    'partial classifications display outward-rounded bounds without replacing the measured-day total');
+  assert.match(row.title,/Recorded flag coverage: 99\.7%/);
+  assert.equal(row.pairs[1],'14–17 guard','a complete rounded range and its role remain one wrap unit');
+  assert.match(row.title,/Ranges include unclassified relays; endpoints are rounded outward/);
+  assert.doesNotMatch(row.title,/confidence/);
+  assert.equal(relayRows(bounded)[0].text,expectedPrimaryRows[0],'complete current counts remain exact');
+}
+for (const [coverage, expected] of [[0.99999,'>99.9%'],[0.00001,'<0.1%'],[1,'100%'],[0,'0%']]) {
+  partial.coverage = coverage;
+  const edge = application('?view=explorer&chart=transport_rejections&range=all',partialRoles); edge.app.start();
+  assert.ok(relayRows(edge)[3].title.includes('Recorded flag coverage: '+expected+'.'),
+    'rounded coverage preserves the distinction between partial, absent and complete evidence');
+}
+for (const invalidCoverage of [null,NaN,Infinity,-1,1.1,'0.9']) {
+  partial.coverage = invalidCoverage;
+  const invalid = application('?view=explorer&chart=transport_rejections&range=all',partialRoles); invalid.app.start();
+  assert.doesNotMatch(relayRows(invalid)[3].title,/Recorded flag coverage/);
+}
+for (const invalidBounds of [[-1,3],[4,3],[0,405],[0,Infinity],['1',3],[1],null]) {
+  partial.role_bounds.guard = invalidBounds;
+  const invalid = application('?view=explorer&chart=transport_rejections&range=all',partialRoles); invalid.app.start();
+  assert.match(relayRows(invalid)[3].text,/404 total · — guard/);
+}
+unknownSeries.current.day.relays = null; unknownSeries.relay_counts.day.total = null;
+const noPopulation = application('?view=explorer&chart=transport_rejections',unknownRoles); noPopulation.app.start();
+assert.equal(relayRows(noPopulation)[0].text,'• Relays: —','unknown population is not reported as zero');
+const fractionalRoles=structuredClone(roleData),fractionalPrimary=chart('transport_rejections',fractionalRoles).series.find(s=>s.key===roleChart.primary_series);
+fractionalPrimary.relay_counts.all_time.guard=.5;
+const fractionalView=application('?view=explorer&chart=transport_rejections&range=all',fractionalRoles);fractionalView.app.start();
+assert.equal(relayRows(fractionalView)[3].pairs[1],'<1 guard');
+assert.match(fractionalView.page.innerHTML,/<span class="relay-count">&lt;1 guard<\/span>/,
+  'less-than counts are escaped without altering the displayed value');
+delete unknownSeries.relay_counts;
+unknownSeries.current.day.relays = 29;
+const legacyPopulation = application('?view=explorer&chart=transport_rejections&range=all',unknownRoles); legacyPopulation.app.start();
+assert.deepEqual(relayRows(legacyPopulation).map(row=>row.text),[
+  '• Relays: 29 total · — guard · — middle-only · — exit · — HSDir · — V2Dir',
+  '• Relays: —','• Relays: —','• Relays: —',
+], 'old releases use only current measured totals and do not infer historical roles');
+const populationMethods = application('?view=methods',roleData).app.markup();
+assert.match(populationMethods,/Middle-only means Running with Guard, Exit, HSDir and V2Dir off/);
+assert.match(populationMethods,/Exact role counts require complete flag coverage/);
+assert.match(populationMethods,/ranges include unclassified relays over the same contributing windows; endpoints are rounded outward/);
+assert.match(populationMethods,/<h3>Dir-spec coarsening<\/h3>/);
+assert.match(populationMethods,/<h3>Current DirCache 0 cohort<\/h3>/);
+assert.match(populationMethods,/configuration and matching flags for the latest complete UTC day/);
+
+const withGap = structuredClone(chart('transport_rejections'));
+withGap.start = 30 * 86400;
+withGap.end = 31 * 86400;
+for (const series of withGap.series) {
+  series.history.daily = Array.from({length: 31}, (_, index) => [(index + 1) * 86400, index + 1, 104, 1, true]);
+}
+withGap.series[1].history.daily[0][1] = null;
+withGap.series[1].history.daily[0][4] = false;
+withGap.series[1].history.daily[1][1] = Infinity;
+const mobile = element();
+application().app.draw(mobile, withGap, '1mo');
+assert.equal((mobile.innerHTML.match(/<rect /g) || []).length, 2);
+assert.doesNotMatch(mobile.innerHTML, /NaN|Infinity/);
+const sourceRows = [...mobile.innerHTML.matchAll(/<text[^>]*y="([^"]+)"[^>]*class="source"/g)].map(x => x[1]);
+assert.equal(new Set(sourceRows).size, 2);
+
+const bandApp = application('?view=explorer&family=transport&chart=transport_rejections&range=1mo&band=1').app;
+const withBand = structuredClone(chart('transport_rejections'));
+withBand.end = 30 * 86400;
+withBand.start = withBand.end - 86400;
+const selected = withBand.series.find(s => s.key === 'conn_rejected');
+selected.history.daily = [[29 * 86400, 100, 100, 1, true], [30 * 86400, 200, 200, 1, true]];
+selected.reference.day = {n: 100, p10_per_relay: 1, p50_per_relay: 2, p90_per_relay: 3};
+withBand.series = [selected];
+withBand.display_keys = ['conn_rejected'];
+for (const bandRange of ranges) {
+  const widePlot = element(800);
+  bandApp.draw(widePlot, withBand, bandRange);
+  const heights = [...widePlot.innerHTML.matchAll(/class="reference-band"[^>]+height="([^"]+)"/g)].map(x => Number(x[1]));
+  assert.equal(heights.length, 2, '10th-90th band renders on ' + bandRange);
+  assert.ok(Math.abs(heights[1] / heights[0] - 2) < 1e-9, 'each interval uses its own population on ' + bandRange);
+  assert.match(widePlot.innerHTML, /reference-median/);
+}
+const extremeBand = structuredClone(withBand);
+extremeBand.display_scale = 0.1;
+extremeBand.end = 86400;
+extremeBand.series[0].history.daily = [[86400, 100, 3, 1, true]];
+extremeBand.series[0].reference.day = {n: 100, p10_per_relay: 2e307, p50_per_relay: 5e307, p90_per_relay: 8e307};
+const finiteBand = element(800);
+bandApp.draw(finiteBand, extremeBand, 'all');
+assert.doesNotMatch(finiteBand.innerHTML, /NaN|Infinity/);
+const bound = finiteBand.innerHTML.match(/class="reference-band"[^>]+y="([^"]+)"[^>]+height="([^"]+)"/);
+assert.ok(bound, 'three factors with a finite final product retain the band interval');
+assert.ok(Math.abs(Number(bound[1]) - 70.4) < 1e-9, 'upper bound is 2.4e307 on a 3e307 axis');
+assert.ok(Math.abs(Number(bound[2]) - 133.2) < 1e-9, 'band spans 6e306 through 2.4e307');
+const overflowingBand = structuredClone(extremeBand);
+overflowingBand.display_scale = 10;
+const absentBand = element(800);
+bandApp.draw(absentBand, overflowingBand, 'all');
+assert.doesNotMatch(absentBand.innerHTML, /reference-band|reference-median|NaN|Infinity/);
+assert.match(absentBand.innerHTML, /measurement-series/, 'nonfinite final bounds suppress the band, not valid measurements');
+for (const median of [undefined, NaN, Infinity, 4]) {
+  const invalid = structuredClone(withBand);
+  invalid.series[0].reference.day.p50_per_relay = median;
+  const output = element(800);
+  bandApp.draw(output, invalid, 'all');
+  assert.doesNotMatch(output.innerHTML, /reference-band|reference-median|NaN|Infinity/);
+  assert.match(output.innerHTML, /<path class="measurement-series" d="M[^"]+"/,
+    'invalid reference suppresses only the band, not measured observations');
+}
+
+// Omitted tail rows remain gaps through the latest complete UTC day.
+const staleHistory = structuredClone(chart('transport_rejections'));
+const day = value => Date.parse(value + 'T00:00:00Z') / 1000;
+staleHistory.end = day('2026-11-18');
+for (const series of staleHistory.series) {
+  series.history.daily = [
+    [day('2026-11-15'), 10, 100, 1, true],
+    [day('2026-11-16'), 12, 100, 1, true],
+  ];
+}
+const tail = ui.preparePlot(staleHistory, staleHistory.series, 'all');
+assert.equal(tail.start, day('2026-11-14'), 'start is the first qualifying interval');
+assert.equal(tail.end, day('2026-11-18'));
+assert.deepEqual(tail.missing.map(([t]) => t), [day('2026-11-17'), day('2026-11-18')]);
+const tailPlot = element(800);
+application().app.draw(tailPlot, staleHistory, 'all');
+assert.equal((tailPlot.innerHTML.match(/<rect /g) || []).length, 2);
+
+function statSections(html) {
+  const starts = [...html.matchAll(/<div class="stat ([^"]*)">/g)];
+  return starts.map((match,index)=>({classes:match[1],
+    html:html.slice(match.index,starts[index+1]?.index ?? html.length)}));
+}
+for (const span of ranges) {
+  const viewMarkup = application('?view=explorer&chart=transport_rejections&range=' + span).app.markup();
+  const slot2 = dynamicSlotPeriod(span);
+  const labels = statSections(viewMarkup).map(section => section.html.match(/<div class="stat-label">([^<]+)<\/div>/)?.[1]);
+  assert.deepEqual(labels, ['24-hour average', slot2.average_label, 'Last 6 months average', 'All-time average'],
+    'adaptive 2x2 stat grid on ' + span);
+  assert.equal((viewMarkup.match(/class="stat-number"/g) || []).length, 4, '2x2 stat grid on ' + span);
+  const csvPattern = new RegExp(`exports\\/transport_rejections-${slot2 && span ? data.time_ranges.periods.find(p => p.id === span).export_suffix : ''}\\.csv`);
+  assert.match(viewMarkup, csvPattern, 'Explorer CSV link uses active period export_suffix on ' + span);
+}
+const directory = application('?view=explorer&chart=directory_requests&range=all').app.markup();
+const sixMonths = chart('directory_requests').series.find(s => s.key === 'hs_get').historical_averages.six_months;
+assert.ok(directory.includes(`${sixMonths.days} / ${sixMonths.expected_days} days`));
+assert.equal((statSections(directory).slice(0,2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
+  'directory_requests 1mo partial window is ready under zero minimum_coverage alongside 24h');
+const directoryGated = structuredClone(data);
+chart('directory_requests', directoryGated).series.find(s => s.key === 'hs_get').historical_averages.one_month.status = 'insufficient_data';
+assert.equal((statSections(application('?view=explorer&chart=directory_requests&range=all', directoryGated).app.markup()).slice(0,2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 1,
+  'explicit insufficient_data 1mo window still suppresses the Current 24h ruler');
+const directory7d = application('?view=explorer&chart=directory_requests&range=7d').app.markup();
+assert.equal((statSections(directory7d).slice(0,2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
+  'directory_requests 7d window is ready and displays its Current 24h ruler');
+
+const comparisonData = structuredClone(data), comparisonChart = chart('transport_rejections',comparisonData);
+const comparisonSeries = comparisonChart.series.find(series=>series.key===comparisonChart.primary_series);
+function comparison(n, rank, flat_zero=false) {
+  return {method:'daily-per-relay-midrank-v1',cutoff:data.reference_cutoff,n,
+    start:n?data.reference_cutoff-n*86400:null,end:n?data.reference_cutoff:null,
+    current_percentile:rank,flat_zero};
+}
+Object.assign(comparisonSeries.current.day,{valid:true,value:12,display:'12'});
+comparisonSeries.historical_averages.seven_days.comparison = comparison(7,91);
+comparisonSeries.historical_averages.one_month.comparison = comparison(30,92);
+comparisonSeries.historical_averages.three_months.comparison = comparison(90,93);
+comparisonSeries.historical_averages.six_months.comparison = comparison(116,99);
+comparisonSeries.historical_averages.twelve_months.comparison = comparison(300,95);
+comparisonSeries.historical_averages.all_time.comparison = comparison(400,99.7);
+for (const layout of ['full','grid']) for (const range of ranges) {
+  const view = application('?view=explorer&chart=transport_rejections&layout='+layout+'&range='+range,comparisonData);
+  view.app.start();
+  const panels = statSections(view.page.innerHTML);
+  const slot2 = dynamicSlotPeriod(range);
+  assert.equal(panels.length,4);
+  assert.equal((view.page.innerHTML.match(/class="historical-comparison"/g) || []).length,3);
+  assert.match(view.page.innerHTML,/18-month average: <b>/);
+  assert.doesNotMatch(view.page.innerHTML,/Reference mean:|Last complete hour|Sampled 1h fleet peak/);
+  assert.match(view.page.innerHTML,/Recorded 24h fleet peak:/);
+  assert.match(view.page.innerHTML,/Average of available qualifying 24-hour UTC windows per relay within the 18-month reference, scaled to this period’s reporting-relay count/);
+  assert.equal(panels[1].classes,'long-term-stat');
+  assert.equal(panels[2].classes,'long-term-stat','the historical mean does not receive the current-rank color class');
+  assert.equal(panels[3].classes,'long-term-stat');
+  const expectedSlot2Rank = comparisonSeries.historical_averages[slot2.summary_key].comparison.current_percentile;
+  assert.match(panels[1].html,new RegExp(`Current 24h: ${ui.ordinal(expectedSlot2Rank)} percentile`));
+  assert.match(panels[2].html,/class="percentile high">Current 24h: 99th percentile/);
+  assert.match(panels[3].html,/class="percentile high">Current 24h: &gt;99th percentile/);
+  assert.match(panels[2].html,/aria-label="Current 24h: 99th percentile on a zero-to-100 percentile scale"/);
+  assert.match(panels[2].html,/116 qualifying daily intervals\./);
+  assert.match(panels[3].html,/400 qualifying daily intervals\./);
+  assert.match(panels[3].html,/\d+ [A-Za-z]+ \d{4}–\d+ [A-Za-z]+ \d{4} UTC/);
+  assert.match(panels[3].html,/Current 24-hour and historical values are divided by their reporting-relay counts/);
+  assert.ok(panels[1].html.includes('>'+comparisonSeries.historical_averages[slot2.summary_key].display+' <small>'));
+  assert.ok(panels[2].html.includes('>'+comparisonSeries.historical_averages.six_months.display+' <small>'));
+}
+const oldComparisons = structuredClone(comparisonData);
+for (const series of chart('transport_rejections',oldComparisons).series) {
+  for (const summary of Object.values(series.historical_averages)) delete summary.comparison;
+}
+assert.doesNotMatch(application('?view=explorer&chart=transport_rejections&range=all',oldComparisons).app.markup(),/historical-comparison/);
+for (const [changes,scale] of [
+  [{valid:false},1], [{valid:undefined},1], [{value:null,valid:true},1], [{value:-1,valid:true},1],
+  [{value:Infinity,valid:true},1], [{value:Number.MAX_VALUE,valid:true},2],
+]) {
+  const invalid = structuredClone(comparisonData), item = chart('transport_rejections',invalid);
+  const series = item.series.find(series=>series.key===item.primary_series);
+  Object.assign(series.current.day,changes); item.display_scale=scale;
+  const panels = statSections(application('?view=explorer&chart=transport_rejections&range=all',invalid).app.markup()).slice(1);
+  for (const panel of panels) {
+    assert.match(panel.html,/Current 24h: Percentile unavailable/);
+    assert.doesNotMatch(panel.html,/class="rank-ruler/);
+  }
+}
+const comparisonEdges = structuredClone(comparisonData), edgeSeries = chart('transport_rejections',comparisonEdges).series.find(series=>series.key===comparisonChart.primary_series);
+edgeSeries.historical_averages.six_months.status='insufficient_data';
+edgeSeries.historical_averages.all_time.comparison=comparison(23,99.7);
+let edgePanels = statSections(application('?view=explorer&chart=transport_rejections&range=all',comparisonEdges).app.markup());
+assert.doesNotMatch(edgePanels[2].html,/class="rank-ruler/);
+assert.match(edgePanels[2].html,/Insufficient historical coverage/);
+assert.match(edgePanels[3].html,/class="percentile unknown">Current 24h: &gt;99th percentile/);
+assert.match(edgePanels[3].html,/23 reference windows/);
+edgeSeries.historical_averages.all_time.comparison=comparison(0,null);
+edgePanels=statSections(application('?view=explorer&chart=transport_rejections&range=all',comparisonEdges).app.markup());
+assert.match(edgePanels[3].html,/No reference observations/);
+assert.doesNotMatch(edgePanels[3].html,/class="rank-ruler/);
+Object.assign(edgeSeries.current.day,{value:0,valid:true,display:'0'});
+edgeSeries.historical_averages.all_time.comparison=comparison(100,null,true);
+edgePanels=statSections(application('?view=explorer&chart=transport_rejections&range=all',comparisonEdges).app.markup());
+assert.match(edgePanels[3].html,/Current 24h: Percentile —/);
+assert.match(edgePanels[3].html,/Reference values are all zero/);
+assert.doesNotMatch(edgePanels[3].html,/class="rank-ruler/);
+const anotherSeries = comparisonChart.series.find(series=>series.key!==comparisonChart.primary_series);
+anotherSeries.historical_averages.one_month.comparison=comparison(30,5);
+anotherSeries.historical_averages.six_months.comparison=comparison(100,11);
+anotherSeries.historical_averages.all_time.comparison=comparison(300,22);
+const selectedComparison = application('?view=explorer&chart=transport_rejections&range=all&layout=grid',comparisonData);
+selectedComparison.app.start();
+const comparisonSelect = selectedComparison.browser.document.querySelector('[data-series-select]');
+comparisonSelect.value=anotherSeries.key; selectedComparison.events.get('change')({target:comparisonSelect});
+const selectedPanels=statSections(selectedComparison.page.innerHTML);
+assert.match(selectedPanels[1].html,/Current 24h: 5th percentile/);
+assert.match(selectedPanels[2].html,/Current 24h: 11th percentile/);
+assert.match(selectedPanels[3].html,/Current 24h: 22nd percentile/);
+assert.equal(selectedComparison.app.getState().layout,'grid');
+assert.equal(selectedComparison.app.getState().range,'all');
+assert.equal(selectedComparison.browser.document.activeElement,selectedComparison.browser.document.querySelector('[data-series-select]'));
+
+const valuesTable = directory.match(/<table data-values-table>([\s\S]*?)<\/table>/)[1];
+const tableHeaders = [...valuesTable.matchAll(/<th>(.*?)<\/th>/g)].map(([,h]) => decode(h));
+assert.deepEqual(tableHeaders, ['Series', 'Unit', '24-hour average', ...data.time_ranges.periods.map(p => p.average_label)]);
+assert.equal(tableHeaders.length, 9, '2 label columns + 7 data columns');
+const rows = [...valuesTable.matchAll(/<tr><td>(.*?)<\/td><td>(.*?)<\/td>/g)]
+  .map(([, name, unit]) => [decode(name), decode(unit)]);
+const tableBodyRows = [...valuesTable.matchAll(/<tbody>([\s\S]*?)<\/tbody>/g)][0][1].match(/<tr>[\s\S]*?<\/tr>/g);
+assert.ok(tableBodyRows.every(rowHtml => (rowHtml.match(/<td>/g) || []).length === 9));
+const expectedUnits = {
+  hs_get: 'requests/s', hs_post: 'requests/s', consensus: 'requests/s', microdesc: 'requests/s',
+  descriptor: 'requests/s', other_get: 'requests/s', other_post: 'requests/s',
+  no_request: 'streams/s', unparsed: 'classifications/s', circuit_dead: 'classifications/s',
+};
+assert.equal(rows.length, chart('directory_requests').series.length);
+assert.deepEqual(rows, chart('directory_requests').series.map(series => [series.name, expectedUnits[series.key]]));
+
+// All dataset text/attributes are encoded; palette and download URLs are bounded.
+const hostile = structuredClone(data);
+hostile.families[0].icon = '<img src=x onerror=alert(1)>';
+hostile.reference_window.date = '<img src=x onerror=alert(1)>';
+hostile.reference_document = 'javascript:alert(1)';
+hostile.charts[0].series[0].color = '\" onmouseover=\"alert(1)';
+const overview = application('', hostile).app.markup();
+assert.doesNotMatch(overview, /<img src=x|onmouseover=/);
+assert.match(overview, /&lt;img/);
+const methods = application('?view=methods', hostile).app.markup();
+assert.doesNotMatch(methods, /<img src=x|href="javascript:/);
+assert.match(methods, /href="data.json" download data-focus-key="methods-reference">Download the frozen reference/);
+
+// Probe text and attribute contexts that are not ordinary chart titles.
+const injected = structuredClone(data), injectedChart = chart('transport_rejections', injected);
+const payload = '\"><img src=x onerror=alert(1)>';
+const injectedSeries = injectedChart.series.find(s => s.key === injectedChart.primary_series);
+injectedSeries.reference.day.n = payload;
+injectedSeries.current.day.relays = payload;
+injectedSeries.peaks.day.fleet_peak_relays = payload;
+injectedChart.id = payload;
+const group = injected.families.find(f => f.id === injectedChart.family_id);
+group.children = group.children.map(id => id === 'transport_rejections' ? payload : id);
+group.primary = payload;
+const injectedMarkup = application('?view=explorer&chart=' + encodeURIComponent(payload), injected).app.markup();
+assert.doesNotMatch(injectedMarkup, /<img src=x/);
+assert.match(injectedMarkup, /data-child="&quot;&gt;&lt;img/);
+assert.match(injectedMarkup, /href="exports\/%22%3E%3Cimg/);
+assert.doesNotMatch(application('', injected).app.markup(), /<img src=x/);
+
+// Query/hash contents only select known state; modified links keep native
+// browser behavior instead of changing the current view.
+for (const search of ['?view=' + encodeURIComponent(payload), '?view=explorer&chart=' + encodeURIComponent(payload),
+  '?view=explorer&family=' + encodeURIComponent(payload) + '&range=' + encodeURIComponent(payload)]) {
+  assert.doesNotMatch(application(search).app.markup(), /<img src=x/);
+}
+assert.equal(ui.parseLocation(data, '?view=explorer', '#' + payload).chartId, 'directory_requests');
+const modified = application(); modified.app.start();
+for (const modifiers of [{ctrlKey: true}, {metaKey: true}, {shiftKey: true}, {altKey: true}, {button: 1}]) {
+  const generation = modified.page.generation;
+  let prevented = 0;
+  click(modified, '[data-view]', {view: 'explorer'}, {...modifiers, preventDefault() { prevented++; }});
+  assert.equal(prevented, 0, 'modified links preserve native navigation');
+  assert.equal(modified.app.getState().view, 'overview');
+  assert.equal(modified.page.generation, generation);
+}
+let ordinaryPrevented = 0;
+click(modified, '[data-view]', {view: 'explorer'}, {preventDefault() { ordinaryPrevented++; }});
+assert.equal(ordinaryPrevented, 1, 'the spy observes ordinary in-app link cancellation');
+assert.equal(modified.app.getState().view, 'explorer');
+
+const extremeChart = structuredClone(withGap);
+extremeChart.display_scale = 1;
+for (const value of [Number.MIN_VALUE, Number.MAX_VALUE]) {
+  for (const series of extremeChart.series) series.history.daily = [1, 2, 3, 4].map(d => [d * 86400, value, 104, 1, true]);
+  const output = element(); application().app.draw(output, extremeChart, '1mo');
+  assert.doesNotMatch(output.innerHTML, /NaN|Infinity|Invalid Date/);
+  assert.match(output.innerHTML, /measurement-series/);
+}
+extremeChart.display_scale = 3600;
+for (const series of extremeChart.series) {
+  series.history.daily = [null, [86400, 1, 104, 1, true], [172800, Number.MAX_VALUE, 104, 1, true],
+    [259200, -1, 104, 1, true], [345600, 2, 104, 1, true]];
+}
+extremeChart.end = 4 * 86400;
+const scaled = ui.preparePlot(extremeChart, extremeChart.series, 'all', data.time_ranges);
+assert.deepEqual(scaled.missing.map(([t]) => t), [172800, 259200]);
+const scaledPlot = element(); application().app.draw(scaledPlot, extremeChart, 'all');
+assert.doesNotMatch(scaledPlot.innerHTML, /NaN|Infinity/);
+assert.equal((scaledPlot.innerHTML.match(/<rect /g) || []).length, 2);
+extremeChart.end = Number.MAX_VALUE;
+assert.equal(ui.preparePlot(extremeChart, extremeChart.series, '1mo', data.time_ranges), null);
+extremeChart.end = 8.64e12;
+assert.equal(ui.preparePlot(extremeChart, extremeChart.series, 'all', data.time_ranges), null, 'corrupt range cannot allocate an unbounded gap grid');
+
+for (const value of [undefined, null, -1, Infinity, '1']) {
+  const missingCurrent = structuredClone(data), missingChart = chart('transport_rejections', missingCurrent);
+  const missingSeries = missingChart.series.find(s => s.key === missingChart.primary_series);
+  Object.assign(missingSeries.current.day, {value, valid: true, display: '1234'});
+  missingSeries.peaks.day.current_is_record = true;
+  const missingMarkup = application('?view=explorer&chart=transport_rejections', missingCurrent).app.markup();
+  assert.match(missingMarkup, /24-hour average<\/div><div class="stat-number">Unavailable/);
+  assert.equal((missingMarkup.match(/class="rank-ruler/g) || []).length, 0, 'invalid current value has no percentile marker');
+  assert.doesNotMatch(missingMarkup, /Highest recorded 24h fleet value/, 'an unavailable current value cannot claim a new record');
+}
+for (const [scale, value] of [
+  [2, Number.MAX_VALUE], [0, 1], [-1, 1], [Infinity, 1], [NaN, 1],
+]) {
+  const invalidScale = structuredClone(data), scaledChart = chart('transport_rejections', invalidScale);
+  scaledChart.display_scale = scale;
+  const scaledSeries = scaledChart.series.find(s => s.key === scaledChart.primary_series);
+  Object.assign(scaledSeries.current.day, {value, valid: true, display: '1234'});
+  scaledSeries.peaks.day.current_is_record = true;
+  const scaledMarkup = application('?view=explorer&chart=transport_rejections', invalidScale).app.markup();
+  assert.match(scaledMarkup, /24-hour average<\/div><div class="stat-number">Unavailable/);
+  assert.equal((scaledMarkup.match(/class="rank-ruler/g) || []).length, 0,
+    'headline and percentile use the same scaled-current eligibility');
+  assert.doesNotMatch(scaledMarkup, /Highest recorded 24h fleet value/, 'ineligible scaled values cannot claim a new record');
+}
+const referenceTexts = html => [...html.matchAll(/18-month average: <b>([^<]*)<\/b>/g)].map(match => match[1]);
+function assertUnavailableSummaries(html) {
+  assert.deepEqual(referenceTexts(html), ['Unavailable']);
+  assert.equal((html.match(/Recorded 24h fleet peak: Unavailable<\/div>/g) || []).length, 1);
+  for (const label of ['Last 1 month average', 'Last 6 months average', 'All-time average']) {
+    assert.match(html, new RegExp(label + '<\\/div><div class="stat-number"[^>]*>Unavailable'));
+  }
+  const table = html.match(/<table data-values-table>([\s\S]*?)<\/table>/)[1];
+  assert.doesNotMatch(table, /<td>9012<\/td>/, 'table averages reject the same invalid scale');
+}
+for (const scale of [0, -1, Infinity, NaN, undefined, '1']) for (const cached of [false, true]) {
+  const fixture = structuredClone(data), item = chart('transport_rejections', fixture);
+  const series = item.series.find(s => s.key === item.primary_series);
+  item.display_scale = scale;
+  series.reference.day.mean_per_relay = 2;
+  series.current.day.relays = 3;
+  if (cached) series.current.day.reference_display = '1234';
+  else delete series.current.day.reference_display;
+  series.current.day.peak_display = '5678';
+  series.peaks.day.fleet_peak = 2;
+  for (const period of data.time_ranges.periods) Object.assign(series.historical_averages[period.summary_key], {status: 'ready', value: 2, display: '9012'});
+  assertUnavailableSummaries(application('?view=explorer&chart=transport_rejections&range=all', fixture).app.markup());
+}
+for (const cached of [false, true]) {
+  const fixture = structuredClone(data), item = chart('transport_rejections', fixture);
+  const series = item.series.find(s => s.key === item.primary_series);
+  Object.assign(series.current.day, {valid: false, value: null, relays: 3});
+  series.reference.day.mean_per_relay = 2;
+  if (cached) series.current.day.reference_display = '6';
+  else delete series.current.day.reference_display;
+  const html = application('?view=explorer&chart=transport_rejections&range=all', fixture).app.markup();
+  assert.deepEqual(referenceTexts(html), ['6'], 'reference means survive insufficient current coverage');
+  assert.doesNotMatch(html, /class="rank-ruler/);
+}
+const overflowingSummaries = structuredClone(data), overflowingChart = chart('transport_rejections', overflowingSummaries);
+const overflowingSeries = overflowingChart.series.find(s => s.key === overflowingChart.primary_series);
+overflowingChart.display_scale = 2;
+overflowingSeries.reference.day.mean_per_relay = Number.MAX_VALUE;
+overflowingSeries.current.day.reference_display = '1234';
+overflowingSeries.peaks.day.fleet_peak = Number.MAX_VALUE;
+overflowingSeries.current.day.peak_display = '5678';
+for (const period of data.time_ranges.periods) Object.assign(overflowingSeries.historical_averages[period.summary_key], {value: Number.MAX_VALUE, display: '9012'});
+assertUnavailableSummaries(application('?view=explorer&chart=transport_rejections&range=all', overflowingSummaries).app.markup());
+overflowingChart.display_scale = 0.1;
+overflowingSeries.reference.day.mean_per_relay = 8e307;
+overflowingSeries.current.day.relays = 3;
+delete overflowingSeries.current.day.reference_display;
+assert.equal(referenceTexts(application('?view=explorer&chart=transport_rejections', overflowingSummaries).app.markup())[0],
+  ui.number((8e307 * 0.1) * 3), 'reference scaling retains a finite final product');
+const validZero = structuredClone(data), zeroChart = chart('transport_rejections', validZero);
+const zeroSeries = zeroChart.series.find(s => s.key === zeroChart.primary_series);
+Object.assign(zeroSeries.current.day, {value: 0, valid: true, display: '0'});
+Object.assign(zeroSeries.reference.day, {current_percentile: 0, flat_zero: false});
+const zeroMarkup = application('?view=explorer&chart=transport_rejections', validZero).app.markup();
+assert.match(zeroMarkup, /24-hour average<\/div><div class="stat-number">0 /);
+assert.match(zeroMarkup, />0th percentile<\/span>/);
+assert.match(zeroMarkup, /rank-marker" style="left:0%"/);
+const badTime = structuredClone(data); badTime.end = Number.MAX_VALUE;
+assert.match(application('?view=methods', badTime).app.markup(), /Saved snapshot · Unavailable Unavailable UTC/);
+for (const [timestamp, expected] of [
+  [8.64e12, '00:00'],
+  [-8.64e12, '00:00'],
+  [Date.parse('+010000-01-01T03:04:00Z') / 1000, '03:04'],
+]) {
+  const expandedYear = structuredClone(data); expandedYear.end = timestamp;
+  assert.match(application('?view=methods', expandedYear).app.markup(),
+    new RegExp('Saved snapshot · [^<]* ' + expected + ' UTC'), 'UTC clock is independent of year width');
+}
+
+const broken = structuredClone(data); broken.families[0].primary = 'missing-chart';
+const failed = application();
+failed.browser.ONIONSURGE_DATA = broken;
+failed.browser.document.getElementById = () => failed.page;
+assert.equal(ui.startObservatory(failed.browser), null);
+assert.equal(failed.page.textContent, 'Unable to load chart data. Please reload this page.');
+assert.equal(failed.events.size, 0, 'failed startup leaves no active controller handlers');
+
+// All ranges use the same plot dimensions at a given layout width.
+const plotDimensions = new Map();
+for (const item of data.charts) for (const span of ranges) {
+  const app = application('?view=explorer&chart=' + item.id + '&range=' + span).app;
+  for (const width of [240, 262, 360, 800, 1680]) {
+    const plot = element(width); app.draw(plot, item, span);
+    assert.doesNotMatch(plot.innerHTML, /NaN|Infinity|Invalid Date/, `${item.id}/${span}/${width}`);
+    assert.match(plot.innerHTML, /<svg|No retained samples/);
+    assert.equal((plot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g) || []).length, 1,
+      `one source credit: ${item.id}/${span}/${width}`);
+    const viewBox = plot.innerHTML.match(/viewBox="([^"]+)"/)?.[1];
+    if (viewBox) {
+      const key = item.id + '/' + width;
+      if (plotDimensions.has(key)) assert.equal(viewBox, plotDimensions.get(key), `stable range dimensions: ${key}`);
+      else plotDimensions.set(key, viewBox);
+    }
+  }
+}
+
+const emptyChart = structuredClone(chart('transport_rejections'));
+for (const series of emptyChart.series) {
+  series.history.daily = [];
+}
+for (const period of data.time_ranges.periods) {
+  const span = period.id;
+  const output = element(240);
+  const noDataView=application().app;
+  noDataView.draw(output, emptyChart, span);
+  assert.match(output.innerHTML, /No retained samples available/);
+  assert.equal((output.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g) || []).length, 1);
+  assert.equal(output.getAttribute('aria-label'),`${emptyChart.title}; ${period.plot_label}; linear scale; No retained samples available for this chart.`);
+  const restored=chart(emptyChart.id),baseline=element(240);
+  noDataView.draw(output,restored,span);noDataView.draw(baseline,restored,span);
+  assert.equal(output.getAttribute('aria-label'),`${restored.title}; ${period.plot_label}; linear scale. Use arrow keys to inspect intervals.`,
+    'returning observations restore the normal accessible chart description');
+  assert.equal(output.innerHTML,baseline.innerHTML,'accessible state changes do not change SVG output');
+  const zeroChart=structuredClone(restored);
+  for(const series of zeroChart.series){
+    series.history.daily=series.history.daily.map(row=>[row[0],0,...row.slice(2)]);
+  }
+  noDataView.draw(output,zeroChart,span);
+  assert.doesNotMatch(output.getAttribute('aria-label'),/No retained samples/,'measured zeros remain observations, not a no-data state');
+}
+
+function releaseContext(dataset,id,now) {
+  const suffixes=dataset.time_ranges?dataset.time_ranges.periods.map(p=>p.export_suffix):['30d','all-time'];
+  const paths=['data.json','manifest.json',dataset.reference_document,
+    ...dataset.charts.flatMap(item=>suffixes.map(span=>'exports/'+item.id+'-'+span+'.csv'))];
+  return {mode:'live',id,generatedAt:dataset.end+600,now,downloads:new Map(paths.map(file=>[file,'blob:'+id+'/'+file]))};
+}
+
+for (const layout of ['full','grid']) for (const range of ranges) {
+  for (const [view, selector] of [
+    ['overview','[data-all-range="'+range+'"]'],
+    ['overview','[data-layout="'+layout+'"]'],
+    ['explorer','[data-all-range="'+range+'"]'],
+    ['explorer','[data-chart-plot="transport_rejections"]'],
+  ]) {
+    const focused = application('?view='+view+'&range='+range+'&layout='+layout+'&chart=transport_rejections',
+      data,'1',releaseContext(data,'preferences-old',()=>data.end));
+    focused.app.start();
+    const before = focused.app.getState();
+    focused.browser.document.querySelector(selector).focus({preventScroll:true});
+    const fresh = structuredClone(data);
+    focused.app.replaceRelease(fresh,releaseContext(fresh,'preferences-new',()=>fresh.end));
+    assert.deepEqual(focused.app.getState(),before,'refresh preserves global range/layout and selection');
+    assert.equal(focused.browser.document.activeElement,focused.browser.document.querySelector(selector),
+      'refresh restores the selected control including chart plot focus');
+    assert.deepEqual(ui.parseLocation(data,focused.app.url(view)),before);
+  }
+}
+
+// Count reads of the real observations, rather than exposing cache internals.
+// Navigation may reuse a release's prepared plots; a replacement must prepare
+// them again, and a failed replacement must restore the prior release's cache.
+const cachedData = structuredClone(data), cachedChart = chart('transport_rejections', cachedData);
+let dailyReads = 0;
+for (const series of cachedChart.series) {
+  const daily = series.history.daily;
+  Object.defineProperty(series.history, 'daily', {enumerable: true, get() { dailyReads++; return daily; }});
+}
+const cachedView = application('?view=overview', cachedData);
+cachedView.app.start();
+const firstDefaultReads = dailyReads;
+assert.ok(firstDefaultReads > 0, 'initial default plot preparation reads daily observations');
+click(cachedView, '[data-view]', {view: 'methods'});
+click(cachedView, '[data-view]', {view: 'overview'});
+assert.equal(dailyReads, firstDefaultReads, 'view redraw retains default preparation');
+click(cachedView, '[data-all-range]', {allRange: 'all'});
+const afterAllReads = dailyReads;
+assert.ok(afterAllReads > firstDefaultReads, 'first All time view prepares all-time observations');
+click(cachedView, '[data-all-range]', {allRange: defaultRange});
+click(cachedView, '[data-all-range]', {allRange: 'all'});
+assert.equal(dailyReads, afterAllReads, 'range redraw reuses both default and all-time preparations');
+cachedView.app.replaceRelease(cachedData, releaseContext(cachedData, 'cache-new', () => data.end));
+assert.ok(dailyReads > afterAllReads, 'replacement resets preparation even for the same chart identities');
+const beforeRejectedPlot = element(); cachedView.app.draw(beforeRejectedPlot, cachedChart, 'all');
+const rejectedData = structuredClone(data);
+for (const series of chart('transport_rejections', rejectedData).series) {
+  series.history.daily = series.history.daily.map(row => [row[0], 1000000, ...row.slice(2)]);
+}
+const originalQueryAll = cachedView.browser.document.querySelectorAll;
+let rejectPlots = true;
+cachedView.browser.document.querySelectorAll = selector => {
+  if (selector === '[data-chart-plot]' && rejectPlots) { rejectPlots = false; throw new Error('reject prepared candidate'); }
+  return originalQueryAll(selector);
+};
+const readsBeforeFailure = dailyReads;
+assert.throws(() => cachedView.app.replaceRelease(rejectedData, releaseContext(rejectedData, 'cache-rejected', () => data.end)), /reject prepared candidate/);
+const afterRejectedPlot = element(); cachedView.app.draw(afterRejectedPlot, cachedChart, 'all');
+assert.equal(afterRejectedPlot.innerHTML, beforeRejectedPlot.innerHTML, 'rollback retains the old plot geometry');
+assert.equal(dailyReads, readsBeforeFailure, 'rollback restores the prior preparation cache');
+
+let liveNow=data.end+108001;
+const freshNow=data.end+7200;
+const firstRelease=releaseContext(data,'first',()=>freshNow);
+const liveView=application('?view=explorer&chart=transport_rejections&range=all&layout=grid&series=concurrent_conn_rejected&band=1',data,'1',firstRelease);
+liveView.app.start();
+assert.match(liveView.app.markup(),/Observed through/);
+assert.doesNotMatch(liveView.app.markup(),/Saved snapshot|Daily 00:00 UTC publication planned|Update delayed/);
+assert.match(liveView.app.markup(),/href="blob:first\/exports\/transport_rejections-all-time.csv" download="first-transport_rejections-all-time.csv"/);
+const selectedControl=liveView.browser.document.querySelector('[data-series-select]');selectedControl.focus({preventScroll:true});
+const priorState=liveView.app.getState(),clickHandler=liveView.events.get('click');
+const nextData=structuredClone(data);
+Object.assign(chart('transport_rejections',nextData).series.find(series=>series.key==='concurrent_conn_rejected').current.day,{value:42,display:'42'});
+liveView.app.replaceRelease(nextData,releaseContext(nextData,'second',()=>liveNow));
+assert.deepEqual(liveView.app.getState(),priorState,'release swap preserves view/range/series/band state');
+assert.equal(liveView.events.get('click'),clickHandler,'refresh does not register another controller');
+assert.equal(liveView.browser.document.activeElement,liveView.browser.document.querySelector('[data-series-select]'));
+assert.doesNotMatch(liveView.page.innerHTML,/blob:first\//);
+assert.match(liveView.page.innerHTML,/blob:second\/data.json/);
+assert.match(liveView.page.innerHTML,/24-hour average<\/div><div class="stat-number">42 /);
+const beforeAge=liveView.page.generation;liveNow++;
+liveView.app.updateFreshness({fallback:true,failed:true});
+assert.equal(liveView.page.generation,beforeAge,'freshness text does not redraw plots');
+assert.match(liveView.app.markup(),/Update delayed/);
+assert.match(liveView.app.markup(),/Showing previous verified release/);
+assert.match(liveView.app.markup(),/Refresh unavailable; retaining verified release/);
+const queryAll=liveView.browser.document.querySelectorAll;let failPlots=true;
+liveView.browser.document.querySelectorAll=selector=>{
+ if(selector==='[data-chart-plot]'&&failPlots){failPlots=false;throw new Error('plot render failure');}
+ return queryAll(selector);
+};
+assert.throws(()=>liveView.app.replaceRelease(data,releaseContext(data,'rejected',()=>liveNow)),/plot render failure/);
+assert.deepEqual(liveView.app.getState(),priorState);
+assert.match(liveView.page.innerHTML,/blob:second\/data.json/);
+assert.doesNotMatch(liveView.page.innerHTML,/blob:rejected\//);
+click(liveView,'[data-view]',{view:'methods'});
+assert.match(liveView.app.markup(),/Release <code>second<\/code>/);
+assert.match(liveView.app.markup(),/blob:second\/reference\//);
+assert.match(liveView.app.markup(),/blob:second\/manifest.json/);
+
+const refreshedReference=structuredClone(nextData);
+refreshedReference.reference_sha256='d'.repeat(64);
+refreshedReference.reference_id='reference-'+refreshedReference.reference_window.date+'-'+'d'.repeat(12);
+refreshedReference.reference_document='reference/'+refreshedReference.reference_id+'.json';
+for(const [search,key] of [
+ ['?view=explorer&chart=transport_rejections&range=7d','explorer-csv'],
+ ['?view=explorer&chart=transport_rejections&range=1mo','explorer-csv'],
+ ['?view=explorer&chart=transport_rejections&range=all','explorer-csv'],
+ ['?view=explorer&chart=transport_rejections','explorer-json'],
+ ['?view=explorer&chart=transport_rejections','explorer-permalink'],
+ ['?view=methods','methods-json'],
+ ['?view=methods','methods-reference'],
+ ['?view=methods','methods-manifest'],
+]){
+ const focused=application(search,data,'1',releaseContext(data,'focus-old',()=>liveNow));
+ focused.app.start();
+ const selector='[data-focus-key="'+key+'"]';
+ const oldLink=focused.browser.document.querySelector(selector);
+ assert.ok(oldLink&&oldLink.tagName==='A',key+' has a stable interactive focus target');
+ oldLink.focus({preventScroll:true});
+ const oldHref=oldLink.getAttribute('href');
+ focused.app.replaceRelease(refreshedReference,releaseContext(refreshedReference,'focus-new',()=>liveNow));
+ const nextLink=focused.browser.document.querySelector(selector);
+ assert.equal(focused.browser.document.querySelectorAll(selector).length,1,key+' remains unique');
+ assert.equal(focused.browser.document.activeElement,nextLink,key+' preserves keyboard focus after refresh');
+ assert.notEqual(nextLink,oldLink,'focus moves onto the newly rendered link');
+ assert.equal(nextLink.textContent,oldLink.textContent,key+' retains the selected link');
+ if(key==='explorer-permalink')assert.equal(nextLink.getAttribute('href'),oldHref);
+ else{
+  assert.notEqual(nextLink.getAttribute('href'),oldHref,key+' uses the new verified Blob URL');
+  assert.match(nextLink.getAttribute('href'),/^blob:focus-new\//);
+ }
+ if(key==='methods-reference')assert.equal(nextLink.getAttribute('href'),'blob:focus-new/'+refreshedReference.reference_document);
+}
+
+const patternSafe=structuredClone(withGap);
+patternSafe.id='a)b"c d';
+const patternPlot=element(800);
+application().app.draw(patternPlot,patternSafe,'1mo');
+const patId=patternPlot.innerHTML.match(/<pattern id="([^"]+)"/)?.[1];
+assert.ok(patId&&/^[A-Za-z0-9_-]+$/.test(patId),'SVG pattern ID is CSS/fragment-safe');
+assert.ok(patternPlot.innerHTML.includes(`fill="url(#${patId})"`));
+
+const shortHist=structuredClone(staleHistory);
+shortHist.end=day('2026-11-18')+3*3600;
+for(const series of shortHist.series){
+ series.history.daily=[[day('2026-11-17'),10,100,1,true],[day('2026-11-18'),12,100,1,true]];
+}
+const shortOut=element(800);
+application().app.draw(shortOut,shortHist,'all');
+const shortLabels=[...shortOut.innerHTML.matchAll(/<text[^>]*y="271"[^>]*>([^<]+)<\/text>/g)].map(m=>m[1]);
+assert.ok(shortLabels.length>0,'short history renders X-axis ticks');
+assert.equal(new Set(shortLabels).size,shortLabels.length,'no duplicate X-axis ticks on short history');
+
+const medHist=structuredClone(staleHistory);
+medHist.end=day('2026-11-18')+3*3600;
+for(const series of medHist.series){
+ series.history.daily=Array.from({length:150},(_,i)=>[day('2026-11-18')-(149-i)*86400,10,100,1,true]);
+}
+const medOut=element(1680);
+application().app.draw(medOut,medHist,'all');
+const medLabels=[...medOut.innerHTML.matchAll(/<text[^>]*y="331"[^>]*>([^<]+)<\/text>/g)].map(m=>m[1]);
+assert.ok(medLabels.length>0,'150-day history renders X-axis ticks');
+assert.equal(new Set(medLabels).size,medLabels.length,'no duplicate X-axis ticks on 150-day history');
+
+const dirReq=chart('directory_requests');
+for(const plotWidth of [482,452]){
+ const narrowDir=element(plotWidth);
+ application().app.draw(narrowDir,dirReq,'all');
+ const tickTexts=[...narrowDir.innerHTML.matchAll(/<text[^>]*y="271"[^>]*>([^<]+)<\/text>/g)].map(m=>m[1]);
+ assert.ok(tickTexts.length>0,`narrow full-date chart (${plotWidth}px) renders X-axis ticks`);
+ assert.ok(tickTexts.length<=4,`narrow full-date chart (${plotWidth}px) limits ticks to <= 4 (${tickTexts.length})`);
+}
+
+const keyCtrl=application('?view=explorer&chart=transport_rejections&range=all');
+const liveStatus={textContent:''};
+let cursorNode=null,tooltipNode=null;
+const svgNode={
+ querySelector:s=>s==='.plot-cursor'?cursorNode:null,
+ appendChild:n=>{cursorNode=n;}
+};
+const keyPlot={
+ innerHTML:'',
+ getBoundingClientRect:()=>({width:800,height:300}),
+ closest:s=>s==='[data-chart-plot]'?keyPlot:null,
+ querySelector:s=>s==='svg'?svgNode:s==='.plot-cursor'?cursorNode:s==='.chart-tooltip'?tooltipNode:null,
+ appendChild:n=>{tooltipNode=n;}
+};
+const origKeyDocQS=keyCtrl.browser.document.querySelector;
+keyCtrl.browser.document.querySelector=s=>s==='[data-live-status]'?liveStatus:origKeyDocQS(s);
+keyCtrl.browser.document.createElement=tag=>({
+ tag,className:'',innerHTML:'',style:{},
+ remove(){if(this===tooltipNode)tooltipNode=null;}
+});
+keyCtrl.browser.document.createElementNS=(ns,tag)=>({
+ ns,tag,attrs:{},
+ setAttribute(k,v){this.attrs[k]=v;},
+ remove(){if(this===cursorNode)cursorNode=null;}
+});
+keyCtrl.app.start();
+keyCtrl.app.draw(keyPlot,chart('transport_rejections'),'all');
+let keyPrevented=false;
+keyCtrl.events.get('keydown')({key:'ArrowLeft',target:keyPlot,preventDefault(){keyPrevented=true;}});
+assert.equal(keyPrevented,true);
+assert.ok(cursorNode&&cursorNode.attrs.class==='plot-cursor');
+assert.ok(tooltipNode&&tooltipNode.innerHTML.includes('chart-tooltip-time'));
+assert.match(tooltipNode.innerHTML,/UTC \(24h\)/);
+assert.ok(liveStatus.textContent.includes(chart('transport_rejections').title));
+keyCtrl.events.get('keydown')({key:'Escape',target:keyPlot});
+assert.equal(cursorNode,null);
+assert.equal(tooltipNode,null);
+
+for(const search of ['','?view=methods','?view=fixes']){
+ const brokenView=structuredClone(data);brokenView.families[0].primary='missing-chart';
+ const bad=application(search);
+ bad.browser.ONIONSURGE_DATA=brokenView;
+ bad.browser.document.getElementById=()=>bad.page;
+ assert.equal(ui.startObservatory(bad.browser),null);
+ assert.equal(bad.page.textContent,'Unable to load chart data. Please reload this page.');
+ assert.equal(bad.events.size,0,`broken graph fails upfront for ${search}`);
+}
+
+const liveCtrl=application('?view=explorer&chart=transport_rejections');
+liveCtrl.app.start();
+const brokenLive=structuredClone(data);brokenLive.families[0].children=[];
+assert.throws(()=>liveCtrl.app.replaceRelease(brokenLive,{id:'rel-bad',generatedAt:data.end,downloads:new Map()}));
+assert.equal(liveCtrl.app.getState().chartId,'transport_rejections');
+
+const fragParsed=ui.parseLocation(data,'','#transport_rejections','2');
+assert.equal(fragParsed.view,'explorer');
+assert.equal(fragParsed.chartId,'transport_rejections');
+assert.equal(fragParsed.range,defaultRange);
+
+const badPopChart=structuredClone(staleHistory);
+for(const s of badPopChart.series){
+ s.history.daily=[[day('2026-11-17'),10,0,1,true],[day('2026-11-18')+60,12,100,1,true]];
+}
+assert.equal(ui.preparePlot(badPopChart,badPopChart.series,'all'),null);
+
+const noHistQueries=structuredClone(data);
+delete chart('transport_rejections',noHistQueries).history_queries;
+const noHistMarkup=application('?view=explorer&chart=transport_rejections',noHistQueries).app.markup();
+assert.match(noHistMarkup,/PromQL/);
+
+const staleDisplay=structuredClone(data),staleChart=chart('transport_rejections',staleDisplay);
+const staleSeries=staleChart.series.find(s=>s.key===staleChart.primary_series);
+staleChart.display_scale=1;
+Object.assign(staleSeries.current.day,{value:50,valid:true,relays:100,display:'9999'});
+staleSeries.current.day.reference_display='7777';
+staleSeries.current.day.peak_display='8888';
+staleSeries.peaks.day.fleet_peak=100;
+staleSeries.reference.day.mean_per_relay=2;
+Object.assign(staleSeries.historical_averages.one_month,{status:'ready',value:25,display:'5555'});
+Object.assign(staleSeries.historical_averages.six_months,{status:'ready',value:12,display:'6666'});
+const staleMarkup=application('?view=explorer&chart=transport_rejections&range=all',staleDisplay).app.markup();
+assert.match(staleMarkup,/24-hour average<\/div><div class="stat-number">50 /);
+assert.match(staleMarkup,/18-month average: <b>200<\/b>/);
+assert.match(staleMarkup,/Recorded 24h fleet peak: 100<\/div>/);
+assert.match(staleMarkup,/Last 1 month average<\/div><div class="stat-number"[^>]*>25 /);
+assert.match(staleMarkup,/Last 6 months average<\/div><div class="stat-number"[^>]*>12 /);
+assert.doesNotMatch(staleMarkup,/9999|7777|8888|6666|5555/);
+assert.ok(staleMarkup.indexOf('class="series-toolbar"')!==-1&&staleMarkup.indexOf('class="series-toolbar"')<staleMarkup.indexOf('class="stat-pair'));
+
+const subnormalFixture=structuredClone(data),subnormalChart=chart('transport_rejections',subnormalFixture);
+const subnormalSeries=subnormalChart.series.find(s=>s.key===subnormalChart.primary_series);
+subnormalChart.display_scale=0.1;
+Object.assign(subnormalSeries.current.day,{value:Number.MIN_VALUE,valid:true,relays:8});
+const subnormalMarkup=application('?view=explorer&chart=transport_rejections',subnormalFixture).app.markup();
+assert.match(subnormalMarkup,/24-hour average<\/div><div class="stat-number">&lt;1 /);
+
+const phantomBand=structuredClone(data),phantomChart=chart('transport_rejections',phantomBand);
+const phantomSeries=phantomChart.series.find(s=>s.key===phantomChart.primary_series);
+phantomChart.display_scale=10;
+Object.assign(phantomSeries.reference.day,{n:100,p10_per_relay:2e307,p50_per_relay:5e307,p90_per_relay:8e307});
+const phantomMarkup=application('?view=explorer&chart=transport_rejections&range=all&band=1',phantomBand).app.markup();
+assert.match(phantomMarkup,/data-band-toggle[^>]*disabled/);
+assert.doesNotMatch(phantomMarkup,/Reference 10th–90th percentiles/);
+
+const missingQuantiles=structuredClone(data),mqChart=chart('transport_rejections',missingQuantiles);
+const mqSeries=mqChart.series.find(s=>s.key===mqChart.primary_series);
+mqSeries.reference.day={n:100};
+const mqMarkup=application('?view=explorer&chart=transport_rejections',missingQuantiles).app.markup();
+assert.match(mqMarkup,/Reference percentile range unavailable/);
+assert.doesNotMatch(mqMarkup,/10th and 90th percentiles are equal/);
+mqSeries.reference.day={n:-5};
+assert.match(application('?view=explorer&chart=transport_rejections',missingQuantiles).app.markup(),/Reference percentile range unavailable/);
+
+const nullRefMeta=structuredClone(data),nullRefChart=chart('transport_rejections',nullRefMeta);
+const nullRefSeries=nullRefChart.series.find(s=>s.key===nullRefChart.primary_series);
+nullRefSeries.reference.day={n:1,start:null,end:null};
+nullRefSeries.current.day={value:null,relays:null,valid:false};
+const nullRefOverview=application('',nullRefMeta).app.markup();
+assert.doesNotMatch(nullRefOverview,/1 Jan 1970/);
+assert.match(nullRefOverview,/Unavailable reporting relays/);
+
+const partialFlagFixture=structuredClone(data),pfChart=chart('transport_rejections',partialFlagFixture);
+const pfSeries=pfChart.series.find(s=>s.key===pfChart.primary_series);
+pfSeries.relay_counts={day:{total:104,coverage:0.5,role_bounds:{guard:[24,72],middle_only:[0,48],exit:[8,56],hsdir:[8,56],v2dir:[16,64]}}};
+const pfMarkup=application('',partialFlagFixture).app.markup();
+assert.match(pfMarkup,/<small class="rank-note">Flag ranges include unclassified relays \(50% flag coverage\)\.<\/small>/);
+
+const fixesMarkup=application('?view=fixes').app.markup();
+assert.match(fixesMarkup,/class="status-badge status-open">Open<\/span>/);
+assert.match(fixesMarkup,/class="status-badge status-released">Released<\/span>/);
+assert.match(fixesMarkup,/rel="noopener noreferrer"/);
+
+let freshSets=0,freshHtml='';
+const freshNode={get innerHTML(){return freshHtml;},set innerHTML(v){freshSets++;freshHtml=v;}};
+const freshBrowser=application('');
+freshBrowser.browser.document.querySelector=s=>s==='.snapshot'?freshNode:freshBrowser.page;
+const freshInst=ui.createObservatory(data,freshBrowser.browser,{id:'rel-1',generatedAt:data.end,downloads:new Map(),now:()=>data.end});
+freshInst.start();
+freshInst.updateFreshness({failed:false});
+freshSets=0;
+freshInst.updateFreshness({failed:false});
+assert.equal(freshSets,0,'unchanged freshness skips DOM innerHTML rewrite');
+freshInst.updateFreshness({failed:true});
+assert.equal(freshSets,1,'changed freshness updates snapshot DOM');
+
+const winEvents=new Map();
+let scrolledTo=[];
+const refEl={scrollIntoView(opts){scrolledTo.push(opts);},focus(){}};
+const spaCtrl=application('?view=methods#reference');
+spaCtrl.browser.addEventListener=(type,cb)=>winEvents.set(type,cb);
+spaCtrl.browser.document.getElementById=id=>id==='reference'?refEl:spaCtrl.page;
+spaCtrl.app.start();
+assert.equal(scrolledTo.length,1);
+spaCtrl.browser.location.search='?view=explorer&family=exit&chart=exit_stream_rejections&range=all';
+spaCtrl.browser.location.hash='';
+winEvents.get('popstate')();
+assert.equal(spaCtrl.app.getState().chartId,'exit_stream_rejections');
+spaCtrl.browser.location.search='?view=methods';
+spaCtrl.browser.location.hash='#reference';
+winEvents.get('popstate')();
+assert.equal(scrolledTo.length,2);
+
+let menuOpen=true,menuExpanded='true';
+const navLinksStub={classList:{contains:c=>c==='show'&&menuOpen,remove:c=>{if(c==='show')menuOpen=false;}}};
+const navToggleStub={setAttribute(k,v){if(k==='aria-expanded')menuExpanded=v;},focus(){}};
+const origQS=spaCtrl.browser.document.querySelector;
+spaCtrl.browser.document.querySelector=s=>s==='.nav-links'?navLinksStub:s==='.nav-toggle'?navToggleStub:origQS(s);
+spaCtrl.events.get('keydown')({key:'Escape',target:null});
+assert.equal(menuOpen,false);
+assert.equal(menuExpanded,'false');
+menuOpen=true;menuExpanded='true';
+spaCtrl.events.get('click')({target:{closest:s=>null}});
+assert.equal(menuOpen,false);
+assert.equal(menuExpanded,'false');
+
+// Configurable time_ranges: methods copy, UTC calendar window bounds, strict validation,
+// arbitrary custom time_ranges (zero JS changes), and v5 cold-fallback compatibility.
+const methodsHtml=application('?view=methods').app.markup();
+for(const text of ['7 days','1 month','3 months','6 months','12 months','All time',
+ 'Last 7 days average','Last 1 month average','Last 3 months average','Last 6 months average','Last 12 months average','All-time average',
+ '6 for 7 days','25 for 1 month']){
+ assert.ok(methodsHtml.includes(text),`methods() documents ${text}`);
+}
+
+for(const [endIso,periodId,expectedStartIso] of [
+ ['2024-03-31T00:00:00Z','1mo','2024-02-29T00:00:00Z'],
+ ['2025-03-31T00:00:00Z','1mo','2025-02-28T00:00:00Z'],
+ ['2024-08-31T00:00:00Z','6mo','2024-02-29T00:00:00Z'],
+ ['2025-08-31T00:00:00Z','6mo','2025-02-28T00:00:00Z'],
+ ['2026-03-31T00:00:00Z','6mo','2025-09-30T00:00:00Z'],
+ ['2026-11-18T00:00:00Z','7d','2026-11-11T00:00:00Z'],
+ ['2026-11-18T00:00:00Z','12mo','2025-11-18T00:00:00Z'],
+]){
+ const calChart=structuredClone(chart('transport_rejections'));
+ const endTs=Date.parse(endIso)/1000;
+ calChart.end=endTs;
+ for(const s of calChart.series)s.history.daily=[[endTs,10,100,1,true]];
+ const prepared=ui.preparePlot(calChart,calChart.series,periodId,data.time_ranges);
+ assert.equal(prepared.start,Date.parse(expectedStartIso)/1000,`calendar plot start for ${endIso} / ${periodId}`);
+}
+
+for(const mutate of [
+ d=>{delete d.time_ranges;},
+ d=>{d.time_ranges.version=2;},
+ d=>{d.time_ranges.periods=[];},
+ d=>{d.time_ranges.periods=Array.from({length:17},(_,i)=>({...structuredClone(d.time_ranges.periods[0]),id:`p${i}`,summary_key:`p_${i}`,export_suffix:`p${i}`}));},
+ d=>{d.time_ranges.periods=d.time_ranges.periods.filter(p=>p.window.unit!=='all_time');d.time_ranges.card_slots.fixed=['7d','6mo'];},
+ d=>{const dup=structuredClone(d.time_ranges.periods.at(-1));dup.id='all2';dup.summary_key='all_two';dup.export_suffix='all-two';d.time_ranges.periods.push(dup);},
+ d=>{d.time_ranges.periods[0].id='24h';},
+ d=>{d.time_ranges.periods[0].id='1h';},
+ d=>{d.time_ranges.periods[0].id='30m';},
+ d=>{d.time_ranges.periods[0].id='60s';},
+ d=>{d.time_ranges.periods[0].id='1d';},
+ d=>{d.time_ranges.periods[0].export_suffix='24h';},
+ d=>{d.time_ranges.periods[0].export_suffix='foo-24h';},
+ d=>{d.time_ranges.periods[0].summary_key='day';},
+ ...['hour','sampled_hour','hourly_relays','hourly_expected_relays','current24'].flatMap(key=>[
+  d=>{d.time_ranges.periods[0].summary_key=key;},
+  d=>{d.time_ranges.legacy_aliases[key]='1mo';},
+ ]),
+ d=>{d.time_ranges.periods[0].window.count=1;},
+ d=>{d.time_ranges.periods[0].minimum_coverage=-0;},
+ d=>{d.time_ranges.periods[0].minimum_coverage=-0.1;},
+ d=>{d.time_ranges.periods[0].minimum_coverage=1.1;},
+ d=>{d.time_ranges.periods[1].minimum_coverage=-0;},
+ d=>{d.time_ranges.periods[1].minimum_coverage=-0.1;},
+ d=>{d.time_ranges.periods[1].minimum_coverage=1.1;},
+ d=>{d.time_ranges.periods.at(-1).minimum_coverage=-0;},
+ d=>{d.time_ranges.periods.at(-1).minimum_coverage=0.5;},
+ d=>{d.time_ranges.card_slots.fixed=['6mo','6mo'];},
+ d=>{d.time_ranges.card_slots.fallback_dynamic='6mo';},
+ d=>{d.time_ranges.periods[0].label='🚀'.repeat(81);},
+ d=>{d.time_ranges.periods[0].average_label='🚀'.repeat(81);},
+ d=>{d.time_ranges.periods[0].plot_label='🚀'.repeat(81);},
+ d=>{d.time_ranges.periods[0].label='\uFEFF';},
+ d=>{d.time_ranges.periods[0].average_label='\x85';},
+ d=>{d.time_ranges.periods[0].plot_label='\x1f';},
+ d=>{d.time_ranges.legacy_aliases['🚀'.repeat(33)]='1mo';},
+ d=>{d.time_ranges.legacy_aliases['\uFEFF']='1mo';},
+ d=>{d.time_ranges.legacy_aliases['\x85']='1mo';},
+ d=>{d.time_ranges.legacy_aliases['\x1c']='1mo';},
+ d=>{d.time_ranges.legacy_aliases['7d']='1mo';},
+ d=>{d.time_ranges.legacy_aliases['24h']='missing';},
+]){
+ const badTr=structuredClone(data);
+ mutate(badTr);
+ assert.throws(()=>application('',badTr),/time_ranges|all_time|minimum_coverage/);
+}
+assert.equal(ui.parseLocation(data,'?range=1mo').range,'1mo');
+
+for(const cov of [0,0.9]){
+ const covData=structuredClone(data);
+ covData.time_ranges.periods[0].minimum_coverage=cov;
+ covData.time_ranges.periods[1].minimum_coverage=cov;
+ assert.equal(ui.validateTimeRanges(covData.time_ranges).periods[0].minimum_coverage,cov,`validateTimeRanges accepts minimum_coverage=${cov} on days/months`);
+}
+
+// Partial-period coverage (minimum_coverage: 0), n >= 2 Explorer percentile band,
+// .average-dates narrowed hover titles, methods() wording, and 0-day/explicit insufficient_data states.
+assert.ok(methodsHtml.includes('uses all available qualifying days in the window'),
+ 'methods() documents zero minimum_coverage cleanly instead of 0% threshold');
+assert.doesNotMatch(methodsHtml,/at least 0% of days|requires ≥ 0%/);
+const customMethodsHtml=application('?view=methods',(()=>{
+ const d=structuredClone(data);
+ d.time_ranges.periods[0].minimum_coverage=0.9;
+ return d;
+})()).app.markup();
+assert.ok(customMethodsHtml.includes('at least 90% of days required'),'methods() keeps percentage wording for non-zero thresholds');
+
+for(const cid of ['hsdir_fetches','directory_rejections','protocol_closes']){
+ const ch=chart(cid),prim=ch.series.find(s=>s.key===ch.primary_series)||ch.series[0];
+ for(const p of data.time_ranges.periods){
+  assert.equal(prim.historical_averages[p.summary_key].status,'ready',`${cid} primary ${p.id} is ready under partial coverage`);
+ }
+ for(const r of ranges){
+  const html=application(`?view=explorer&chart=${cid}&range=${r}`).app.markup();
+  const histPanels=statSections(html).slice(1);
+  assert.equal(histPanels.length,3);
+  for(const panel of histPanels){
+   assert.doesNotMatch(panel.html,/<div class="stat-number"[^>]*>— <small>/,`${cid}/${r} shows historical average`);
+   assert.doesNotMatch(panel.html,/Insufficient historical coverage/,`${cid}/${r} shows no insufficient coverage fallback`);
+   assert.doesNotMatch(panel.html,/Current 24h: Percentile unavailable/,`${cid}/${r} shows historical comparison percentile`);
+  }
+  const tbl=html.match(/<table data-values-table>([\s\S]*?)<\/table>/)[1];
+  const primRow=tbl.match(/<tbody>([\s\S]*?)<\/tbody>/)[1].match(/<tr>[\s\S]*?<\/tr>/g)
+   .find(row=>decode(row.match(/<td>(.*?)<\/td>/)[1])===prim.name);
+  assert.ok(primRow,`${cid} values table row present`);
+  assert.doesNotMatch(primRow,/<td>—<\/td>/,`${cid}/${r} primary row has no blank historical cells`);
+ }
+}
+
+// 19-reference directory_rejections enables the Explorer percentile band (n >= 2), while n < 2 keeps it disabled.
+const dirRejBandHtml=application('?view=explorer&chart=directory_rejections&range=1mo&band=1').app.markup();
+assert.doesNotMatch(dirRejBandHtml,/data-band-toggle[^>]*disabled/,'directory_rejections 19-ref band is enabled at n >= 2');
+assert.match(dirRejBandHtml,/Reference 10th–90th percentiles/);
+assert.match(dirRejBandHtml,/Reference median/);
+const dirRejBandPlot=element(800);
+application('?view=explorer&chart=directory_rejections&range=1mo&band=1').app.draw(dirRejBandPlot,chart('directory_rejections'),'1mo');
+assert.match(dirRejBandPlot.innerHTML,/class="reference-band"/);
+assert.match(dirRejBandPlot.innerHTML,/class="reference-median"/);
+
+const bandThresholdData=structuredClone(data),btChart=chart('directory_rejections',bandThresholdData);
+const btSeries=btChart.series.find(s=>s.key===btChart.primary_series);
+btSeries.reference.day={n:1,p10_per_relay:1,p50_per_relay:2,p90_per_relay:3,mean_per_relay:2,current_percentile:null,flat_zero:false};
+const oneRefHtml=application('?view=explorer&chart=directory_rejections&range=1mo&band=1',bandThresholdData).app.markup();
+assert.match(oneRefHtml,/data-band-toggle[^>]*disabled/);
+assert.match(oneRefHtml,/1 reference windows; 2 required/);
+btSeries.reference.day={n:2,p10_per_relay:1,p50_per_relay:2,p90_per_relay:3,mean_per_relay:2,current_percentile:50,flat_zero:false};
+assert.doesNotMatch(application('?view=explorer&chart=directory_rejections&range=1mo&band=1',bandThresholdData).app.markup(),/data-band-toggle[^>]*disabled/);
+
+// Narrowed partial window .average-dates hover title vs full-window no-title.
+const narrowedHtml=application('?view=explorer&chart=directory_rejections&range=6mo').app.markup();
+const dirRej6mo=chart('directory_rejections').series.find(s=>s.key===chart('directory_rejections').primary_series).historical_averages.six_months;
+assert.ok(dirRej6mo.observed_start>dirRej6mo.start,'directory_rejections 6mo has narrower observed_start than calendar start');
+const avgDateTag=narrowedHtml.match(/<div class="average-dates"[^>]*>[^<]+<\/div>/g)[1];
+assert.match(avgDateTag,/title="Measured observations: [^"]+ UTC\."/);
+const exactDatesData=structuredClone(data),exChart=chart('transport_rejections',exactDatesData);
+const exSeries=exChart.series.find(s=>s.key===exChart.primary_series);
+const ex6mo=exSeries.historical_averages.six_months;
+ex6mo.observed_start=ex6mo.start;ex6mo.observed_end=ex6mo.end;
+const exactDateTag=application('?view=explorer&chart=transport_rejections&range=all',exactDatesData).app.markup().match(/<div class="average-dates"[^>]*>[^<]+<\/div>/g)[1];
+assert.doesNotMatch(exactDateTag,/title=/,'full-window summary omits redundant .average-dates title');
+
+// Explicit 0-day / insufficient_data states remain well-behaved under minimum_coverage: 0 and 0.9.
+const zeroDayData=structuredClone(data),zdChart=chart('transport_rejections',zeroDayData);
+const zdSeries=zdChart.series.find(s=>s.key===zdChart.primary_series);
+Object.assign(zdSeries.historical_averages.six_months,{days:0,coverage:0,status:'insufficient_data',value:null,observed_start:null,observed_end:null});
+const zeroDayPanels=statSections(application('?view=explorer&chart=transport_rejections&range=all',zeroDayData).app.markup());
+assert.match(zeroDayPanels[2].html,/0 \/ \d+ days available/);
+assert.match(zeroDayPanels[2].html,/title="No qualifying daily observations are available">— <small>/);
+assert.doesNotMatch(zeroDayPanels[2].html,/<div class="average-dates"[^>]*title=/);
+assert.match(zeroDayPanels[2].html,/Insufficient historical coverage/);
+zeroDayData.time_ranges.periods.find(p=>p.id==='6mo').minimum_coverage=0.9;
+const gatedZeroPanels=statSections(application('?view=explorer&chart=transport_rejections&range=all',zeroDayData).app.markup());
+assert.match(gatedZeroPanels[2].html,/At least 90% daily coverage is required for last 6 months average/);
+
+const unicodeTr=structuredClone(data);
+unicodeTr.time_ranges.periods[0].label='🚀'.repeat(80);
+unicodeTr.time_ranges.periods[0].average_label='🚀'.repeat(80);
+unicodeTr.time_ranges.periods[0].plot_label='🚀'.repeat(80);
+unicodeTr.time_ranges.legacy_aliases['🚀'.repeat(32)]='7d';
+assert.equal(ui.parseLocation(unicodeTr,'?range='+encodeURIComponent('🚀'.repeat(32))).range,'7d',
+ 'supplementary Unicode code-point limits accept 80-char labels and 32-char legacy aliases');
+
+const customData=structuredClone(data);
+customData.time_ranges={
+ version:1,
+ default_range:'14d',
+ legacy_aliases:{'24h':'14d','30d':'14d'},
+ card_slots:{fallback_dynamic:'14d',fixed:['2mo','all']},
+ periods:[
+  {id:'14d',summary_key:'fourteen_days',export_suffix:'14d',label:'14 days',average_label:'Last 14 days average',plot_label:'Last 14 days',window:{unit:'days',count:14,comparison_lag_days:1},minimum_coverage:0.9,minimum_comparison_windows:12},
+  {id:'2mo',summary_key:'two_months',export_suffix:'2mo',label:'2 months',average_label:'Last 2 months average',plot_label:'Last 2 months',window:{unit:'months',count:2,comparison_lag_days:0},minimum_coverage:0.9,minimum_comparison_windows:30},
+  {id:'all',summary_key:'all_time',export_suffix:'all-time',label:'All time',average_label:'All-time average',plot_label:'All time',window:{unit:'all_time',count:null,comparison_lag_days:0},minimum_coverage:0,minimum_comparison_windows:30},
+ ],
+};
+for(const c of customData.charts)for(const s of c.series){
+ const all=s.historical_averages.all_time,allRc=s.relay_counts?.all_time;
+ s.historical_averages={fourteen_days:{...structuredClone(all),value:14,display:'14'},two_months:{...structuredClone(all),value:60,display:'60'},all_time:all};
+ if(s.relay_counts)s.relay_counts={day:s.relay_counts.day,fourteen_days:structuredClone(allRc),two_months:structuredClone(allRc),all_time:allRc};
+}
+const customOverview=application('?range=24h',customData);
+customOverview.app.start();
+assert.equal(customOverview.app.getState().range,'14d','custom legacy alias maps 24h to 14d');
+assert.deepEqual(customOverview.browser.document.querySelectorAll('[data-all-range]').map(b=>b.textContent),['14 days','2 months','All time']);
+for(const [r,expectedCsv] of [['14d','14d'],['2mo','2mo'],['all','all-time']]){
+ const customExp=application(`?view=explorer&chart=transport_rejections&range=${r}`,customData).app.markup();
+ const labels=statSections(customExp).map(sec=>sec.html.match(/<div class="stat-label">([^<]+)<\/div>/)?.[1]);
+ assert.deepEqual(labels,['24-hour average','Last 14 days average','Last 2 months average','All-time average']);
+ assert.match(customExp,new RegExp(`exports\\/transport_rejections-${expectedCsv}\\.csv`));
+ const customTable=customExp.match(/<table data-values-table>([\s\S]*?)<\/table>/)[1];
+ assert.deepEqual([...customTable.matchAll(/<th>(.*?)<\/th>/g)].map(([,h])=>decode(h)),
+  ['Series','Unit','24-hour average','Last 14 days average','Last 2 months average','All-time average']);
+}
+
+const v5Data=structuredClone(data);
+v5Data.schema_version=5;
+delete v5Data.time_ranges;
+for(const c of v5Data.charts)for(const s of c.series){
+ s.historical_averages={thirty_days:s.historical_averages.one_month,six_months:s.historical_averages.six_months,all_time:s.historical_averages.all_time};
+ if(s.relay_counts)s.relay_counts={day:s.relay_counts.day,thirty_days:s.relay_counts.one_month,six_months:s.relay_counts.six_months,all_time:s.relay_counts.all_time};
+}
+const v5Paths=['data.json','manifest.json',v5Data.reference_document,
+ ...v5Data.charts.flatMap(item=>['30d','all-time'].map(span=>'exports/'+item.id+'-'+span+'.csv'))];
+const v5Release={mode:'live',id:'v5-old',generatedAt:v5Data.end+600,now:()=>v5Data.end,
+ downloads:new Map(v5Paths.map(file=>[file,'blob:v5-old/'+file]))};
+const v5App=application('?view=explorer&chart=transport_rejections&range=6mo',v5Data,'1',v5Release);
+v5App.app.start();
+assert.match(v5App.page.innerHTML,/href="blob:v5-old\/exports\/transport_rejections-all-time\.csv" download="v5-old-transport_rejections-all-time\.csv" data-focus-key="explorer-csv">CSV · all-time, source units<\/a>/,'v5 fallback maps missing 6mo CSV to all-time CSV and labels it accurately');
+const v5ExactApp=application('?view=explorer&chart=transport_rejections&range=30d',v5Data,'1',v5Release);
+v5ExactApp.app.start();
+assert.match(v5ExactApp.page.innerHTML,/href="blob:v5-old\/exports\/transport_rejections-30d\.csv"[^>]*>CSV · all series, source units<\/a>/,'exact period CSV retains standard label');
+const v5Upgrading=application('?view=overview',v5Data,'1',v5Release);
+v5Upgrading.app.start();
+assert.equal(v5Upgrading.app.getState().range,'30d');
+v5Upgrading.app.replaceRelease(data,releaseContext(data,'v6-new',()=>data.end));
+assert.equal(v5Upgrading.app.getState().range,'1mo','live upgrade from v5 30d migrates via legacy_aliases to 1mo');
+
+// V4 Concurrent DoS hero card: Overview isolation (7d|all), non-overlapping math, responsive SVGs, URL/live/keyboard parity.
+const heroDefault=application('?view=overview');
+heroDefault.app.start();
+assert.equal(heroDefault.app.getState().heroRange,'7d');
+assert.equal(heroDefault.app.getState().heroScale,'linear');
+assert.equal(heroDefault.app.getState().heroHsdir,true);
+assert.equal(heroDefault.app.getState().range,'1mo');
+const heroHtml=heroDefault.page.innerHTML;
+const heroSectionPos=heroHtml.indexOf('<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="7d">');
+const toolbarPos=heroHtml.indexOf('<div class="overview-toolbar">');
+assert.ok(heroSectionPos!==-1&&toolbarPos!==-1&&heroSectionPos<toolbarPos,'hero card leads overview above family toolbar');
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-range]').length,2);
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-scale]').length,2);
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-hsdir]').length,1);
+assert.equal(heroDefault.app.url('overview'),'?view=overview&range=1mo&layout=full&family=directory&chart=directory_requests',
+ 'default hero settings omit extra query parameters');
+click(heroDefault,'[data-hero-range]',{heroRange:'all'});
+assert.equal(heroDefault.app.getState().heroRange,'all');
+assert.equal(heroDefault.app.getState().range,'1mo','hero All time toggle leaves 6-family 1mo range unchanged');
+assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-range="all"]'));
+click(heroDefault,'[data-all-range]',{allRange:'all'});
+assert.equal(heroDefault.app.getState().range,'all');
+assert.equal(heroDefault.app.getState().heroRange,'all');
+click(heroDefault,'[data-all-range]',{allRange:'1mo'});
+assert.equal(heroDefault.app.getState().range,'1mo');
+assert.equal(heroDefault.app.getState().heroRange,'all','family range toggle leaves hero range unchanged');
+click(heroDefault,'[data-hero-scale]',{heroScale:'symlog'});
+assert.equal(heroDefault.app.getState().heroScale,'symlog');
+assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-scale="symlog"]'));
+click(heroDefault,'[data-hero-hsdir]',{});
+assert.equal(heroDefault.app.getState().heroHsdir,false);
+assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-hsdir]'));
+const heroParams=new URLSearchParams(heroDefault.app.url('overview').slice(1));
+assert.equal(heroParams.get('hero_range'),'all');
+assert.equal(heroParams.get('hero_scale'),'symlog');
+assert.equal(heroParams.get('hero_hsdir'),'0');
+assert.deepEqual(ui.parseLocation(data,heroDefault.browser.location.search),heroDefault.app.getState(),
+ 'hero state round-trips between URL and parseLocation');
+heroDefault.back();
+assert.equal(heroDefault.app.getState().heroHsdir,true);
+assert.equal(heroDefault.app.getState().heroScale,'symlog');
+heroDefault.forward();
+assert.equal(heroDefault.app.getState().heroHsdir,false);
+click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
+click(heroDefault,'[data-hero-scale]',{heroScale:'linear'});
+click(heroDefault,'[data-hero-hsdir]',{});
+assert.deepEqual([heroDefault.app.getState().heroRange,heroDefault.app.getState().heroScale,heroDefault.app.getState().heroHsdir],['7d','linear',true]);
+assert.equal(new URLSearchParams(heroDefault.app.url('overview').slice(1)).has('hero_range'),false);
+click(heroDefault,'[data-hero-range]',{heroRange:'all'});
+click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
+click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
+click(heroDefault,'[data-hero-scale]',{heroScale:'linear'});
+heroDefault.back();
+assert.equal(heroDefault.app.getState().heroRange,'all','no-op hero clicks never push duplicate history entries');
+
+const h7=ui.prepareHeroPlot(data,'7d',true);
+const h7NoHsdir=ui.prepareHeroPlot(data,'7d',false);
+const hAll=ui.prepareHeroPlot(data,'all',true);
+assert.equal(h7.times.length,7);
+assert.equal(h7.end-h7.start,7*86400);
+assert.equal(hAll.times.length,548);
+assert.ok(h7.vectors.some(v=>v.id==='hsdir'));
+assert.equal(h7NoHsdir.vectors.some(v=>v.id==='hsdir'),false);
+const hsdirVec=h7.vectors.find(v=>v.id==='hsdir');
+for(let i=0;i<7;i++){
+ assert.ok(Math.abs((h7.totals[i]-h7NoHsdir.totals[i])-hsdirVec.values[i])<1e-9,'HSDir toggle subtracts hs_get+hs_post cleanly');
+}
+const overlapCheckData=structuredClone(data);
+for(const row of chart('onionskin_drops',overlapCheckData).series.find(s=>s.key==='ntor_v3').history.daily)row[1]=999999;
+for(const row of chart('queue_limit_circuits',overlapCheckData).series.find(s=>s.key==='circuit_killed_max_cell_outq').history.daily)row[1]=999999;
+const hsSuccess=chart('hsdir_fetches',overlapCheckData).series.find(s=>s.key==='success');
+for(const row of hsSuccess.history.daily)row[1]=999999;
+hsSuccess.reference.day={n:100,current_percentile:100,flat_zero:false};
+const hOverlap=ui.prepareHeroPlot(overlapCheckData,'7d',true);
+assert.deepEqual(hOverlap.totals,h7.totals,'subset counters never double-count into total hero rates');
+const hsUploadSuccess=chart('hsdir_uploads',overlapCheckData).series.find(s=>s.key==='success');
+hsUploadSuccess.reference.day={n:100,current_percentile:100,flat_zero:false};
+for(const fam of h7.families)assert.equal(fam.rows.length,7);
+const allNormalAlerts=structuredClone(data);
+for(const f of allNormalAlerts.families)for(const cid of f.children)for(const s of chart(cid,allNormalAlerts).series){
+ s.reference.day={n:100,current_percentile:10,flat_zero:false};
+}
+chart('hsdir_fetches',allNormalAlerts).series.find(s=>s.key==='success').reference.day={n:100,current_percentile:100,flat_zero:false};
+chart('hsdir_uploads',allNormalAlerts).series.find(s=>s.key==='success').reference.day={n:100,current_percentile:100,flat_zero:false};
+const noFalseAlert=ui.prepareHeroPlot(allNormalAlerts,'7d',true);
+assert.equal(noFalseAlert.families.find(f=>f.id==='directory').rows[6].state,'neutral','benign hsdir success counters never trigger DoS alerts');
+
+for(const heroRange of ['7d','all'])for(const heroScale of ['linear','symlog'])for(const includeHsdir of [true,false]){
+ const app=application(`?view=overview&hero_range=${heroRange}&hero_scale=${heroScale}${includeHsdir?'':'&hero_hsdir=0'}`).app;
+ for(const width of [240,262,360,800,1680]){
+  const plot=element(width);
+  app.drawHero(plot,heroRange,heroScale,includeHsdir);
+  assert.doesNotMatch(plot.innerHTML,/NaN|Infinity|undefined|Invalid Date/,`hero/${heroRange}/${heroScale}/${includeHsdir}/${width}`);
+  assert.match(plot.innerHTML,/<svg/);
+  assert.equal((plot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g)||[]).length,1);
+  assert.match(plot.innerHTML,/24h intervals · UTC/);
+  if(heroScale==='symlog')assert.match(plot.innerHTML,/class="hero-rate-series"/);
+  else if(heroRange==='7d')assert.match(plot.innerHTML,/class="hero-rate-bar"/);
+  else assert.match(plot.innerHTML,/class="hero-rate-area"/);
+  if(heroRange==='all')assert.match(plot.innerHTML,/class="hero-alert-missing"/);
+ }
+}
+const heroExtreme=structuredClone(data);
+chart('transport_rejections',heroExtreme).series[0].history.daily.forEach(row=>{if(row[4])row[1]=Number.MAX_VALUE;});
+const heroExtremePlot=element(800);
+application('',heroExtreme).app.drawHero(heroExtremePlot,'7d','symlog',true);
+assert.doesNotMatch(heroExtremePlot.innerHTML,/NaN|Infinity|undefined/);
+const heroEmpty=structuredClone(data);
+for(const item of heroEmpty.charts)for(const series of item.series)series.history.daily=[];
+const heroEmptyPlot=element(240);
+application('',heroEmpty).app.drawHero(heroEmptyPlot,'7d','linear',true);
+assert.match(heroEmptyPlot.innerHTML,/No retained samples available/);
+assert.equal((heroEmptyPlot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g)||[]).length,1);
+
+for(const selector of ['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos"]']){
+ const heroLive=application('?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=0',data,'1',releaseContext(data,'hero-old',()=>data.end));
+ heroLive.app.start();
+ const before=heroLive.app.getState();
+ heroLive.browser.document.querySelector(selector).focus({preventScroll:true});
+ const fresh=structuredClone(data);
+ heroLive.app.replaceRelease(fresh,releaseContext(fresh,'hero-new',()=>fresh.end));
+ assert.deepEqual(heroLive.app.getState(),before,'replaceRelease preserves hero controls');
+ assert.equal(heroLive.browser.document.activeElement,heroLive.browser.document.querySelector(selector),
+  `replaceRelease restores focus on ${selector}`);
+}
+
+const inspectHero=(dataset,r,keys)=>{
+ const ctrl=application('?view=overview',dataset),live={textContent:''};
+ let cursor=null,tooltip=null;
+ const svg={querySelector:s=>s==='.plot-cursor'?cursor:null,appendChild:n=>{cursor=n;}};
+ const el={innerHTML:'',getBoundingClientRect:()=>({width:800,height:400}),closest:s=>s==='[data-hero-plot]'?el:null,
+  querySelector:s=>s==='svg'?svg:s==='.plot-cursor'?cursor:s==='.chart-tooltip'?tooltip:null,
+  appendChild:n=>{tooltip=n;},setAttribute(){},hasAttribute:()=>false};
+ const origQS=ctrl.browser.document.querySelector;
+ ctrl.browser.document.querySelector=s=>s==='[data-live-status]'?live:origQS(s);
+ ctrl.browser.document.createElement=tag=>({tag,className:'',innerHTML:'',style:{},remove(){if(this===tooltip)tooltip=null;}});
+ ctrl.browser.document.createElementNS=(ns,tag)=>({ns,tag,attrs:{},setAttribute(k,v){this.attrs[k]=v;},remove(){if(this===cursor)cursor=null;}});
+ ctrl.app.start();
+ ctrl.app.drawHero(el,r,'linear',true);
+ const steps=keys.map(key=>{
+  let prevented=false;
+  ctrl.events.get('keydown')({key,target:el,preventDefault(){prevented=true;}});
+  return {prevented,cursor,tooltipHtml:tooltip?.innerHTML||'',liveText:live.textContent};
+ });
+ return {ctrl,el,steps};
+};
+
+const hDefaultInspect=inspectHero(data,'7d',['ArrowLeft','Escape']);
+assert.equal(hDefaultInspect.steps[0].prevented,true);
+assert.equal(hDefaultInspect.steps[0].cursor.attrs.class,'plot-cursor');
+assert.ok(hDefaultInspect.steps[0].tooltipHtml.includes('Total active rate'));
+assert.match(hDefaultInspect.steps[0].tooltipHtml,/Open circuits:/);
+assert.ok(hDefaultInspect.steps[0].liveText.includes('Concurrent DoS activity'));
+assert.equal(hDefaultInspect.steps[1].cursor,null);
+
+// Hero regression & adversarial hardening checks
+const makeRows=(end,totalDays,valFn)=>Array.from({length:totalDays},(_,k)=>[end-(totalDays-1-k)*86400,valFn(k),100,1,true]);
+const setFamRows=(doc,fid,rows)=>{for(const cid of doc.families.find(f=>f.id===fid).children)for(const s of chart(cid,doc).series)s.history.daily=rows.map(r=>[...r]);};
+const baselineCapBase=structuredClone(data);
+setFamRows(baselineCapBase,'transport',makeRows(baselineCapBase.end-86400,21,k=>k===18?10000:k>=19?20000:(k+1)*100));
+const baselineCapLow=structuredClone(baselineCapBase),baselineCapHigh=structuredClone(baselineCapBase);
+for(const cid of baselineCapLow.families.find(f=>f.id==='transport').children){
+ for(const s of chart(cid,baselineCapLow).series)s.history.daily.push([baselineCapLow.end,0,100,1,true]);
+ for(const s of chart(cid,baselineCapHigh).series)s.history.daily.push([baselineCapHigh.end,50000,100,1,true]);
+}
+const candLow=ui.prepareHeroPlot(baselineCapLow,'7d',true).families.find(f=>f.id==='transport').rows[3];
+assert.equal(candLow.state,'elevated');assert.equal(candLow.rank,90);
+assert.deepEqual(ui.prepareHeroPlot(baselineCapHigh,'7d',true).families.find(f=>f.id==='transport').rows[3],candLow,'latest UTC interval excluded from baseline');
+
+// Duplicate historical rows never inflate baseline denominator or shift ranks.
+const dupBaseline=structuredClone(baselineCapLow);
+for(const cid of dupBaseline.families.find(f=>f.id==='transport').children){
+ for(const s of chart(cid,dupBaseline).series)for(let d=0;d<5;d++)s.history.daily.unshift([...s.history.daily[0]]);
+}
+assert.deepEqual(ui.prepareHeroPlot(dupBaseline,'7d',true).families.find(f=>f.id==='transport').rows[3],candLow,'duplicate timestamps deduplicated before baseline ranking');
+
+// Exact 18-month reference window boundary (t - DAY >= baselineStart && t <= baselineEnd).
+const boundData=structuredClone(baselineCapLow);
+boundData.reference_window={...boundData.reference_window,start:boundData.end-21*86400,end:boundData.end-86400};
+const boundCell=ui.prepareHeroPlot(boundData,'7d',true).families.find(f=>f.id==='transport').rows[3];
+assert.equal(boundCell.n,19,'row starting before reference_window.start (t === start) is excluded from baseline');
+assert.equal(boundCell.state,'neutral');
+
+// Out-of-range reference percentiles cannot emit false alerts or bogus ordinal strings.
+const badRef=structuredClone(allNormalAlerts);
+chart('transport_rejections',badRef).series[0].current.day={valid:true,value:100,relays:100,available:1};
+for(const badPct of [150,-5,null]){
+ chart('transport_rejections',badRef).series[0].reference.day={n:120,current_percentile:badPct,flat_zero:false};
+ assert.equal(ui.prepareHeroPlot(badRef,'7d',true).families.find(f=>f.id==='transport').rows[6].state,'neutral',`invalid percentile ${badPct} stays neutral`);
+}
+
+const gaugeAlertGuard=structuredClone(allNormalAlerts);
+chart('open_circuits',gaugeAlertGuard).series[0].reference.day={n:500,current_percentile:100,flat_zero:false};
+chart('directory_waiting',gaugeAlertGuard).series[0].reference.day={n:500,current_percentile:100,flat_zero:false};
+const hGaugeGuard=ui.prepareHeroPlot(gaugeAlertGuard,'7d',true);
+assert.equal(hGaugeGuard.families.find(f=>f.id==='circuits').rows[6].state,'neutral');
+assert.equal(hGaugeGuard.families.find(f=>f.id==='directory').rows[6].state,'neutral');
+
+const subOneGauge=structuredClone(data),dwSeries=chart('directory_waiting',subOneGauge).series[0];
+dwSeries.peaks.day.fleet_peak=0.4;
+dwSeries.history.daily=dwSeries.history.daily.map(row=>row[0]===subOneGauge.end?[row[0],0.4,104,1,true]:row[4]?[row[0],0.2,104,1,true]:row);
+const hSubOne=ui.prepareHeroPlot(subOneGauge,'7d',true);
+assert.equal(hSubOne.gauges.directoryWaiting.scalePeak,0.4);
+const subOnePlot=element(800);
+application('',subOneGauge).app.drawHero(subOnePlot,'7d','linear',true);
+assert.match(subOnePlot.innerHTML,/<line x1="62" y1="256\.00"[^>]*\/>\s*<text[^>]*>100%<\/text>/);
+assert.match(subOnePlot.innerHTML,/class="hero-gauge-series" d="M[^"]*L788\.00,256\.00"/);
+
+// Tiny openCircuits (<0.1%) matches across heroCard KPI meta and tooltip inspection.
+const tinyGauge=structuredClone(data),ocSeries=chart('open_circuits',tinyGauge).series[0];
+ocSeries.peaks.day.fleet_peak=1e6;
+ocSeries.history.daily=ocSeries.history.daily.map(row=>row[0]===tinyGauge.end?[row[0],100,104,1,true]:row[4]?[row[0],100,104,1,true]:row);
+assert.match(application('?view=overview',tinyGauge).app.markup(),/&lt;0\.1% of 1M peak/);
+assert.match(inspectHero(tinyGauge,'7d',['End']).steps[0].tooltipHtml,/Open circuits: 100 \(&lt;0\.1%\)/);
+
+const partialHeroData=structuredClone(data);
+for(const row of chart('directory_rejections',partialHeroData).series[0].history.daily){
+ if(row[0]===partialHeroData.end){row[1]=null;row[4]=false;}
+}
+const hPartial=ui.prepareHeroPlot(partialHeroData,'7d',true);
+assert.equal(hPartial.partialRates[6],true);assert.equal(hPartial.partialRates[5],false);assert.equal(hPartial.hasPartialRate,true);
+const partialHeroMarkup=application('?view=overview',partialHeroData).app.markup();
+assert.match(partialHeroMarkup,/partial source coverage/);assert.match(partialHeroMarkup,/Partial rate coverage/);
+const partialHeroSvg=element(800),partialHeroAllSvg=element(800);
+application('?view=overview',partialHeroData).app.drawHero(partialHeroSvg,'7d','linear',true);
+application('?view=overview',partialHeroData).app.drawHero(partialHeroAllSvg,'all','linear',true);
+assert.ok(partialHeroSvg.innerHTML.lastIndexOf('hero-rate-bar')<partialHeroSvg.innerHTML.indexOf('hero-rate-partial'),'partial hatch after bars');
+assert.ok(partialHeroAllSvg.innerHTML.lastIndexOf('hero-rate-area')<partialHeroAllSvg.innerHTML.indexOf('hero-rate-partial'),'partial hatch after areas');
+
+const allZeroRateData=structuredClone(data);
+for(const item of allZeroRateData.charts)if(item.kind==='counter_daily_rate')for(const s of item.series)s.history.daily=s.history.daily.map(row=>[row[0],0,104,1,true]);
+const hZeroRates=ui.prepareHeroPlot(allZeroRateData,'7d',true);
+assert.deepEqual(hZeroRates.partialRates,Array(7).fill(false));
+assert.deepEqual(hZeroRates.totals,Array(7).fill(0));
+assert.deepEqual(hZeroRates.missingRates,Array(7).fill(false));
+
+const missingHsPost=structuredClone(allZeroRateData);
+chart('directory_requests',missingHsPost).series=chart('directory_requests',missingHsPost).series.filter(s=>s.key!=='hs_post');
+chart('directory_requests',missingHsPost).series.find(s=>s.key==='hs_get').history.daily.forEach(row=>{row[1]=10;});
+assert.equal(ui.prepareHeroPlot(missingHsPost,'7d',true).partialRates.every(Boolean),true);
+assert.equal(ui.prepareHeroPlot(missingHsPost,'7d',true).vectors.find(v=>v.id==='hsdir').partial.every(Boolean),true);
+assert.equal(ui.prepareHeroPlot(missingHsPost,'7d',false).partialRates.some(Boolean),false);
+
+const pIns=inspectHero(partialHeroData,'all',['End','Home']);
+assert.match(pIns.steps[0].tooltipHtml,/Total active rate<\/span><span>[^<]*\(partial coverage\)/);
+assert.match(pIns.steps[1].tooltipHtml,/Unmeasured families:[^<]*Directory floods/);
+assert.match(pIns.steps[1].liveText,/Unmeasured families:/);
+
+const noQualData=structuredClone(data);
+for(const f of noQualData.families)for(const cid of f.children)for(const s of chart(cid,noQualData).series)s.reference.day={n:19,current_percentile:95,flat_zero:false};
+const noQualOverview=application('?view=overview',noQualData).app.markup();
+assert.match(noQualOverview,/No qualifying family alerts/);
+assert.doesNotMatch(noQualOverview,/All families below 90th pct/);
+assert.match(noQualOverview,/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
+assert.match(noQualOverview,/Alert lanes \(01→06\): 01 Connection floods/);
+
+const heroAllSvg=element(800),narrowAllSvg=element(240);
+application('?view=overview',data).app.drawHero(heroAllSvg,'all','linear',true);
+assert.match(heroAllSvg.innerHTML,/data-family-lane="directory"/);assert.match(heroAllSvg.innerHTML,/>01–06<\/text>/);
+application('?view=overview',data).app.drawHero(narrowAllSvg,'all','linear',true);
+const byLane=new Map();
+for(const m of narrowAllSvg.innerHTML.matchAll(/<rect class="hero-alert-(?:high|elevated|missing)" data-family-lane="([^"]+)" x="([\d.]+)" y="[\d.]+" width="([\d.]+)"/g)){
+ const lane=m[1],x=Number(m[2]),w=Number(m[3]);
+ assert.ok(x>=62-0.01&&x+w<=228+0.01,`alert rect [${x}, ${x+w}] within [62, 228]`);
+ assert.ok(x>=(byLane.get(lane)??62)-0.01,`lane ${lane} non-overlapping`);
+ byLane.set(lane,x+w);
+}
+assert.ok(byLane.size>0);
+
+const singleDayNarrow=structuredClone(allZeroRateData);
+for(const f of singleDayNarrow.families)for(const cid of f.children)for(const s of chart(cid,singleDayNarrow).series){
+ s.reference.day={n:100,current_percentile:0,flat_zero:true};
+ if(cid==='transport_rejections'){const mid=s.history.daily.length>>1;s.history.daily[mid]=[s.history.daily[mid][0],1e6,104,1,true];}
+}
+const expectedDayW=166/ui.prepareHeroPlot(singleDayNarrow,'all',true).times.length,narrowSingleSvg=element(240);
+application('?view=overview',singleDayNarrow).app.drawHero(narrowSingleSvg,'all','linear',true);
+const singleMarks=[...narrowSingleSvg.innerHTML.matchAll(/<rect class="hero-alert-high" data-family-lane="transport" x="([\d.]+)" y="[\d.]+" width="([\d.]+)"/g)];
+assert.equal(singleMarks.length,1);
+assert.ok(Number(singleMarks[0][2])>0&&Number(singleMarks[0][2])<=expectedDayW+0.02);
+
+// High alert state text, >1e9 symlog ticks, bar height clamp, and queue/h overflow guard.
+const highStateInspect=structuredClone(data);
+chart('transport_rejections',highStateInspect).series[0].current.day={valid:true,value:100,relays:100,available:1};
+chart('transport_rejections',highStateInspect).series[0].reference.day={n:120,current_percentile:100,flat_zero:false};
+const stateIns=inspectHero(highStateInspect,'7d',['End']);
+assert.match(stateIns.steps[0].tooltipHtml,/Alerts ≥90th:[^<]*\(high, 100th\)/);
+assert.match(stateIns.steps[0].liveText,/Alerts ≥90th:.*\(high, 100th\)/);
+
+const largeSymlog=structuredClone(allZeroRateData),hugeSvg=element(800);
+chart('transport_rejections',largeSymlog).series[0].history.daily.at(-1)[1]=1e12;
+application('',largeSymlog).app.drawHero(hugeSvg,'7d','symlog',true);
+assert.match(hugeSvg.innerHTML,/>1e\+12</);
+assert.doesNotMatch(hugeSvg.innerHTML,/NaN|Infinity|undefined/);
+
+const barClampData=structuredClone(allZeroRateData),barClampSvg=element(800);
+chart('transport_rejections',barClampData).series[0].history.daily.at(-1)[1]=1000;
+chart('exit_stream_rejections',barClampData).series[0].history.daily.at(-1)[1]=1e-4;
+application('',barClampData).app.drawHero(barClampSvg,'7d','linear',true);
+for(const m of barClampSvg.innerHTML.matchAll(/<rect class="hero-rate-bar" x="[\d.]+" y="([\d.]+)" width="[\d.]+" height="([\d.]+)"/g)){
+ assert.ok(Number(m[1])>=24&&Number(m[1])+Number(m[2])<=194.01,'bar slice stays strictly inside Tier 1 rate bounds');
+}
+
+const qOverflow=structuredClone(allZeroRateData);
+chart('queue_limit_circuits',qOverflow).series.find(s=>s.key==='circuit_killed_max_cell').history.daily.at(-1)[1]=1e306;
+assert.doesNotMatch(inspectHero(qOverflow,'7d',['End']).steps[0].tooltipHtml,/Unavailable\/h/);
+const cssText=fs.readFileSync(path.join(__dirname,'..','site','style.css'),'utf8'),mobileTail=cssText.slice(cssText.lastIndexOf('@media(max-width:600px)'));
+for(const [base,mob] of [['.hero-card { margin-bottom: 26px','.hero-card { margin-bottom: 20px'],['.hero-kpi-grid { display:','.hero-kpi-grid { gap: 12px'],['.hero-kpi-value { font-size: 26px','.hero-kpi-value { font-size: clamp'],['.hero-plot-wrap { min-height: 360px','.hero-plot-wrap { min-height: 320px']]){
+ assert.ok(cssText.includes(base)&&mobileTail.includes(mob)&&cssText.lastIndexOf(mob)>cssText.indexOf(base),`mobile ${mob} overrides base`);
+}
+assert.match(application('?view=methods',data).app.markup(),/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
+
+const copiedQueries=[];
+const copyCtrl=application('?view=explorer&chart=transport_rejections');
+copyCtrl.browser.navigator.clipboard={async writeText(text){copiedQueries.push(text);}};
+copyCtrl.app.start();
+(async()=>{
+ const scheduled=[];
+ const origSetTimeout=globalThis.setTimeout;
+ globalThis.setTimeout=(cb,ms)=>{scheduled.push([cb,ms]);return {unref(){}};};
+ try{
+  const firstBtn={dataset:{copy:'transport_rejections',queryKind:'plot'},textContent:'Copy',isConnected:true,closest:s=>s==='[data-copy]'?firstBtn:null};
+  await copyCtrl.events.get('click')({target:firstBtn});
+  assert.equal(firstBtn.textContent,'Copied');
+  assert.equal(scheduled[0][1],2000);
+  scheduled[0][0]();
+  assert.equal(firstBtn.textContent,'Copy');
+  for(const kind of ['coverage']){
+   click(copyCtrl,'[data-copy]',{queryKind:kind});
+  }
+  await new Promise(resolve=>setImmediate(resolve));
+  const trChart=chart('transport_rejections');
+  assert.deepEqual(copiedQueries,[trChart.history_queries.daily.value,trChart.history_queries.daily.eligible]);
+  copyCtrl.browser.navigator.clipboard={async writeText(){throw new Error('denied');}};
+  const errBtn={dataset:{copy:'transport_rejections',queryKind:'plot'},textContent:'Copy',isConnected:true,closest:s=>s==='[data-copy]'?errBtn:null};
+  await copyCtrl.events.get('click')({target:errBtn});
+  assert.equal(errBtn.textContent,'Select text to copy');
+
+  // Async clipboard stale-request ignoring + clearTimeout race: only latest request updates/schedules timer.
+  const raceTimers=[],clearedTimers=[];
+  const origClearTimeout=globalThis.clearTimeout;
+  const clipLive={textContent:''};
+  const origClipQS=copyCtrl.browser.document.querySelector;
+  copyCtrl.browser.document.querySelector=s=>s==='[data-live-status]'?clipLive:origClipQS(s);
+  let timerSeq=0;
+  globalThis.setTimeout=(cb,ms)=>{const id=++timerSeq;raceTimers.push({id,cb,ms});return id;};
+  globalThis.clearTimeout=id=>{if(id!==undefined)clearedTimers.push(id);};
+  try{
+   let calls=[];
+   copyCtrl.browser.navigator.clipboard={
+    writeText(){return new Promise((resolve,reject)=>{calls.push({resolve,reject});});}
+   };
+   const raceBtn={dataset:{copy:'transport_rejections',queryKind:'plot'},textContent:'Copy',isConnected:true,closest:s=>s==='[data-copy]'?raceBtn:null};
+   const seq1=copyCtrl.events.get('click')({target:raceBtn});
+   calls[0].resolve();await seq1;
+   assert.equal(raceTimers.length,1);assert.equal(clearedTimers.length,0);
+   const seq2=copyCtrl.events.get('click')({target:raceBtn});
+   calls[1].resolve();await seq2;
+   assert.deepEqual(clearedTimers,[raceTimers[0].id]);
+   assert.equal(raceTimers.length,2);
+   raceTimers[1].cb();
+   assert.equal(raceBtn.textContent,'Copy');
+
+   // Out-of-order overlap: click 1 fails after click 2 succeeds -> stale click 1 is completely ignored.
+   calls=[];raceTimers.length=0;clearedTimers.length=0;clipLive.textContent='';
+   const staleBtn={dataset:{copy:'transport_rejections',queryKind:'plot'},textContent:'Copy',isConnected:true,closest:s=>s==='[data-copy]'?staleBtn:null};
+   const slowFail=copyCtrl.events.get('click')({target:staleBtn});
+   const fastOk=copyCtrl.events.get('click')({target:staleBtn});
+   calls[1].resolve();await fastOk;
+   assert.equal(staleBtn.textContent,'Copied');
+   assert.equal(clipLive.textContent,'Copied PromQL query to clipboard.');
+   assert.equal(raceTimers.length,1);
+   calls[0].reject(new Error('late stale fail'));await slowFail;
+   assert.equal(staleBtn.textContent,'Copied');
+   assert.equal(clipLive.textContent,'Copied PromQL query to clipboard.');
+   assert.equal(raceTimers.length,1);
+   assert.equal(clearedTimers.length,0);
+   raceTimers[0].cb();
+   assert.equal(staleBtn.textContent,'Copy');
+  }finally{
+   globalThis.clearTimeout=origClearTimeout;
+   copyCtrl.browser.document.querySelector=origClipQS;
+  }
+
+  // Negative axisNumber symmetry and -0 UI suppression.
+  for(const [val,expected] of [[-1.234,'-1.23'],[-555,'-555'],[-1500,'-1,500'],[-1500000,'-1.5M'],[-0.025,'-0.025'],[-1e-5,'-1e-5'],[-0,'0']]){
+   assert.equal(ui.axisNumber(val),expected,`axisNumber(${val})`);
+  }
+  assert.equal(ui.number(-0),'0');
+  const negZeroData=structuredClone(data);
+  negZeroData.dircache_cohort={configured_nonexit_zero:-0,observed_controlport_zero:-0,file_config_fallback_zero:-0};
+  for(const cid of ['open_circuits','directory_waiting']){
+   const s=chart(cid,negZeroData).series[0];
+   s.history.daily.at(-1)[1]=-0;s.current.day={value:-0,relays:8,expected_relays:8,coverage:1,valid:true};
+   s.peaks.day={fleet_peak:100,fleet_peak_at:negZeroData.end,fleet_peak_relays:8,current_is_record:false};
+  }
+  const nzSeries=chart('transport_rejections',negZeroData).series[0];
+  nzSeries.current.day={value:-0,relays:8,expected_relays:8,coverage:1,valid:true};
+  nzSeries.reference.day={n:-0,current_percentile:null,flat_zero:false,mean_per_relay:0,start:negZeroData.reference_window.start,end:negZeroData.reference_window.end};
+  nzSeries.historical_averages.seven_days.days=-0;
+  nzSeries.relay_counts.day={total:-0,guard:null,middle_only:null,exit:null,hsdir:null,v2dir:null,role_bounds:{guard:[-0,-0],middle_only:[0,0],exit:[0,0],hsdir:[0,0],v2dir:[0,0]},measured_windows:-0,classified_windows:0,relay_windows:0,classified_relay_windows:0,coverage:-0};
+  nzSeries.relay_counts.seven_days.coverage=-0;
+  for(const viewSearch of ['?view=overview','?view=explorer&chart=transport_rejections','?view=methods']){
+   const html=application(viewSearch,negZeroData).app.markup();
+   assert.doesNotMatch(html,/>-0(?:<|%| total| \/| non-exit)/,`no -0 UI leak in ${viewSearch}`);
+  }
+  for(const [patch,rx] of [
+   [tr=>{tr.periods[0].window.comparison_lag_days=-0;},/time_ranges days window/],
+   [tr=>{tr.periods.at(-1).window.comparison_lag_days=-0;},/time_ranges all_time window/],
+   [tr=>{tr.periods[0].minimum_coverage=-0;},/time_ranges minimum_coverage/],
+   [tr=>{tr.periods[0].window.unit=['days'];},/Unsupported time_ranges window unit/],
+   [tr=>{tr.periods[1].window.unit=['months'];},/Unsupported time_ranges window unit/],
+   [tr=>{tr.periods[0].window.unit=123;},/Unsupported time_ranges window unit/],
+  ]){
+   const badTr=structuredClone(data.time_ranges);patch(badTr);
+   assert.throws(()=>ui.validateTimeRanges(badTr),rx);
+  }
+
+  // replaceRelease preserves focus on [data-query-kind="coverage"] and [data-methods].
+  const covCtrl=application('?view=explorer&chart=transport_rejections',data,'1',releaseContext(data,'cov-old',()=>data.end));
+  covCtrl.app.start();
+  const covBtn=covCtrl.browser.document.querySelectorAll('[data-copy]').find(el=>el.dataset.queryKind==='coverage');
+  assert.ok(covBtn);covBtn.focus({preventScroll:true});
+  const covFresh=structuredClone(data);
+  covCtrl.app.replaceRelease(covFresh,releaseContext(covFresh,'cov-new',()=>covFresh.end));
+  assert.equal(covCtrl.browser.document.activeElement,covCtrl.browser.document.querySelectorAll('[data-copy]').find(el=>el.dataset.queryKind==='coverage'));
+  const methCtrl=application('?view=overview',data,'1',releaseContext(data,'meth-old',()=>data.end));
+  methCtrl.app.start();
+  methCtrl.browser.document.querySelector('[data-methods]').focus({preventScroll:true});
+  const methFresh=structuredClone(data);
+  methCtrl.app.replaceRelease(methFresh,releaseContext(methFresh,'meth-new',()=>methFresh.end));
+  assert.equal(methCtrl.browser.document.activeElement,methCtrl.browser.document.querySelector('[data-methods]'));
+
+  // Layout normalization + no-op skip + stale/null target click guards.
+  const guardCtrl=application('?view=overview');guardCtrl.app.start();
+  const initialState=guardCtrl.app.getState();
+  const forgedLayout={dataset:{layout:'bad" onclick="x'},closest:s=>s==='[data-layout]'?forgedLayout:null};
+  guardCtrl.events.get('click')({target:forgedLayout,button:0,preventDefault(){}});
+  assert.equal(guardCtrl.app.getState().layout,'full');
+  const genBefore=guardCtrl.page.generation;
+  click(guardCtrl,'[data-layout]',{layout:'full'});
+  assert.equal(guardCtrl.page.generation,genBefore,'clicking already-active layout does not redraw');
+  for(const [attr,ds] of [['[data-explore]',{explore:'missing',chart:'missing',range:'bad'}],['[data-child]',{child:'missing'}],['[data-family]',{family:'missing'}],['[data-view]',{view:'bogus'}]]){
+   const node={dataset:ds,closest:s=>s===attr?node:null};
+   guardCtrl.events.get('click')({target:node,button:0,preventDefault(){}});
+  }
+  assert.deepEqual(guardCtrl.app.getState(),initialState);
+
+  // Empty <path> omission in draw().
+  const emptyPathData=structuredClone(data),epChart=chart('transport_rejections',emptyPathData);
+  const cutoff7d=emptyPathData.end-7*86400;
+  for(const row of epChart.series[0].history.daily)if(row[0]>cutoff7d)row[4]=false;
+  const epPlot=element(800);
+  application('?view=explorer&chart=transport_rejections&range=7d',emptyPathData).app.draw(epPlot,epChart,'7d');
+  assert.equal((epPlot.innerHTML.match(/class="measurement-series"/g)||[]).length,1);
+
+  // Disqualified-day tooltip suppression & resize activeIndex preservation & touch tap & Escape preventDefault.
+  const disqData=structuredClone(data),dc=chart('transport_rejections',disqData);
+  for(const s of dc.series){
+   const lenD=s.history.daily.length;
+   if(lenD>=2){
+    const dRow=s.history.daily[lenD-2];
+    dRow[1]=12;dRow[2]=104;dRow[3]=0.5;dRow[4]=true;
+    s.history.daily[lenD-1][4]=true;s.history.daily[lenD-1][3]=1;
+   }
+   s.reference.day={n:100,p10_per_relay:0.01,p50_per_relay:0.05,p90_per_relay:0.2,mean_per_relay:0.05,current_percentile:50,flat_zero:false,start:disqData.reference_window.start,end:disqData.reference_window.end};
+  }
+  const hCtrl=application('?view=explorer&chart=transport_rejections&range=7d&band=1',disqData);
+  const hLive={textContent:''};
+  const makePlotMock=(attrs,isHero)=>{
+   let html='';
+   const el={cur:null,tip:null,dataset:attrs,
+    get innerHTML(){return html;},
+    set innerHTML(v){html=v;el.cur=null;el.tip=null;},
+    getBoundingClientRect:()=>({width:800,height:isHero?400:300}),
+    closest:s=>(isHero?s==='[data-hero-plot]':s==='[data-chart-plot]')?el:null,
+    querySelector:s=>s==='svg'?svg:s==='.plot-cursor'?el.cur:s==='.chart-tooltip'?el.tip:null,
+    appendChild:n=>{el.tip=n;n.owner=el;},
+    contains:node=>node===el,setAttribute(){},hasAttribute:()=>false};
+   const svg={getBoundingClientRect:()=>({left:0,width:800,height:300}),querySelector:s=>s==='.plot-cursor'?el.cur:null,appendChild:n=>{el.cur=n;n.owner=el;}};
+   return el;
+  };
+  const heroResizeEl=makePlotMock({heroPlotRange:'7d'},true);
+  const chartResizeEl=makePlotMock({chartPlot:'transport_rejections',range:'7d'},false);
+  const origQS=hCtrl.browser.document.querySelector,origQSA=hCtrl.browser.document.querySelectorAll;
+  hCtrl.browser.document.querySelector=s=>s==='[data-live-status]'?hLive:origQS(s);
+  hCtrl.browser.document.querySelectorAll=s=>s==='[data-hero-plot]'?[heroResizeEl]:s==='[data-chart-plot]'?[chartResizeEl]:origQSA(s);
+  hCtrl.browser.document.createElement=tag=>({tag,className:'',innerHTML:'',style:{},owner:null,remove(){if(this.owner)this.owner.tip=null;}});
+  hCtrl.browser.document.createElementNS=(ns,tag)=>({ns,tag,attrs:{},owner:null,setAttribute(k,v){this.attrs[k]=v;},remove(){if(this.owner)this.owner.cur=null;}});
+  const rTimers=[];
+  const origClearResize=globalThis.clearTimeout;
+  globalThis.setTimeout=(cb,ms)=>{const id=rTimers.length+1;rTimers.push({id,cb,ms});return id;};
+  globalThis.clearTimeout=()=>{};
+  try{
+   hCtrl.app.start();
+   const kd=hCtrl.events.get('keydown');
+   kd({key:'ArrowLeft',target:chartResizeEl,preventDefault(){}});
+   assert.match(chartResizeEl.tip.innerHTML,/Reporting relays:/);assert.match(chartResizeEl.tip.innerHTML,/10th–90th:/);
+   kd({key:'ArrowLeft',target:chartResizeEl,preventDefault(){}});
+   assert.match(chartResizeEl.tip.innerHTML,/Missing/);
+   assert.doesNotMatch(chartResizeEl.tip.innerHTML,/Reporting relays:/);
+   assert.doesNotMatch(chartResizeEl.tip.innerHTML,/10th–90th:/);
+   kd({key:'ArrowLeft',target:heroResizeEl,preventDefault(){}});
+   const savedChartTip=chartResizeEl.tip.innerHTML,savedHeroTip=heroResizeEl.tip.innerHTML;
+   hLive.textContent='';
+   hCtrl.windowEvents.get('resize')();
+   assert.ok(rTimers.length>0);
+   rTimers.at(-1).cb();
+   assert.ok(chartResizeEl.cur&&chartResizeEl.tip&&chartResizeEl.tip.innerHTML===savedChartTip,'chart activeIndex preserved on resize');
+   assert.ok(heroResizeEl.cur&&heroResizeEl.tip&&heroResizeEl.tip.innerHTML===savedHeroTip,'hero activeIndex preserved on resize');
+   assert.equal(hLive.textContent,'','resize restore does not re-announce live status');
+
+   // Touch tap inspection stays visible across pointerout (pointerType='touch') until tap outside or Escape.
+   const pm=hCtrl.events.get('pointermove'),pd=hCtrl.events.get('pointerdown'),po=hCtrl.events.get('pointerout');
+   kd({key:'Escape',target:chartResizeEl,preventDefault(){}});
+   assert.equal(chartResizeEl.tip,null);
+   pd({target:chartResizeEl,clientX:400,pointerType:'touch'});
+   assert.ok(chartResizeEl.cur&&chartResizeEl.tip,'touch pointerdown inspects interval');
+   po({target:chartResizeEl,pointerType:'touch',relatedTarget:null});
+   assert.ok(chartResizeEl.cur&&chartResizeEl.tip,'touch pointerout does not wipe tooltip');
+   const outside={closest:()=>null};
+   pd({target:outside,clientX:10,pointerType:'touch'});
+   assert.equal(chartResizeEl.tip,null,'tapping outside dismisses touch tooltip');
+   pm({target:chartResizeEl,clientX:400,pointerType:'mouse'});
+   assert.ok(chartResizeEl.tip);
+   po({target:chartResizeEl,pointerType:'mouse',relatedTarget:null});
+   assert.equal(chartResizeEl.tip,null,'desktop mouse pointerout still clears tooltip');
+
+   // Escape calls e.preventDefault?.() for active chart inspection and open mobile nav menu.
+   pm({target:chartResizeEl,clientX:400,pointerType:'mouse'});
+   let chartPrevented=false;
+   kd({key:'Escape',target:chartResizeEl,preventDefault(){chartPrevented=true;}});
+   assert.equal(chartPrevented,true);assert.equal(chartResizeEl.tip,null);
+   const navClasses=new Set(['show']),navLinks={classList:{contains:k=>navClasses.has(k),remove:k=>navClasses.delete(k),toggle:k=>navClasses.has(k)?navClasses.delete(k):navClasses.add(k)}};
+   let toggleFocused=false;const navToggle={setAttribute(){},closest:s=>s==='.nav-toggle'?navToggle:null,focus(){toggleFocused=true;}};
+   hCtrl.browser.document.querySelector=s=>({'.nav-links':navLinks,'.nav-toggle':navToggle,'[data-live-status]':hLive}[s]||origQS(s));
+   let navPrevented=false;
+   kd({key:'Escape',target:navToggle,preventDefault(){navPrevented=true;}});
+   assert.equal(navPrevented,true);assert.equal(navClasses.has('show'),false);assert.equal(toggleFocused,true);
+   navClasses.add('show');
+   kd({key:'Escape',target:navToggle});
+   assert.equal(navClasses.has('show'),false);
+
+   // Non-finite clientX / index guards on chart and hero plots.
+   for(const targetEl of [chartResizeEl,heroResizeEl]){
+    kd({key:'Escape',target:targetEl});
+    pm({target:targetEl,clientX:undefined,pointerType:'mouse'});
+    pm({target:targetEl,clientX:NaN,pointerType:'mouse'});
+   }
+   assert.equal(chartResizeEl.cur,null);assert.equal(chartResizeEl.tip,null);
+   assert.equal(heroResizeEl.cur,null);assert.equal(heroResizeEl.tip,null);
+   hCtrl.browser.document.querySelector=origQS;
+   hCtrl.browser.document.querySelectorAll=origQSA;
+  }finally{
+   globalThis.setTimeout=origSetTimeout;
+   globalThis.clearTimeout=origClearResize;
+  }
+
+  // Mobile (<450px) tooltip uses 8px horizontal insets on left/right halves.
+  const mobCtrl=application('?view=explorer&chart=transport_rejections&range=7d');
+  let mobCur=null,mobTip=null;
+  const mobSvg={getBoundingClientRect:()=>({left:0,width:320,height:300}),querySelector:s=>s==='.plot-cursor'?mobCur:null,appendChild:n=>{mobCur=n;}};
+  const mobPlot={dataset:{chartPlot:'transport_rejections',range:'7d'},innerHTML:'',getBoundingClientRect:()=>({width:320,height:300}),
+   closest:s=>s==='[data-chart-plot]'?mobPlot:null,
+   querySelector:s=>s==='svg'?mobSvg:s==='.plot-cursor'?mobCur:s==='.chart-tooltip'?mobTip:null,
+   appendChild:n=>{mobTip=n;},setAttribute(){},hasAttribute:()=>false};
+  mobCtrl.browser.document.createElement=tag=>({tag,className:'',innerHTML:'',style:{},remove(){if(this===mobTip)mobTip=null;}});
+  mobCtrl.browser.document.createElementNS=(ns,tag)=>({ns,tag,attrs:{},setAttribute(k,v){this.attrs[k]=v;},remove(){if(this===mobCur)mobCur=null;}});
+  mobCtrl.app.start();
+  mobCtrl.app.draw(mobPlot,chart('transport_rejections'),'7d',320);
+  mobCtrl.events.get('pointermove')({target:mobPlot,clientX:290,pointerType:'mouse'});
+  assert.equal(mobTip.style.left,'8px');assert.equal(mobTip.style.right,'auto');
+  mobCtrl.events.get('pointermove')({target:mobPlot,clientX:75,pointerType:'mouse'});
+  assert.equal(mobTip.style.right,'8px');assert.equal(mobTip.style.left,'auto');
+
+  // replaceRelease disabled control & unmarked #app element focus fallback to view heading.
+  const bandData=structuredClone(data);
+  chart('transport_rejections',bandData).series.forEach(s=>{
+   s.reference.day={n:100,p10_per_relay:0.01,p50_per_relay:0.05,p90_per_relay:0.2,mean_per_relay:0.05,current_percentile:50,flat_zero:false,start:bandData.reference_window.start,end:bandData.reference_window.end};
+  });
+  const disRelCtrl=application('?view=explorer&chart=transport_rejections',bandData,'1',releaseContext(bandData,'band-on',()=>bandData.end));
+  disRelCtrl.app.start();
+  disRelCtrl.browser.document.querySelector('[data-band-toggle]').focus({preventScroll:true});
+  assert.equal(disRelCtrl.browser.document.activeElement.getAttribute('data-band-toggle'),'');
+  const noBandData=structuredClone(bandData);
+  chart('transport_rejections',noBandData).series.forEach(s=>{s.reference.day.n=1;});
+  disRelCtrl.app.replaceRelease(noBandData,releaseContext(noBandData,'band-off',()=>noBandData.end));
+  assert.equal(disRelCtrl.browser.document.activeElement,disRelCtrl.browser.document.querySelector('[data-view-heading]'));
+
+  const fixCtrl=application('?view=fixes',data,'1',releaseContext(data,'fix-old',()=>data.end));
+  fixCtrl.app.start();
+  const extLink=fixCtrl.browser.document.querySelectorAll('a').find(a=>!a.hasAttribute('data-view'));
+  assert.ok(extLink);extLink.focus({preventScroll:true});
+  assert.equal(fixCtrl.browser.document.activeElement,extLink);
+  fixCtrl.app.replaceRelease(structuredClone(data),releaseContext(data,'fix-new',()=>data.end));
+  assert.equal(fixCtrl.browser.document.activeElement,fixCtrl.browser.document.querySelector('[data-view-heading]'));
+
+  // render() resets touchPlot so later outside touch taps cannot touch detached plots.
+  const tpCtrl=application('?view=explorer&chart=transport_rejections&range=7d');
+  let tpCur=null,tpTip=null,detachedWipes=0;
+  const tpSvg={getBoundingClientRect:()=>({left:0,width:800,height:300}),querySelector:s=>s==='.plot-cursor'?tpCur:null,appendChild:n=>{tpCur=n;}};
+  const tpPlot={dataset:{chartPlot:'transport_rejections',range:'7d'},innerHTML:'',getBoundingClientRect:()=>({width:800,height:300}),
+   closest:s=>s==='[data-chart-plot]'?tpPlot:null,
+   querySelector:s=>s==='svg'?tpSvg:s==='.plot-cursor'?tpCur:s==='.chart-tooltip'?tpTip:null,
+   appendChild:n=>{tpTip=n;},setAttribute(){},hasAttribute:()=>false};
+  tpCtrl.browser.document.createElement=tag=>({tag,className:'',innerHTML:'',style:{},remove(){if(this===tpTip){detachedWipes++;tpTip=null;}}});
+  tpCtrl.browser.document.createElementNS=(ns,tag)=>({ns,tag,attrs:{},setAttribute(k,v){this.attrs[k]=v;},remove(){if(this===tpCur){detachedWipes++;tpCur=null;}}});
+  tpCtrl.app.start();
+  tpCtrl.app.draw(tpPlot,chart('transport_rejections'),'7d');
+  tpCtrl.events.get('pointerdown')({target:tpPlot,clientX:400,pointerType:'touch'});
+  assert.ok(tpCur&&tpTip);
+  click(tpCtrl,'[data-all-range]',{allRange:'1mo'});
+  detachedWipes=0;
+  tpCtrl.events.get('pointerdown')({target:{closest:()=>null},clientX:10,pointerType:'touch'});
+  assert.equal(detachedWipes,0);
+
+  // cachedPlot distinguishes single series literally named '*' from multi-series cache key '*'.
+  const starData=structuredClone(data),sc=chart('transport_rejections',starData);
+  sc.series[0].key='*';sc.display_keys=['*',sc.series[1].key];sc.primary_series='*';
+  for(const s of sc.series)s.reference.day={n:100,p10_per_relay:0.01,p50_per_relay:0.05,p90_per_relay:0.2,mean_per_relay:0.05,current_percentile:50,flat_zero:false,start:starData.reference_window.start,end:starData.reference_window.end};
+  const starCtrl=application('?view=explorer&chart=transport_rejections&range=7d',starData);
+  starCtrl.app.start();
+  const starMulti=element(800),starBand=element(800);
+  starCtrl.app.draw(starMulti,sc,'7d');
+  assert.equal((starMulti.innerHTML.match(/class="measurement-series"/g)||[]).length,2);
+  click(starCtrl,'[data-band-toggle]');
+  starCtrl.app.draw(starBand,sc,'7d');
+  assert.equal((starBand.innerHTML.match(/class="measurement-series"/g)||[]).length,1);
+
+  // Oxford commas in methods() lag sentence, validTime in .average-dates, and xAxisTicks invalid bounds.
+  const lag3Data=structuredClone(data);
+  const p7=structuredClone(data.time_ranges.periods[0]);
+  const p14={...structuredClone(p7),id:'14d',summary_key:'fourteen_days',export_suffix:'14d',label:'14 days',average_label:'Last 14 days average',plot_label:'Last 14 days',window:{unit:'days',count:14,comparison_lag_days:1}};
+  const p28={...structuredClone(p7),id:'28d',summary_key:'twenty_eight_days',export_suffix:'28d',label:'28 days',average_label:'Last 28 days average',plot_label:'Last 28 days',window:{unit:'days',count:28,comparison_lag_days:1}};
+  lag3Data.time_ranges.periods=[p7,p14,p28,...data.time_ranges.periods.slice(1)];
+  for(const c of lag3Data.charts)for(const s of c.series){
+   s.historical_averages.fourteen_days={...structuredClone(s.historical_averages.seven_days)};
+   s.historical_averages.twenty_eight_days={...structuredClone(s.historical_averages.seven_days)};
+   if(s.relay_counts){s.relay_counts.fourteen_days={...structuredClone(s.relay_counts.seven_days)};s.relay_counts.twenty_eight_days={...structuredClone(s.relay_counts.seven_days)};}
+  }
+  const oxMethods=application('?view=methods',lag3Data).app.markup();
+  assert.match(oxMethods,/7 days, 14 days, and 28 days/);
+
+  const badAvgDateData=structuredClone(data);
+  chart('transport_rejections',badAvgDateData).series[0].historical_averages.seven_days.start='not-a-timestamp';
+  chart('transport_rejections',badAvgDateData).series[0].historical_averages.one_month.end=null;
+  const badAvgHtml=application('?view=explorer&chart=transport_rejections',badAvgDateData).app.markup();
+  assert.doesNotMatch(badAvgHtml,/average-dates[^<]*Unavailable/);
+
+  assert.deepEqual(ui.xAxisTicks(100,100,800,62,12),[]);
+  assert.deepEqual(ui.xAxisTicks(200,100,800,62,12),[]);
+  assert.deepEqual(ui.xAxisTicks(NaN,200,800,62,12),[]);
+  assert.deepEqual(ui.xAxisTicks(1e15,2e15,800,62,12),[]);
+
+  // replaceRelease restricts focus restoration to #app and preserves occurrence order across identical links.
+  const ovCtrl=application('?view=explorer&chart=transport_rejections',data,'1',releaseContext(data,'ov-old',()=>data.end));
+  const staticNavOverview={tagName:'A',dataset:{view:'overview'},setAttribute(){},hasAttribute:n=>n==='data-view',getAttribute:n=>n==='data-view'?'overview':null,focus(){}};
+  const origOvQSA=ovCtrl.browser.document.querySelectorAll;
+  ovCtrl.browser.document.querySelectorAll=s=>s==='[data-view]'?[staticNavOverview,...origOvQSA(s)]:origOvQSA(s);
+  const inAppOverviews=()=>origOvQSA('[data-view]').filter(n=>n.getAttribute('data-view')==='overview');
+  ovCtrl.app.start();
+  const initialOvLinks=inAppOverviews();
+  assert.equal(initialOvLinks.length,2,'explorer renders subnav and breadcrumb overview links');
+  assert.equal(ovCtrl.page.contains(staticNavOverview),false);
+  initialOvLinks[1].focus({preventScroll:true});
+  ovCtrl.app.replaceRelease(structuredClone(data),releaseContext(data,'ov-new-1',()=>data.end));
+  const afterBreadcrumbLinks=inAppOverviews();
+  assert.equal(ovCtrl.browser.document.activeElement,afterBreadcrumbLinks[1]);
+  assert.equal(ovCtrl.page.contains(ovCtrl.browser.document.activeElement),true);
+  afterBreadcrumbLinks[0].focus({preventScroll:true});
+  ovCtrl.app.replaceRelease(structuredClone(data),releaseContext(data,'ov-new-2',()=>data.end));
+  assert.equal(ovCtrl.browser.document.activeElement,inAppOverviews()[0]);
+
+  // Custom period id='band' does not collide with bandReference cache key 'band:<r>:<key>'.
+  const bandPeriodData=structuredClone(data);
+  const p7d=structuredClone(data.time_ranges.periods[0]),p1m=structuredClone(data.time_ranges.periods[1]),pAll=structuredClone(data.time_ranges.periods.at(-1));
+  bandPeriodData.time_ranges={
+   version:1,default_range:'1',legacy_aliases:{},card_slots:{fallback_dynamic:'1',fixed:['band','all']},
+   periods:[
+    {...p7d,id:'1',export_suffix:'1p'},
+    {...p1m,id:'band',export_suffix:'band'},
+    pAll,
+   ],
+  };
+  const bc=chart('transport_rejections',bandPeriodData);
+  bc.series.forEach(s=>{
+   s.reference.day={n:100,p10_per_relay:0.01,p50_per_relay:0.05,p90_per_relay:0.2,mean_per_relay:0.05,current_percentile:50,flat_zero:false,start:bandPeriodData.reference_window.start,end:bandPeriodData.reference_window.end};
+  });
+  const bandCollisionCtrl=application('?view=explorer&chart=transport_rejections&range=1&band=1',bandPeriodData);
+  bandCollisionCtrl.app.start();
+  click(bandCollisionCtrl,'[data-all-range]',{allRange:'band'});
+  assert.equal(bandCollisionCtrl.app.getState().range,'band');
+  assert.equal(bandCollisionCtrl.app.getState().bandEnabled,true);
+  const bandCollisionSvg=element(800);
+  bandCollisionCtrl.app.draw(bandCollisionSvg,bc,'band');
+  assert.match(bandCollisionSvg.innerHTML,/class="measurement-series"/);
+  assert.match(bandCollisionSvg.innerHTML,/class="reference-band"/);
+
+  // .hero-controls keeps margin-bottom spacing when wrapping at <=1200px widths.
+  const latestCss=fs.readFileSync(path.join(__dirname,'..','site','style.css'),'utf8');
+  assert.match(latestCss,/\.hero-controls\s*\{[^}]*margin-bottom:\s*14px;/);
+ }finally{
+  globalThis.setTimeout=origSetTimeout;
+ }
+ console.log('Display checks passed: source selectors, state/controllers, both layouts and global ranges across six families, legacy migration/history, units/tables, bands/gaps, finite extremes, encoded metadata, modified links, failed startup, adaptive X-axis ticks, keyboard inspection, and frontend hardening.');
+})().catch(error=>{
+ console.error(error);
+ process.exit(1);
+});

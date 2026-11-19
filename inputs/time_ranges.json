@@ -1,0 +1,111 @@
+{
+  "version": 1,
+  "default_range": "1mo",
+  "legacy_aliases": {
+    "24h": "1mo",
+    "30d": "1mo",
+    "1m": "1mo",
+    "3m": "3mo",
+    "6m": "6mo",
+    "12m": "12mo"
+  },
+  "card_slots": {
+    "fallback_dynamic": "1mo",
+    "fixed": [
+      "6mo",
+      "all"
+    ]
+  },
+  "periods": [
+    {
+      "id": "7d",
+      "summary_key": "seven_days",
+      "export_suffix": "7d",
+      "label": "7 days",
+      "average_label": "Last 7 days average",
+      "plot_label": "Last 7 days",
+      "window": {
+        "unit": "days",
+        "count": 7,
+        "comparison_lag_days": 1
+      },
+      "minimum_coverage": 0,
+      "minimum_comparison_windows": 6
+    },
+    {
+      "id": "1mo",
+      "summary_key": "one_month",
+      "export_suffix": "1mo",
+      "label": "1 month",
+      "average_label": "Last 1 month average",
+      "plot_label": "Last 1 month",
+      "window": {
+        "unit": "months",
+        "count": 1,
+        "comparison_lag_days": 0
+      },
+      "minimum_coverage": 0,
+      "minimum_comparison_windows": 25
+    },
+    {
+      "id": "3mo",
+      "summary_key": "three_months",
+      "export_suffix": "3mo",
+      "label": "3 months",
+      "average_label": "Last 3 months average",
+      "plot_label": "Last 3 months",
+      "window": {
+        "unit": "months",
+        "count": 3,
+        "comparison_lag_days": 0
+      },
+      "minimum_coverage": 0,
+      "minimum_comparison_windows": 30
+    },
+    {
+      "id": "6mo",
+      "summary_key": "six_months",
+      "export_suffix": "6mo",
+      "label": "6 months",
+      "average_label": "Last 6 months average",
+      "plot_label": "Last 6 months",
+      "window": {
+        "unit": "months",
+        "count": 6,
+        "comparison_lag_days": 0
+      },
+      "minimum_coverage": 0,
+      "minimum_comparison_windows": 30
+    },
+    {
+      "id": "12mo",
+      "summary_key": "twelve_months",
+      "export_suffix": "12mo",
+      "label": "12 months",
+      "average_label": "Last 12 months average",
+      "plot_label": "Last 12 months",
+      "window": {
+        "unit": "months",
+        "count": 12,
+        "comparison_lag_days": 0
+      },
+      "minimum_coverage": 0,
+      "minimum_comparison_windows": 30
+    },
+    {
+      "id": "all",
+      "summary_key": "all_time",
+      "export_suffix": "all-time",
+      "label": "All time",
+      "average_label": "All-time average",
+      "plot_label": "All time",
+      "window": {
+        "unit": "all_time",
+        "count": null,
+        "comparison_lag_days": 0
+      },
+      "minimum_coverage": 0,
+      "minimum_comparison_windows": 30
+    }
+  ]
+}

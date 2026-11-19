@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "project": "OnionSurge",
+  "queries": {
+    "cohort_custom_runtime": "count by(build_id)((label_replace(label_replace(tor41339_build_info,\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) and on(instance) tor_relay_hsdir_fetch_total{job=\"tor_relays\",action=\"success\"})",
+    "cohort_default_effective_dircache": "count by(dircache,dircache_source)(label_replace(onionforge_tor_process_effective_config_info * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"})",
+    "cohort_directory_defense_runtime": "count by(build_id)((label_replace(label_replace(tor41339_build_info,\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) and on(instance) tor_relay_dos_total{job=\"tor_relays\",type=\"begindir_rejected\"})",
+    "cohort_fingerprint_verified": "sum(tor41339_fingerprint_verified)",
+    "cohort_native_runtime": "count by(build_id)((label_replace(label_replace(tor41339_build_info,\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) and on(instance) tor_relay_dos_total{job=\"tor_relays\",type=\"circuit_rejected\"})",
+    "cohort_observed_dircache": "count_values(\"dircache\",tor41339_directory_config_value{option=\"DirCache\"})",
+    "dircache_combined_zero": "count(((label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) == 0) or ((label_replace(onionforge_tor_process_effective_config_info{dircache=\"0\",dircache_source=\"torrc\"} * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) unless on(instance) (label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"})))",
+    "dircache_combined_zero_flags": "sum by(type)(tor_relay_flag{job=\"tor_relays\",type=~\"Guard|HSDir|V2Dir\"} and on(instance) (((label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) == 0) or ((label_replace(onionforge_tor_process_effective_config_info{dircache=\"0\",dircache_source=\"torrc\"} * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) unless on(instance) (label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}))))",
+    "dircache_combined_zero_nonexit": "count((((label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) == 0) or ((label_replace(onionforge_tor_process_effective_config_info{dircache=\"0\",dircache_source=\"torrc\"} * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) unless on(instance) (label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}))) and on(instance) (tor_relay_flag{job=\"tor_relays\",type=\"Exit\"}==0))",
+    "dircache_file0_observed1_conflicts": "count((label_replace(onionforge_tor_process_effective_config_info{dircache=\"0\",dircache_source=\"torrc\"} * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) and on(instance) ((label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"})==1))",
+    "dircache_file_fallback_zero": "count((label_replace(onionforge_tor_process_effective_config_info{dircache=\"0\",dircache_source=\"torrc\"} * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) unless on(instance) (label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}))",
+    "dircache_observed_zero": "count((label_replace(label_replace(tor41339_directory_config_value{option=\"DirCache\"},\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"})==0)",
+    "directory_rejections_daily_available": "count by(type)(tor_relay_dos_total{job=\"tor_relays\",type=~\"begindir_rejected|begindir_rate_rejected|begindir_hsdir_rejected\"})",
+    "directory_rejections_daily_eligible": "count by(type)(count_over_time(tor_relay_dos_total{job=\"tor_relays\",type=~\"begindir_rejected|begindir_rate_rejected|begindir_hsdir_rejected\"}[1d]) >= 360)",
+    "directory_rejections_daily_value": "sum by(type)(rate(tor_relay_dos_total{job=\"tor_relays\",type=~\"begindir_rejected|begindir_rate_rejected|begindir_hsdir_rejected\"}[1d]) and (count_over_time(tor_relay_dos_total{job=\"tor_relays\",type=~\"begindir_rejected|begindir_rate_rejected|begindir_hsdir_rejected\"}[1d]) >= 360))",
+    "directory_requests_daily_available": "count by(type)(count by(instance,type)(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}) == 3)",
+    "directory_requests_daily_eligible": "count by(type)(count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) >= 360) == 3)",
+    "directory_requests_daily_value": "sum by(type)(rate(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) and (count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) >= 360) and on(instance,type) (count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) >= 360) == 3))",
+    "directory_waiting_daily_available": "count(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"})",
+    "directory_waiting_daily_eligible": "count(count_over_time(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"}[1d]) >= 360)",
+    "directory_waiting_daily_value": "sum(avg_over_time(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"}[1d]) and (count_over_time(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"}[1d]) >= 360))",
+    "hsdir_fetches_daily_available": "count by(action)(tor_relay_hsdir_fetch_total{job=\"tor_relays\"})",
+    "hsdir_fetches_daily_eligible": "count by(action)(count_over_time(tor_relay_hsdir_fetch_total{job=\"tor_relays\"}[1d]) >= 360)",
+    "hsdir_fetches_daily_value": "sum by(action)(rate(tor_relay_hsdir_fetch_total{job=\"tor_relays\"}[1d]) and (count_over_time(tor_relay_hsdir_fetch_total{job=\"tor_relays\"}[1d]) >= 360))",
+    "hsdir_uploads_daily_available": "count by(action)(tor_relay_hsdir_upload_total{job=\"tor_relays\"})",
+    "hsdir_uploads_daily_eligible": "count by(action)(count_over_time(tor_relay_hsdir_upload_total{job=\"tor_relays\"}[1d]) >= 360)",
+    "hsdir_uploads_daily_value": "sum by(action)(rate(tor_relay_hsdir_upload_total{job=\"tor_relays\"}[1d]) and (count_over_time(tor_relay_hsdir_upload_total{job=\"tor_relays\"}[1d]) >= 360))",
+    "metadata_flags": "sum by(type)(tor_relay_flag{job=\"tor_relays\"})",
+    "metadata_targets": "count(up{job=\"tor_relays\"})",
+    "metadata_up": "sum(up{job=\"tor_relays\"})",
+    "onionskin_drops_daily_available": "count by(type)(tor_relay_load_onionskins_total{job=\"tor_relays\",action=\"dropped\"})",
+    "onionskin_drops_daily_eligible": "count by(type)(count_over_time(tor_relay_load_onionskins_total{job=\"tor_relays\",action=\"dropped\"}[1d]) >= 360)",
+    "onionskin_drops_daily_value": "sum by(type)(rate(tor_relay_load_onionskins_total{job=\"tor_relays\",action=\"dropped\"}[1d]) and (count_over_time(tor_relay_load_onionskins_total{job=\"tor_relays\",action=\"dropped\"}[1d]) >= 360))",
+    "open_circuits_daily_available": "count(tor_relay_circuits_total{job=\"tor_relays\",state=\"opened\"})",
+    "open_circuits_daily_eligible": "count(count_over_time(tor_relay_circuits_total{job=\"tor_relays\",state=\"opened\"}[1d]) >= 360)",
+    "open_circuits_daily_value": "sum(avg_over_time(tor_relay_circuits_total{job=\"tor_relays\",state=\"opened\"}[1d]) and (count_over_time(tor_relay_circuits_total{job=\"tor_relays\",state=\"opened\"}[1d]) >= 360))",
+    "protocol_closes_daily_available": "count(tor_relay_circ_proto_violation_total{job=\"tor_relays\"})",
+    "protocol_closes_daily_eligible": "count(count_over_time(tor_relay_circ_proto_violation_total{job=\"tor_relays\"}[1d]) >= 360)",
+    "protocol_closes_daily_value": "sum(rate(tor_relay_circ_proto_violation_total{job=\"tor_relays\"}[1d]) and (count_over_time(tor_relay_circ_proto_violation_total{job=\"tor_relays\"}[1d]) >= 360))",
+    "transport_rejections_daily_available": "count by(type)(tor_relay_dos_total{job=\"tor_relays\",type=~\"conn_rejected|concurrent_conn_rejected|circuit_rejected|introduce2_rejected|circuit_killed_max_cell|circuit_killed_max_cell_outq|stream_rejected\"})",
+    "transport_rejections_daily_eligible": "count by(type)(count_over_time(tor_relay_dos_total{job=\"tor_relays\",type=~\"conn_rejected|concurrent_conn_rejected|circuit_rejected|introduce2_rejected|circuit_killed_max_cell|circuit_killed_max_cell_outq|stream_rejected\"}[1d]) >= 360)",
+    "transport_rejections_daily_value": "sum by(type)(rate(tor_relay_dos_total{job=\"tor_relays\",type=~\"conn_rejected|concurrent_conn_rejected|circuit_rejected|introduce2_rejected|circuit_killed_max_cell|circuit_killed_max_cell_outq|stream_rejected\"}[1d]) and (count_over_time(tor_relay_dos_total{job=\"tor_relays\",type=~\"conn_rejected|concurrent_conn_rejected|circuit_rejected|introduce2_rejected|circuit_killed_max_cell|circuit_killed_max_cell_outq|stream_rejected\"}[1d]) >= 360))",
+    "version_runtime_binary_hashes": "count by(build_id,sha256)(tor41339_build_info)",
+    "version_runtime_fresh_members": "count(tor41339_member_source_timestamp_seconds{kind=\"cpu\"} > (time()-180))",
+    "version_runtime_mapped_by_build": "count by(build_id)(label_replace(label_replace(tor41339_build_info,\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"})",
+    "version_runtime_valid_members": "sum(tor41339_member_valid{kind=\"cpu\"})",
+    "cohort_native_verified_binary": "count by(build_id,sha256)((label_replace(label_replace(((tor41339_build_info{kind=\"state\"} and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_valid{kind=\"state\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_fingerprint_verified{kind=\"state\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_source_timestamp_seconds{kind=\"state\"} <= time())) and on(experiment_id,host,instance,job,member_id,unit,pid,start_ticks,boot_id) (tor41339_rss_bytes{kind=\"cpu\"} and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_valid{kind=\"cpu\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) ((tor41339_member_source_timestamp_seconds{kind=\"cpu\"} > (time()-180)) and (tor41339_member_source_timestamp_seconds{kind=\"cpu\"} <= time())))),\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) and on(instance) tor_relay_dos_total{job=\"tor_relays\",type=\"circuit_rejected\"})",
+    "attested_native_runtime": "count by(build_id)(onionsurge_attested_runtime_info{type=\"native\"})",
+    "cohort_directory_defense_verified_binary": "count by(build_id,sha256)((label_replace(label_replace(((tor41339_build_info{kind=\"state\"} and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_valid{kind=\"state\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_fingerprint_verified{kind=\"state\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_source_timestamp_seconds{kind=\"state\"} <= time())) and on(experiment_id,host,instance,job,member_id,unit,pid,start_ticks,boot_id) (tor41339_rss_bytes{kind=\"cpu\"} and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_valid{kind=\"cpu\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) ((tor41339_member_source_timestamp_seconds{kind=\"cpu\"} > (time()-180)) and (tor41339_member_source_timestamp_seconds{kind=\"cpu\"} <= time())))),\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) and on(instance) tor_relay_dos_total{job=\"tor_relays\",type=\"begindir_rejected\"})",
+    "attested_directory_defense_runtime": "count by(build_id)(onionsurge_attested_runtime_info{type=\"directory_defense\"})",
+    "cohort_custom_verified_binary": "count by(build_id,sha256)((label_replace(label_replace(((tor41339_build_info{kind=\"state\"} and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_valid{kind=\"state\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_fingerprint_verified{kind=\"state\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_source_timestamp_seconds{kind=\"state\"} <= time())) and on(experiment_id,host,instance,job,member_id,unit,pid,start_ticks,boot_id) (tor41339_rss_bytes{kind=\"cpu\"} and on(experiment_id,host,instance,job,kind,member_id,unit) (tor41339_member_valid{kind=\"cpu\"} == 1) and on(experiment_id,host,instance,job,kind,member_id,unit) ((tor41339_member_source_timestamp_seconds{kind=\"cpu\"} > (time()-180)) and (tor41339_member_source_timestamp_seconds{kind=\"cpu\"} <= time())))),\"instance\",\"$1\",\"host\",\"(.+)\") * on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,\"instance\",\"$1\",\"tor_metrics_instance\",\"(.+)\") and on(instance) up{job=\"tor_relays\"}) and on(instance) tor_relay_hsdir_fetch_total{job=\"tor_relays\",action=\"success\"})",
+    "attested_custom_runtime": "count by(build_id)(onionsurge_attested_runtime_info{type=\"custom\"})",
+    "attestation_proof_metadata": "sum by(type,sha256,build_id)(onionsurge_attestation_proof_observed_at)"
+  },
+  "operations": {
+    "circuit_rejections.daily.available": "transport_rejections_daily_available",
+    "circuit_rejections.daily.eligible": "transport_rejections_daily_eligible",
+    "circuit_rejections.daily.value": "transport_rejections_daily_value",
+    "cohort.custom_runtime": "cohort_custom_runtime",
+    "cohort.default_effective_dircache": "cohort_default_effective_dircache",
+    "cohort.directory_defense_runtime": "cohort_directory_defense_runtime",
+    "cohort.fingerprint_verified": "cohort_fingerprint_verified",
+    "cohort.native_runtime": "cohort_native_runtime",
+    "cohort.observed_dircache": "cohort_observed_dircache",
+    "dircache.combined_zero": "dircache_combined_zero",
+    "dircache.combined_zero_flags": "dircache_combined_zero_flags",
+    "dircache.combined_zero_nonexit": "dircache_combined_zero_nonexit",
+    "dircache.file0_observed1_conflicts": "dircache_file0_observed1_conflicts",
+    "dircache.file_fallback_zero": "dircache_file_fallback_zero",
+    "dircache.observed_zero": "dircache_observed_zero",
+    "directory_rejections.daily.available": "directory_rejections_daily_available",
+    "directory_rejections.daily.eligible": "directory_rejections_daily_eligible",
+    "directory_rejections.daily.value": "directory_rejections_daily_value",
+    "directory_requests.daily.available": "directory_requests_daily_available",
+    "directory_requests.daily.eligible": "directory_requests_daily_eligible",
+    "directory_requests.daily.value": "directory_requests_daily_value",
+    "directory_waiting.daily.available": "directory_waiting_daily_available",
+    "directory_waiting.daily.eligible": "directory_waiting_daily_eligible",
+    "directory_waiting.daily.value": "directory_waiting_daily_value",
+    "exit_stream_rejections.daily.available": "transport_rejections_daily_available",
+    "exit_stream_rejections.daily.eligible": "transport_rejections_daily_eligible",
+    "exit_stream_rejections.daily.value": "transport_rejections_daily_value",
+    "hsdir_fetches.daily.available": "hsdir_fetches_daily_available",
+    "hsdir_fetches.daily.eligible": "hsdir_fetches_daily_eligible",
+    "hsdir_fetches.daily.value": "hsdir_fetches_daily_value",
+    "hsdir_uploads.daily.available": "hsdir_uploads_daily_available",
+    "hsdir_uploads.daily.eligible": "hsdir_uploads_daily_eligible",
+    "hsdir_uploads.daily.value": "hsdir_uploads_daily_value",
+    "introduction_rejections.daily.available": "transport_rejections_daily_available",
+    "introduction_rejections.daily.eligible": "transport_rejections_daily_eligible",
+    "introduction_rejections.daily.value": "transport_rejections_daily_value",
+    "metadata.flags": "metadata_flags",
+    "metadata.targets": "metadata_targets",
+    "metadata.up": "metadata_up",
+    "onionskin_drops.daily.available": "onionskin_drops_daily_available",
+    "onionskin_drops.daily.eligible": "onionskin_drops_daily_eligible",
+    "onionskin_drops.daily.value": "onionskin_drops_daily_value",
+    "open_circuits.daily.available": "open_circuits_daily_available",
+    "open_circuits.daily.eligible": "open_circuits_daily_eligible",
+    "open_circuits.daily.value": "open_circuits_daily_value",
+    "protocol_closes.daily.available": "protocol_closes_daily_available",
+    "protocol_closes.daily.eligible": "protocol_closes_daily_eligible",
+    "protocol_closes.daily.value": "protocol_closes_daily_value",
+    "queue_limit_circuits.daily.available": "transport_rejections_daily_available",
+    "queue_limit_circuits.daily.eligible": "transport_rejections_daily_eligible",
+    "queue_limit_circuits.daily.value": "transport_rejections_daily_value",
+    "transport_rejections.daily.available": "transport_rejections_daily_available",
+    "transport_rejections.daily.eligible": "transport_rejections_daily_eligible",
+    "transport_rejections.daily.value": "transport_rejections_daily_value",
+    "version.runtime_binary_hashes": "version_runtime_binary_hashes",
+    "version.runtime_fresh_members": "version_runtime_fresh_members",
+    "version.runtime_mapped_by_build": "version_runtime_mapped_by_build",
+    "version.runtime_valid_members": "version_runtime_valid_members",
+    "cohort.native_verified_binary": "cohort_native_verified_binary",
+    "cohort.native_attested": "attested_native_runtime",
+    "cohort.directory_defense_verified_binary": "cohort_directory_defense_verified_binary",
+    "cohort.directory_defense_attested": "attested_directory_defense_runtime",
+    "cohort.custom_verified_binary": "cohort_custom_verified_binary",
+    "cohort.custom_attested": "attested_custom_runtime",
+    "version.attestation_proof_metadata": "attestation_proof_metadata"
+  },
+  "rules": {
+    "max_range_seconds": 604800,
+    "max_points": 169,
+    "step_seconds": [
+      86400
+    ],
+    "query_timeout_seconds": 25,
+    "max_response_bytes": 8388608
+  },
+  "usage": {
+    "daily": "Use step=86400 on UTC midnight boundaries (00:00:00 UTC). Expression uses a non-overlapping 1d window.",
+    "metadata": "Aggregate counts only; query [end-86400,end] step=86400 on UTC midnight boundaries and retain final result.",
+    "attestations": "The four attested/proof IDs are gateway-computed descriptors, not source Prometheus metrics. They revalidate private process-epoch attestations and expose aggregate public version labels only across completed UTC day boundaries.",
+    "verified_binary": "Cohort binary routes require a valid fingerprint-verified recorded state hash matched to fresh CPU identity by member, PID, start ticks and boot ID. CPU source age must be in [0,180) seconds. The collector additionally accepts only approved public binary hashes."
+  },
+  "postprocessing": "Collector still applies the 90% population coverage test and rolling 31-day denominator, null masking, per-relay normalization and midrank reference calculation. Fetch the required prior windows in bounded requests; the gateway only returns reviewed raw aggregates.",
+  "relay_population_groups": {
+    "native_defenses": {
+      "charts": [
+        "transport_rejections",
+        "circuit_rejections",
+        "introduction_rejections",
+        "queue_limit_circuits",
+        "exit_stream_rejections",
+        "directory_rejections"
+      ],
+      "selector": "tor_relay_dos_total{job=\"tor_relays\",type=~\"conn_rejected|concurrent_conn_rejected|circuit_rejected|introduce2_rejected|circuit_killed_max_cell|circuit_killed_max_cell_outq|stream_rejected|begindir_rejected|begindir_rate_rejected|begindir_hsdir_rejected\"}",
+      "label": "type"
+    },
+    "directory_requests": {
+      "charts": [
+        "directory_requests"
+      ],
+      "selector": "tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}",
+      "label": "type",
+      "strata": true
+    },
+    "directory_waiting": {
+      "charts": [
+        "directory_waiting"
+      ],
+      "selector": "tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"}",
+      "label": ""
+    },
+    "hsdir_fetches": {
+      "charts": [
+        "hsdir_fetches"
+      ],
+      "selector": "tor_relay_hsdir_fetch_total{job=\"tor_relays\"}",
+      "label": "action"
+    },
+    "hsdir_uploads": {
+      "charts": [
+        "hsdir_uploads"
+      ],
+      "selector": "tor_relay_hsdir_upload_total{job=\"tor_relays\"}",
+      "label": "action"
+    },
+    "onionskin_drops": {
+      "charts": [
+        "onionskin_drops"
+      ],
+      "selector": "tor_relay_load_onionskins_total{job=\"tor_relays\",action=\"dropped\"}",
+      "label": "type"
+    },
+    "open_circuits": {
+      "charts": [
+        "open_circuits"
+      ],
+      "selector": "tor_relay_circuits_total{job=\"tor_relays\",state=\"opened\"}",
+      "label": ""
+    },
+    "protocol_closes": {
+      "charts": [
+        "protocol_closes"
+      ],
+      "selector": "tor_relay_circ_proto_violation_total{job=\"tor_relays\"}",
+      "label": ""
+    }
+  }
+}

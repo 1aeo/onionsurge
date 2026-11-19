@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "22"
+      - name: Install pinned Prometheus query test tool
+        shell: bash
+        run: |
+          tool_dir="$RUNNER_TEMP/onionsurge-promtool"
+          mkdir -p "$tool_dir"
+          curl --fail --location --retry 3 \
+            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz \
+            --output "$tool_dir/prometheus.tar.gz"
+          echo 'f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d  '"$tool_dir/prometheus.tar.gz" | sha256sum --check
+          tar -xzf "$tool_dir/prometheus.tar.gz" --strip-components=1 \
+            -C "$tool_dir" prometheus-3.14.0.linux-amd64/promtool
+          "$tool_dir/promtool" --version
+          echo "$tool_dir" >> "$GITHUB_PATH"
+      - run: make check

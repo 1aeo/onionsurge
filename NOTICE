@@ -1,0 +1,9 @@
+OnionSurge
+Copyright 2026 1AEO / 1aeo
+
+The display-number formatter in scripts/display_numbers.py is derived from
+1AEO blog chart tooling, retained with its precision and rounding rules.
+Original SHA-256: 84e68e0644e650e98bb6439144f3cc33c7f3250481a8ced6ed19fb05cb1dd13e
+
+Tor and the Tor logo are trademarks of The Tor Project, Inc.
+No C Tor source code or third-party chart assets are redistributed here.
