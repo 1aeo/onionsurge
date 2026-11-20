@@ -2824,6 +2824,21 @@ copyCtrl.app.start();
   clampSwitch.app.replaceRelease(v7NonMidnight,v7Rel);
   assert.equal(clampSwitch.app.getState().heroRange,'7d');
 
+  const impClick=application('?view=overview',v6Data,'1',v6Rel);
+  impClick.app.start();
+  assert.equal(new URLSearchParams(impClick.app.url('overview').slice(1)).has('hero_range'),false,'implicit hero_range is absent before click');
+  click(impClick,'[data-hero-range]',{heroRange:'7d'});
+  assert.equal(new URLSearchParams(impClick.app.url('overview').slice(1)).get('hero_range'),'7d','clicking implicit 7d persists hero_range in links');
+  assert.equal(new URLSearchParams(impClick.browser.location.search).get('hero_range'),'7d','clicking implicit 7d persists hero_range in URL');
+  click(impClick,'[data-hero-range]',{heroRange:'7d'});
+  impClick.back();
+  assert.equal(new URLSearchParams(impClick.browser.location.search).has('hero_range'),false,'repeated click on explicit 7d pushes no duplicate history entry');
+  const impUpgrade=application('?view=overview',v6Data,'1',v6Rel);
+  impUpgrade.app.start();
+  click(impUpgrade,'[data-hero-range]',{heroRange:'7d'});
+  impUpgrade.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(impUpgrade.app.getState().heroRange,'7d','v6->v7 upgrade retains explicitly clicked 7d');
+
   // validateTimeRanges rejects malformed hours definitions (including 24h minimum_coverage=0.5 parity with Python).
   for(const badHours of [
    tr=>{tr.periods[0].window.count=12;},
