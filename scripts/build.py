@@ -94,9 +94,10 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
         for series in chart['series']:
             for period in ('hour', 'day'):
                 current = series['current'][period]
-                expected = current.setdefault('expected_relays',
-                                              series['hourly_expected_relays'][-1][1] if period == 'hour'
-                                              else max(8, chart['relays']))
+                hourly_expected = series.get('hourly_expected_relays')
+                default_expected = (hourly_expected[-1][1] if (period == 'hour' and hourly_expected)
+                                    else max(8, chart['relays']))
+                expected = current.setdefault('expected_relays', default_expected)
                 value, n = current.get('value'), current.get('relays')
                 coverage = current.setdefault('coverage', n / expected if n and expected else None)
                 current.setdefault('valid', usable_measurement(value, n)

@@ -278,10 +278,11 @@ def _coarsen_history_rows(rows, chart_id, series_key, kind, min_exp, snapshot_en
     return coarsened, pop_totals, last_exp_c
 
 
-def _coarsen_current_period(cur, *, chart_id, series_key, kind, chart_c, min_exp, window_seconds,
+def _coarsen_current_period(cur, *, chart_id, series_key, kind, min_exp, window_seconds,
                             last_row=None, last_exp_c=None, enforce_chart_floor=True):
     cur_n_c = coarsen_count(cur.get('relays'))
-    expected_raw = chart_c if 'expected_relays' not in cur else cur['expected_relays']
+    default_exp = min_exp if (enforce_chart_floor or last_exp_c is None) else last_exp_c
+    expected_raw = default_exp if 'expected_relays' not in cur else cur['expected_relays']
     require(expected_raw is not None, 'Invalid current expected_relays')
     floor = min_exp if enforce_chart_floor else 8
     cur_exp_c = max(floor, coarsen_count(expected_raw), 0 if cur_n_c is None else cur_n_c)
@@ -419,8 +420,9 @@ def coarsen_snapshot(data):
                     c_expected.append([t, exp_c])
                 series['values'], series['hourly_relays'], series['hourly_expected_relays'] = (
                     c_values, c_relays, c_expected)
-                if c_values and c_values[-1][0] == snapshot_end:
+                if c_expected:
                     last_hour_exp = c_expected[-1][1]
+                if c_values and c_values[-1][0] == snapshot_end:
                     last_cov = _cov(c_relays[-1][1], last_hour_exp)
                     last_valid = bool(c_values[-1][1] is not None and c_relays[-1][1] is not None
                                       and c_relays[-1][1] >= 8 and last_cov is not None
@@ -430,13 +432,13 @@ def coarsen_snapshot(data):
             last_daily = coarsened_daily[-1] if (coarsened_daily and coarsened_daily[-1][0] == snapshot_end) else None
             series['current']['day'], cur_n_c = _coarsen_current_period(
                 series['current']['day'], chart_id=chart_id, series_key=series_key, kind=kind,
-                chart_c=chart_c, min_exp=min_exp, window_seconds=DAY,
+                min_exp=min_exp, window_seconds=DAY,
                 last_row=last_daily, last_exp_c=last_exp_c, enforce_chart_floor=True,
             )
             if 'hour' in series['current']:
                 series['current']['hour'], cur_hour_n_c = _coarsen_current_period(
                     series['current']['hour'], chart_id=chart_id, series_key=series_key, kind=kind,
-                    chart_c=chart_c, min_exp=min_exp, window_seconds=HOUR,
+                    min_exp=min_exp, window_seconds=HOUR,
                     last_row=last_hour_row, last_exp_c=last_hour_exp, enforce_chart_floor=False,
                 )
                 if last_hour_row is not None and series['values']:

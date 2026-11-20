@@ -175,6 +175,21 @@ class BuildTests(unittest.TestCase):
             self.data['provenance']['query_contract_sha256'],
             hashlib.sha256((ROOT / 'catalogue/contract.json').read_bytes()).hexdigest(),
         )
+        def hourly_csv_pairs(csv_rows, target_series):
+            actual = [
+                (r['interval_end_utc'], '' if r['value'] == '' else float(r['value']))
+                for r in csv_rows
+                if r['series'] == target_series['key']
+            ]
+            expected = [
+                (
+                    builder.datetime.fromtimestamp(t, builder.timezone.utc).isoformat(),
+                    '' if v is None else float(v),
+                )
+                for t, v in target_series['values']
+            ]
+            return actual, expected
+
         for chart in self.data['charts']:
             for period in periods:
                 with (self.output / 'exports' / f"{chart['id']}-{period['export_suffix']}.csv").open() as handle:
@@ -188,11 +203,11 @@ class BuildTests(unittest.TestCase):
                         self.assertGreater(ts, period_start)
                         self.assertLessEqual(ts, self.data['end'])
                 for series in chart['series']:
-                    values = [float(r['value']) for r in rows if r['series'] == series['key'] and r['value']]
                     if period['window']['unit'] == 'hours':
-                        expected_vals = [float(v) for _, v in series['values'] if v is not None]
-                        self.assertEqual(values, expected_vals)
+                        actual_pairs, expected_pairs = hourly_csv_pairs(rows, series)
+                        self.assertEqual(actual_pairs, expected_pairs)
                         continue
+                    values = [float(r['value']) for r in rows if r['series'] == series['key'] and r['value']]
                     summary = series['historical_averages'][period['summary_key']]
                     self.assertEqual(len(values), summary['days'])
                     if summary['status'] == 'ready':
@@ -203,6 +218,24 @@ class BuildTests(unittest.TestCase):
                         summary['value'] is not None,
                         summary['days'] > 0 and summary['coverage'] >= period['minimum_coverage'],
                     )
+
+        # Missing hourly observations must preserve ordered timestamps with blank ('') cells.
+        gapped = copy.deepcopy(self.data)
+        gapped_chart = gapped['charts'][0]
+        gapped_series = gapped_chart['series'][0]
+        gapped_series['values'][3][1] = None
+        gapped_series['values'][12][1] = None
+        with tempfile.TemporaryDirectory() as folder:
+            stage = Path(folder) / 'stage'
+            stage.mkdir()
+            ref_json = (self.output / self.data['reference_document']).read_text()
+            builder.write_outputs(gapped, ref_json, stage)
+            with (stage / 'exports' / f"{gapped_chart['id']}-24h.csv").open() as handle:
+                gap_rows = list(csv.DictReader(handle))
+            actual_pairs, expected_pairs = hourly_csv_pairs(gap_rows, gapped_series)
+            self.assertEqual(actual_pairs, expected_pairs)
+            self.assertEqual(actual_pairs[3][1], '')
+            self.assertEqual(actual_pairs[12][1], '')
 
     def test_partial_period_coverage_and_explicit_threshold_override(self):
         by_id = {chart['id']: chart for chart in self.data['charts']}

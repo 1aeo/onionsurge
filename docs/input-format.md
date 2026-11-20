@@ -13,8 +13,8 @@ are produced by the build, not supplied by the collector.
 - Each series supplies `24` completed hourly `[t, value]` rows (`values`), `hourly_relays`, `hourly_expected_relays`, `current.{hour, day}`, and `history.{daily, sampled_hour}` (`sampled_hour` aligned to `21,600s` `6h` grid points):
   both `current.hour` and `current.day` record `{value, relays, expected_relays, coverage, valid}`.
   The collector supplies `expected_relays` as the larger of that cohort's
-  available population at `end` and the preceding 31-day daily (32-day hourly) maximum eligible
-  population (including `end`). It is positive and at least the reported count.
+  available population at `end` and the preceding 31-day maximum eligible
+  population on the metric's measurement grid ending at each interval endpoint (the collector's 32-day hourly query populates context for earlier hours in the 24-hour window without extending the 31-day maximum). It is positive and at least the reported count.
   Earlier expected populations need not equal today's cohort.
   A point needs at least 90% of its own expected population (`coverage >= 0.9`);
   otherwise `value` is `null` and `valid` is `false`. `current.hour` agrees with the final `values[23]` entry; when `history.daily` includes `end`, `current.day` agrees with that final daily row within coarsening bounds.

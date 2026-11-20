@@ -452,7 +452,7 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
     hasAnyMeasured=true;notePop(t,pop);
     let rank=null,n=0,flatZero=false;
     const ref=s.reference?.[refPeriod];
-    if(isEnd&&ref&&typeof ref==='object'){
+    if(isEnd&&(refPeriod==='hour'||rawEnd===end)&&ref&&typeof ref==='object'){
      if(s.current?.[refPeriod]?.valid===true&&Number.isInteger(ref.n)&&ref.n>0&&(ref.flat_zero||(isFiniteNumber(ref.current_percentile)&&ref.current_percentile>=0&&ref.current_percentile<=100))){
       flatZero=!!ref.flat_zero;rank=flatZero?0:ref.current_percentile;n=ref.n;
      }
@@ -603,6 +603,8 @@ function createObservatory(data,browser,initialRelease=null){
  let families=new Map(D.families.map(f=>[f.id,f]));
  const chart=id=>charts.get(id),family=id=>families.get(id);
  let {view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN);
+ const hasExplicitHeroRange=search=>{const reqHero=new URLSearchParams(search).get('hero_range');return reqHero==='all'||reqHero==='7d'||reqHero==='24h';};
+ let heroRangeExplicit=hasExplicitHeroRange(location.search);
  let plotCache=new WeakMap(),heroCache=new Map(),urlCache=null,lastHeaderH=null,touchPlot=null;
  const plotMeta=new WeakMap(),copyTimers=new WeakMap(),copyRequests=new WeakMap();
 const chartCache=c=>{let cache=plotCache.get(c);if(!cache){cache=new Map();plotCache.set(c,cache);}return cache;};
@@ -649,7 +651,11 @@ function url(v,r=range,f=familyId,c=chartId){
  return out;
 }
 const remember=()=>{try{window.history.pushState(null,'',url(view,range,familyId,chartId));return true;}catch{window.location.assign(url(view,range,familyId,chartId));return false;}};
-const focusDestination=(selector='[data-view-heading]')=>$(selector)?.focus({preventScroll:true});
+const focusDestination=(selector='[data-view-heading]')=>{
+ const matches=document.querySelectorAll?.(selector);
+ const target=matches?.length?[...matches].find(el=>el.offsetParent!==null)||matches[0]:$(selector);
+ target?.focus({preventScroll:true});
+};
 const announceStatus=message=>{const rgn=$('[data-live-status]');if(rgn)rgn.textContent=message;};
 function scrollToFragment(){
  const raw=location.hash?location.hash.slice(1):'';
@@ -697,7 +703,7 @@ function updateFreshness(status={}){
 }
 function replaceRelease(nextData,nextRelease){
  const appEl=$('#app');
- const before={D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,plotCache,heroCache,html:appEl.innerHTML};
+ const before={D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,heroRangeExplicit,plotCache,heroCache,html:appEl.innerHTML};
  const active=document.activeElement,hadAppFocus=!!appEl.contains?.(active);
  const focus=hadAppFocus?FOCUS_ATTRS.filter(name=>active.hasAttribute(name)).map(name=>[name,active.getAttribute(name)]):[];
  const matchInApp=node=>(!appEl.contains||appEl.contains(node))&&focus.every(([key,value])=>node.getAttribute(key)===value);
@@ -721,14 +727,15 @@ function replaceRelease(nextData,nextRelease){
    const aliased=Object.hasOwn(timeRanges.legacy_aliases,range)?timeRanges.legacy_aliases[range]:null;
    range=aliased&&periodMap.has(aliased)?aliased:timeRanges.default_range;
   }
-  if(heroRange==='24h'&&!hasHourPayload(D))heroRange='7d';
+  if(!heroRangeExplicit)heroRange=defaultHeroRange();
+  else if(heroRange==='24h'&&!hasHourPayload(D))heroRange='7d';
   charts=new Map(D.charts.map(c=>[c.id,c]));families=new Map(D.families.map(f=>[f.id,f]));
   if(!charts.has(chartId)){chartId=(families.get(familyId)||D.families[0]).primary;seriesKey=null;bandEnabled=false;}
   familyId=chart(chartId).family_id;
   if(seriesKey&&!shown(chart(chartId)).some(series=>series.key===seriesKey))seriesKey=null;
   render();restorePosition();
  }catch(error){
-  ({D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,plotCache,heroCache}=before);
+  ({D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,heroRangeExplicit,plotCache,heroCache}=before);
   try{render();}catch{appEl.innerHTML=before.html;}
   restorePosition();throw error;
  }
@@ -796,7 +803,7 @@ function statPair(c,s){
 function reference(s){
  const hour=s.reference?.hour,day=s.reference?.day;
  const validSpan=r=>r&&validTime(r.start)&&validTime(r.end)&&r.start<=r.end;
- if(hour&&Number.isInteger(hour.n)&&hour.n>=0&&validSpan(day||hour)&&(hour.n>0||(day&&Number.isInteger(day.n)&&day.n>0))){
+ if(hour&&Number.isInteger(hour.n)&&hour.n>=0&&(validSpan(hour)||validSpan(day))&&(hour.n>0||(day&&Number.isInteger(day.n)&&day.n>0))){
   const spans=[hour,day].filter(validSpan),start=Math.min(...spans.map(r=>r.start)),end=Math.max(...spans.map(r=>r.end));
   return `<div class="reference"><small>18-month reference: ${date(start)}–${date(end)} · ${count(hour.n)} sampled hours / ${count(day?.n??0)} days</small><small>18-month averages use per-relay history scaled to the current reporting count.</small></div>`;
  }
@@ -858,7 +865,7 @@ function figure(c,r){
 const plotQuery=(c,r=range)=>isHourRange(r)?c.query:(c.history_queries?.daily?.value||c.query);
 const coverageQuery=(c,r=range)=>isHourRange(r)?c.quality_query:(c.history_queries?.daily?.eligible||c.quality_query);
 const headlineQuery=c=>c.history_queries?.current24?.value||null;
-const controlGroup=(lbl,aria,attr,cur,opts,cls='',extraActive=null)=>`<div class="control-group${cls?' '+cls:''}"><span>${lbl}</span><div class="range-control" role="group" aria-label="${aria}">${opts.map(([v,t])=>`<button ${attr}="${escapeHtml(v)}" class="${[cur===v?'active':'',extraActive===v?'desktop-active':''].filter(Boolean).join(' ')}" aria-pressed="${cur===v}">${escapeHtml(t)}</button>`).join('')}</div></div>`;
+const controlGroup=(lbl,aria,attr,cur,opts,cls='')=>`<div class="control-group${cls?' '+cls:''}"><span>${lbl}</span><div class="range-control" role="group" aria-label="${aria}">${opts.map(([v,t])=>`<button ${attr}="${escapeHtml(v)}" class="${cur===v?'active':''}" aria-pressed="${cur===v}">${escapeHtml(t)}</button>`).join('')}</div></div>`;
 function heroPlotData(r=heroRange,includeHsdir=heroHsdir){
  const key='r:'+r+':'+(includeHsdir?'1':'0');
  if(heroCache.has(key))return heroCache.get(key);
@@ -876,9 +883,9 @@ function formatIntervalWindow(intervalStart,endTs,win){
  return `${sd} UTC`;
 }
 function heroCard(){
- const isHourly=isHourlyRelease(),leftRange=heroRange==='7d'?'7d':(isHourly?'24h':'7d');
+ const isHourly=isHourlyRelease(),leftRange=heroRange==='7d'?'7d':(isHourly?'24h':'7d'),is24h=leftRange==='24h';
  const h24=isHourly?heroPlotData('24h',heroHsdir):null,h7=heroPlotData('7d',heroHsdir),hAll=heroPlotData('all',heroHsdir);
- const h=leftRange==='24h'?(h24||h7||hAll):(h7||hAll||h24),last=h?h.times.length-1:-1,is24h=leftRange==='24h';
+ const h=is24h?h24:(h7||hAll),last=h?h.times.length-1:-1;
  const total=last>=0?h.totals[last]:null,latestPartial=last>=0&&h.partialRates[last];
  const open=last>=0?h.gauges.openCircuits.values[last]:null,wait=last>=0?h.gauges.directoryWaiting.values[last]:null;
  const openPeak=h?.gauges.openCircuits.rawPeak??0,waitPeak=h?.gauges.directoryWaiting.rawPeak??0;
@@ -893,8 +900,10 @@ function heroCard(){
  const alertClass=!anyAlertMeasured?'unknown':hasHighAlert?'high':alerts.length?'elevated':'neutral';
  const alertSummary=alerts.length?alerts.slice(0,3).map(f=>`${f.icon} ${f.title}`).join(' · ')+(alerts.length>3?` +${alerts.length-3}`:''):anyAlertMeasured?'No qualifying family alerts':'No measured family series';
  const endWindow=h?formatIntervalWindow(h.end-h.window,h.end,h.window):validTime(D.end)?(is24h?formatIntervalWindow(Math.floor(D.end/HOUR)*HOUR-HOUR,Math.floor(D.end/HOUR)*HOUR,HOUR):date(Math.floor(D.end/DAY)*DAY-DAY)+' UTC'):'Unavailable';
- const heroOpts=isHourly?[['24h','24 hours'],['7d','7 days'],['all','All time']]:[['7d','7 days'],['all','All time']];
- const controls=`<div class="hero-controls">${controlGroup('Window','Concurrent DoS time range','data-hero-range',heroRange,heroOpts,isHourly?'hero-window-control':'hero-window-control hero-window-control--legacy',heroRange==='all'?leftRange:null)}${controlGroup('Flow scale','Concurrent DoS flow scale','data-hero-scale',heroScale,[['linear','Linear'],['symlog','Symlog']])}<button class="hero-toggle ${heroHsdir?'active':''}" data-hero-hsdir aria-pressed="${heroHsdir}">HSDir GET/POST ${heroHsdir?'included':'excluded'}</button></div>`;
+ const desktopWindow=isHourly?controlGroup('Window','Concurrent DoS left-panel window','data-hero-range',leftRange,[['24h','24 hours'],['7d','7 days']],'hero-window-desktop'):'';
+ const mobileOpts=isHourly?[['24h','24 hours'],['7d','7 days'],['all','All time']]:[['7d','7 days'],['all','All time']];
+ const mobileWindow=controlGroup('Window','Concurrent DoS time range','data-hero-range',heroRange,mobileOpts,'hero-window-mobile');
+ const controls=`<div class="hero-controls">${desktopWindow}${mobileWindow}${controlGroup('Flow scale','Concurrent DoS flow scale','data-hero-scale',heroScale,[['linear','Linear'],['symlog','Symlog']])}<button class="hero-toggle ${heroHsdir?'active':''}" data-hero-hsdir aria-pressed="${heroHsdir}">HSDir GET/POST ${heroHsdir?'included':'excluded'}</button></div>`;
  const kpiItems=[
   [is24h?(heroHsdir?'Latest 1h mitigated &amp; flood rate':'Latest 1h mitigated rate'):(heroHsdir?'Latest 24h mitigated &amp; flood rate':'Latest 24h mitigated rate'),total!=null?'neutral':'unknown',`${escapeHtml(total!=null?number(total):'Unavailable')} <small>events/s${latestPartial?' · partial':''}</small>`,`${endWindow} · ${heroHsdir?'incl. HSDir GET/POST':'excl. HSDir GET/POST'}${latestPartial?' · partial source coverage':''}`],
   [is24h?'Concurrent family alerts (1h)':'Concurrent family alerts (24h)',alertClass,`${count(alerts.length)} of ${count(D.families.length)} <small>families ≥90th pct</small>`,alertSummary],
@@ -916,7 +925,7 @@ function heroCard(){
  panelHtml.push(heroPanel('all','All time',hAll,allDays,'24h'));
  const panels=`<div class="hero-panels">${panelHtml.join('')}</div>`;
  const hasPartial=!!(h24?.hasPartialRate||h7?.hasPartialRate||hAll?.hasPartialRate),hasMissing=!!(h24?.hasAnyMissing||h7?.hasAnyMissing||hAll?.hasAnyMissing);
- const vecLegend=(h?.vectors||[]).map(v=>`<span><i style="background:${seriesColor(v.color)}"></i>${escapeHtml(v.label)}</span>`).join('');
+ const vecLegend=((h||h7||hAll)?.vectors||[]).map(v=>`<span><i style="background:${seriesColor(v.color)}"></i>${escapeHtml(v.label)}</span>`).join('');
  const laneKey=D.families.map(f=>`${escapeHtml(f.icon)} ${escapeHtml(f.title)}`).join(' · ');
  const laneSpan=`${escapeHtml(D.families[0]?.icon||'01')}→${escapeHtml(D.families.at(-1)?.icon||'06')}`;
  const legendHtml=`<div class="legend">${vecLegend}<span><i class="alert-elevated-key"></i>≥90th pct family</span><span><i class="alert-high-key"></i>≥99th pct family</span><span><i style="background:#f1d05d"></i>Open circuits (${escapeHtml(openPeak>0?axisNumber(openPeak):'100%')} peak)</span><span><i class="gauge-dashed-key"></i>Stalled BEGIN_DIR (${escapeHtml(waitPeak>0?axisNumber(waitPeak):'100%')} peak)</span>${hasPartial?'<span><i class="partial-key"></i>Partial rate coverage</span>':''}${hasMissing?'<span><i class="gap-key"></i>Unmeasured interval</span>':''}<span>Alert lanes (${laneSpan}): ${laneKey}</span></div>`;
@@ -1279,7 +1288,7 @@ document.addEventListener('click',async e=>{
  const t=targetEl(e);if(!t)return;
  const hit=s=>t.closest(s),anchor=hit('a[href]');
  if(anchor&&(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||e.button!==0))return;
- const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d';if(next!==heroRange){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
+ const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d';heroRangeExplicit=true;if(next!==heroRange){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
  const heroScaleToggle=hit('[data-hero-scale]');if(heroScaleToggle){const next=heroScaleToggle.dataset.heroScale==='symlog'?'symlog':'linear';if(next!==heroScale){heroScale=next;redrawControl(`[data-hero-scale="${heroScale}"]`);}return;}
  if(hit('[data-hero-hsdir]')){heroHsdir=!heroHsdir;redrawControl('[data-hero-hsdir]');return;}
  const allToggle=hit('[data-all-range]');if(allToggle){const nextRange=allToggle.dataset.allRange;if(periodMap.has(nextRange)){range=nextRange;redrawControl(`[data-all-range="${range}"]`);}return;}
@@ -1358,6 +1367,7 @@ for(const type of ['pointerout','focusout'])document.addEventListener(type,onPlo
 let resizeTimer;window.addEventListener('resize',()=>{updateHeaderOffset();clearTimeout(resizeTimer);resizeTimer=setTimeout(renderPlots,80);});
 window.addEventListener('popstate',()=>{
  ({view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN));
+ heroRangeExplicit=hasExplicitHeroRange(location.search);
  render();closeNavigation();scrollToFragment();focusDestination(view==='methods'&&location.hash==='#reference'?'#reference':'[data-view-heading]');
 });
 }

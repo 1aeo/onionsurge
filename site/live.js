@@ -13,7 +13,7 @@ const count=v=>Number.isSafeInteger(v)&&!Object.is(v,-0)&&v>=0;
 const coarsenedCount=v=>count(v)&&v%8===0;
 const nonNegative=v=>finite(v)&&!Object.is(v,-0)&&v>=0;
 const byteBudget=(n,max)=>Number.isSafeInteger(n)&&n>0&&n<=max;
-const textField=v=>typeof v==='string';
+const textField=v=>typeof v==='string'&&v.trim().length>0;
 const matches=(pattern,v)=>typeof v==='string'&&pattern.test(v);
 function parseLiveJson(bytes){
  const root=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
@@ -295,7 +295,14 @@ function checkData(data,manifest){
  const nearVal=(a,b)=>(a===null&&b===null)||(a!==null&&b!==null&&Math.abs(a-b)<=Math.max(1e-12*Math.max(Math.abs(a),Math.abs(b)),1e-12));
  for(const chart of data.charts){
   requireLive(record(chart)&&matches(CHART_ID,chart.id)&&!chartsById.has(chart.id),'Invalid chart ID');chartsById.set(chart.id,chart);
-  exactKeys(chart.history_queries,isV7?['daily','sampled_hour','current24']:['daily'],'Invalid chart metadata');
+  if(isV7){
+   exactKeys(chart.history_queries,['daily','sampled_hour','current24'],'Invalid chart metadata');
+   for(const qk of ['daily','sampled_hour','current24']){
+    const q=chart.history_queries[qk];
+    exactKeys(q,['value','eligible','available'],'Invalid chart metadata');
+    requireLive(textField(q.value)&&textField(q.eligible)&&textField(q.available),'Invalid chart metadata');
+   }
+  }else exactKeys(chart.history_queries,['daily'],'Invalid chart metadata');
   const validKind=isV7?(chart.kind==='counter_hour_rate'||chart.kind==='gauge_hour_mean'):(chart.kind==='counter_daily_rate'||chart.kind==='gauge_daily_mean');
   requireLive(matches(CHART_ID,chart.family_id)&&['title','definition','display_unit','query','quality_query','metric_origin'].every(k=>textField(chart[k]))&&Array.isArray(chart.metrics)&&chart.metrics.length>0&&chart.metrics.every(textField)&&validKind&&finite(chart.display_scale)&&chart.display_scale>0&&chart.start===data.start&&chart.end===data.end&&coarsenedCount(chart.relays),'Invalid chart metadata');
   requireLive(Array.isArray(chart.series)&&chart.series.length>0&&chart.series.length<=64,'Invalid series array');

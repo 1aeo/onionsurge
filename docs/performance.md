@@ -36,8 +36,8 @@ node scripts/benchmark_charts.cjs --baseline /path/to/baseline-app.cjs
 ```
 
 The optional baseline is a CommonJS-compatible `site/app.js` with the same UI
-contract. `scripts/benchmark_charts.cjs` checks SVG rendering (`svgCases`) and markup rendering (`markupCases`),
-including hero views (`24h`, `7d`, `all`) and every configured time range (`24h`, `7d`, `1mo`, `3mo`, `6mo`, `12mo`, and `all` by default) in Grid and Full width. Only source-credit
+contract. In `scripts/benchmark_charts.cjs`, `compare()` checks SVG rendering (`svgCases`) and overview markup rendering (`markupCases`)
+across every configured time range (`24h`, `7d`, `1mo`, `3mo`, `6mo`, `12mo`, and `all` by default) in Grid and Full width, while `timings()` separately benchmarks `drawHero()` for `24h`, `7d`, and `all` (without baseline hero parity checks). Only source-credit
 text and the credited empty-chart wrapper are normalized. Other output
 differences fail the comparison; a baseline predating intentional UI changes
 must be compared separately for chart geometry and measurements.

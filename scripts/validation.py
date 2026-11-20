@@ -310,15 +310,16 @@ def _validate_versions(data, start, end, *, ts_alignment=DAY):
     return cohorts, labels, cohort_totals
 
 
-def _validate_current_measurement(measurement, chart, *, period, window_seconds):
+def _validate_current_measurement(measurement, chart, *, period, window_seconds, default_expected=None):
     fields(measurement, CURRENT_FIELDS, 'Unknown current measurement field')
     value, n = measurement.get('value'), measurement.get('relays')
     require(is_coarsened_value(chart['id'], chart['_cur_series_key'], chart['kind'], value, window_seconds=window_seconds),
             'Invalid or uncoarsened current value')
     require(n is None or is_coarsened_count(n), 'Invalid or uncoarsened current population')
-    expected = measurement.get('expected_relays', max(8, chart['relays']))
+    fallback_expected = max(8, chart['relays']) if default_expected is None else default_expected
+    expected = measurement.get('expected_relays', fallback_expected)
     require(population(expected) and is_coarsened_count(expected)
-            and (period == 'hour' or expected >= chart['relays']),
+            and (expected >= 8 if period == 'hour' else expected >= chart['relays']),
             'Invalid current qualification denominator')
     require(n is None or n <= expected, 'Current coverage exceeds its qualification denominator')
     require(n not in (None, 0) or value is None, 'Unreported current interval cannot carry a measurement')
@@ -380,7 +381,9 @@ def _validate_series(series, chart, end, *, schema_version=4):
     current = series.get('current', {})
     if schema_version == 4:
         require(isinstance(current, dict) and set(current) == {'hour', 'day'}, 'Both current durations must be explicit')
-        h_val, h_n, h_exp, _, _ = _validate_current_measurement(current['hour'], chart_ctx, period='hour', window_seconds=HOUR)
+        hourly_expected = series['hourly_expected_relays'][-1][1] if series.get('hourly_expected_relays') else None
+        h_val, h_n, h_exp, _, _ = _validate_current_measurement(
+            current['hour'], chart_ctx, period='hour', window_seconds=HOUR, default_expected=hourly_expected)
         require(h_exp == series['hourly_expected_relays'][-1][1], 'Headline and plotted expected population disagree')
         if 'valid' in current['hour']:
             require(current['hour']['valid'] == hourly[-1][4], 'Headline and plotted qualification disagree')

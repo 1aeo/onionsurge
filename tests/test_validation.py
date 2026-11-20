@@ -444,6 +444,42 @@ class InputValidationTests(unittest.TestCase):
         data = self.fixture(); del data['charts'][0]['series'][0]['current']['day']['expected_relays']
         validate_snapshot(data)
 
+    def test_omitted_current_hour_expected_relays_uses_hourly_array_not_cohort(self):
+        from build import prepare
+        data = self.fixture(share_rows=False)
+        chart = data['charts'][0]
+        series = chart['series'][0]
+        series.pop('relay_population', None)
+        subcohort = 160
+        self.assertGreater(chart['relays'], subcohort)
+        series['hourly_expected_relays'][-1][1] = subcohort
+        series['hourly_relays'][-1][1] = subcohort
+        series['current']['hour'].pop('expected_relays', None)
+        series['current']['hour'].update(relays=subcohort, coverage=1.0, valid=True)
+        validate_snapshot(data)
+
+        coarsened = coarsen_snapshot(clone_snapshot(data, share_rows=False))
+        coarsened_hour = coarsened['charts'][0]['series'][0]['current']['hour']
+        self.assertEqual(coarsened_hour['expected_relays'], subcohort)
+        self.assertTrue(coarsened_hour['valid'])
+        validate_snapshot(coarsened)
+
+        with tempfile.TemporaryDirectory() as folder:
+            built, _ = prepare(clone_snapshot(data, share_rows=False), 'a' * 64, Path(folder) / 'cache')
+        built_hour = built['charts'][0]['series'][0]['current']['hour']
+        self.assertEqual(built_hour['expected_relays'], subcohort)
+        self.assertTrue(built_hour['valid'])
+
+        bad_hour = self.fixture(share_rows=False)
+        bad_hour['charts'][0]['series'][0]['current']['hour']['expected_relays'] = 0
+        with self.assertRaisesRegex(ValueError, 'denominator'):
+            validate_snapshot(bad_hour)
+
+        bad_day = self.fixture(share_rows=False)
+        bad_day['charts'][0]['series'][0]['current']['day']['expected_relays'] = subcohort
+        with self.assertRaisesRegex(ValueError, 'denominator'):
+            validate_snapshot(bad_day)
+
     def test_metric_lists_and_prototype_keys_are_validated(self):
         for value in [None, 'tor_relay_dos_total', [1], [], {'name': 'tor_relay_dos_total'}]:
             data = self.fixture(); data['charts'][0]['metrics'] = value

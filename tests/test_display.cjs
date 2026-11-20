@@ -2162,11 +2162,12 @@ for(const [base,mob] of [['.hero-card { margin-bottom: 26px','.hero-card { margi
 }
 const desktopMedia=cssText.match(/@media\(min-width:1000px\)\s*\{[\s\S]*?\n\}/)?.[0]||'';
 assert.match(cssText,/\.hero-panel \{ display: none;/);
+assert.match(cssText,/\.hero-window-desktop \{ display: none;/);
 assert.match(desktopMedia,/\.hero-panels \{ display: grid;/);
 assert.match(desktopMedia,/\.hero-panel \{ display: none;/);
 assert.match(desktopMedia,/\.hero-panel\.desktop-left,\.hero-panel\.desktop-right \{ display: block;/);
-assert.match(desktopMedia,/\.hero-window-control \[data-hero-range="all"\],\.hero-window-control--legacy \{ display: none;/);
-assert.match(desktopMedia,/\.range-control button\.desktop-active \{/);
+assert.match(desktopMedia,/\.hero-window-desktop \{ display: flex;/);
+assert.match(desktopMedia,/\.hero-window-mobile \{ display: none;/);
 {
  const savedSetTimeout=globalThis.setTimeout,queued=[];
  globalThis.setTimeout=(cb,ms)=>{queued.push([cb,ms]);return 0;};
@@ -2612,7 +2613,7 @@ copyCtrl.app.start();
   v7Overview.app.start();
   assert.equal(v7Overview.app.getState().heroRange,'24h');
   assert.equal(v7Overview.app.getState().range,'24h');
-  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-range]').length,3);
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-range]').length,5);
   assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-panel]').length,3);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel active desktop-left');
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel');
@@ -2625,17 +2626,61 @@ copyCtrl.app.start();
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel active desktop-left');
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel desktop-right');
   click(v7Overview,'[data-hero-range]',{heroRange:'all'});
-  assert.equal(v7Overview.browser.document.querySelector('[data-hero-range="24h"]').getAttribute('class'),'desktop-active');
-  assert.equal(v7Overview.browser.document.querySelector('[data-hero-range="all"]').getAttribute('class'),'active');
+  const desktopWinHtml=v7Overview.page.innerHTML.match(/hero-window-desktop"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
+  const mobileWinHtml=v7Overview.page.innerHTML.match(/hero-window-mobile"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
+  assert.equal([...desktopWinHtml.matchAll(/<button /g)].length,2);
+  assert.equal([...mobileWinHtml.matchAll(/<button /g)].length,3);
+  assert.match(desktopWinHtml,/data-hero-range="24h" class="active" aria-pressed="true"/);
+  assert.match(desktopWinHtml,/data-hero-range="7d" class="" aria-pressed="false"/);
+  assert.match(mobileWinHtml,/data-hero-range="all" class="active" aria-pressed="true"/);
+  assert.match(mobileWinHtml,/data-hero-range="24h" class="" aria-pressed="false"/);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel desktop-left');
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel active desktop-right');
   click(v7Overview,'[data-hero-range]',{heroRange:'24h'});
+  // When hidden control precedes visible control, redrawControl restores focus to the visible one (offsetParent !== null).
+  const visCtrl=application('?view=overview',v7NonMidnight);
+  const origVisQSA=visCtrl.browser.document.querySelectorAll;
+  visCtrl.browser.document.querySelectorAll=s=>{
+   const out=origVisQSA(s);
+   if(s==='[data-hero-range="7d"]'&&out.length===2){out[0].offsetParent=null;out[1].offsetParent={};}
+   return out;
+  };
+  visCtrl.app.start();
+  click(visCtrl,'[data-hero-range]',{heroRange:'7d'});
+  assert.equal(visCtrl.browser.document.activeElement,origVisQSA('[data-hero-range="7d"]')[1],'focus skips hidden button (offsetParent===null)');
   assert.match(v7Overview.page.innerHTML,/Hourly UTC publication planned/);
   assert.match(v7Overview.page.innerHTML,/Latest 1h mitigated &amp; flood rate/);
   assert.match(v7Overview.page.innerHTML,/Concurrent family alerts \(1h\)/);
   assert.match(v7Overview.page.innerHTML,/Open circuits \(1h mean\)/);
   assert.match(v7Overview.page.innerHTML,/Stalled BEGIN_DIR \(1h mean\)/);
   assert.match(v7Overview.page.innerHTML,/sampled 1-hour|20 sampled reference hours/);
+
+  // Null 24h hero plot must not fall back to daily h7/hAll under Latest 1h KPI labels.
+  const emptyHourlyOnly=structuredClone(v7NonMidnight);
+  for(const c of emptyHourlyOnly.charts)for(const s of c.series){
+   s.values=s.values.map(([t])=>[t,null]);
+   s.hourly_relays=s.hourly_relays.map(([t])=>[t,0]);
+   s.current.hour={value:null,relays:0,expected_relays:Math.max(8,c.relays),coverage:0,valid:false};
+  }
+  const empty24Kpi=application('?view=overview',emptyHourlyOnly).app.markup();
+  assert.match(empty24Kpi,/Latest 1h mitigated &amp; flood rate<\/div><div class="hero-kpi-value unknown">Unavailable/);
+  assert.match(empty24Kpi,/No measured family series/);
+
+  // Non-midnight v7 snapshot: 7d hero end cell ranks 00:00 UTC daily bar via baseline rather than rolling reference.day.
+  const nonMidHeroAlert=structuredClone(v7NonMidnight);
+  const trNm=chart('transport_rejections',nonMidHeroAlert).series[0];
+  const nmDayEnd=Math.floor(nonMidHeroAlert.end/86400)*86400;
+  trNm.history.daily=Array.from({length:25},(_,k)=>{
+   const t=nonMidHeroAlert.reference_window.start+(k+1)*86400;
+   return [t,k===24?10:100,100,1,true];
+  });
+  trNm.history.daily.push([nmDayEnd,10,100,1,true]);
+  trNm.reference.day={n:100,current_percentile:99,flat_zero:false,start:nonMidHeroAlert.reference_window.start,end:nonMidHeroAlert.reference_window.end};
+  const nonMidHero7=ui.prepareHeroPlot(nonMidHeroAlert,'7d',true);
+  assert.equal(nonMidHero7.families.find(f=>f.id==='transport').rows[6].state,'neutral','non-midnight 7d hero ignores current24 reference.day');
+  const midSameAlert=structuredClone(nonMidHeroAlert);
+  midSameAlert.end=nmDayEnd;midSameAlert.start=nmDayEnd-86400;
+  assert.equal(ui.prepareHeroPlot(midSameAlert,'7d',true).families.find(f=>f.id==='transport').rows[6].state,'high','midnight 7d hero still uses matching reference.day');
 
   // 24h prepareHeroPlot: non-midnight 24h window, sampled_hour baseline ranking (t<end) vs reference.hour (t===end), low-coverage rejection, gauge hour peak.
   const h24Custom=structuredClone(v7NonMidnight);
@@ -2693,10 +2738,34 @@ copyCtrl.app.start();
   const plot24El=element(800);
   v7Exp.app.draw(plot24El,v7Tr,'24h');
   assert.match(plot24El.innerHTML,/1h intervals · UTC/);
-  assert.match(plot24El.innerHTML,/class="reference-band"/);
+  assert.match(plot24El.innerHTML,/<rect class="reference-band"[^>]*y="48\.[12][^>]*height="133\.2/);
+  assert.match(plot24El.innerHTML,/<path class="reference-median" d="M62\.00,114\.80/);
+  assert.match(plot24El.innerHTML,/>8,000</,'24h band axis scales from reference.hour (7,200 upper bound), not reference.day');
   assert.match(plot24El.innerHTML,/:00</);
+  const expLive={textContent:''};
+  let expCursor=null,expTooltip=null;
+  const expSvg={querySelector:s=>s==='.plot-cursor'?expCursor:null,appendChild:n=>{expCursor=n;}};
+  const expWrap={innerHTML:'',getBoundingClientRect:()=>({width:800,height:400}),closest:s=>s==='[data-chart-plot]'?expWrap:null,
+   querySelector:s=>s==='svg'?expSvg:s==='.plot-cursor'?expCursor:s==='.chart-tooltip'?expTooltip:null,
+   appendChild:n=>{expTooltip=n;},setAttribute(){},hasAttribute:()=>false};
+  const expBandCtrl=application('?view=explorer&chart=transport_rejections&range=24h&band=1',v7BandDoc);
+  const origExpQS=expBandCtrl.browser.document.querySelector;
+  expBandCtrl.browser.document.querySelector=s=>s==='[data-live-status]'?expLive:origExpQS(s);
+  expBandCtrl.browser.document.createElement=tag=>({tag,className:'',innerHTML:'',style:{},remove(){if(this===expTooltip)expTooltip=null;}});
+  expBandCtrl.browser.document.createElementNS=(ns,tag)=>({ns,tag,attrs:{},setAttribute(k,v){this.attrs[k]=v;},remove(){if(this===expCursor)expCursor=null;}});
+  expBandCtrl.app.start();
+  expBandCtrl.app.draw(expWrap,v7Tr,'24h');
+  expBandCtrl.events.get('keydown')({key:'End',target:expWrap,preventDefault(){}});
+  assert.match(expTooltip.innerHTML,/10th–90th: 2,400–7,200 \(median 4,800\)/,'24h band tooltip reflects 240-relay reference.hour');
 
-  // Live replaceRelease rollback v7 (24h hero + 24h range) -> v6 (7d hero + 1mo alias + daily freshness).
+  // Empty reference.day ({n:0}) must not shadow a valid populated reference.hour span in reference(s).
+  const hourOnlyRefDoc=structuredClone(v7BandDoc),trHourOnly=chart('transport_rejections',hourOnlyRefDoc);
+  trHourOnly.series.find(s=>s.key===trHourOnly.primary_series).reference.day={n:0,current_percentile:null,flat_zero:false};
+  const hourOnlyMarkup=application('?view=explorer&chart=transport_rejections&range=24h',hourOnlyRefDoc).app.markup();
+  assert.match(hourOnlyMarkup,/100 sampled hours \/ 0 days/);
+  assert.doesNotMatch(hourOnlyMarkup,/No reference observations yet/);
+
+  // Live replaceRelease rollback v7 (24h hero + 24h range) -> v6 (7d hero + 1mo alias + daily freshness), plus implicit v6->v7 upgrade & explicit 7d preservation.
   const v7Rel=releaseContext(v7NonMidnight,'rel-v7',()=>v7NonMidnight.end+300);
   const v6Rel=releaseContext(v6Data,'rel-v6',()=>v6Data.end+300);
   const rbCtrl=application('?view=overview',v7NonMidnight,'1',v7Rel);
@@ -2709,6 +2778,19 @@ copyCtrl.app.start();
   assert.equal(rbCtrl.app.getState().range,'1mo','rollback to v6 migrates 24h range via legacy_aliases to 1mo');
   assert.match(rbCtrl.page.innerHTML,/Updated daily \(00:00 UTC\)/);
   assert.doesNotMatch(rbCtrl.page.innerHTML,/data-hero-range="24h"/);
+  rbCtrl.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(rbCtrl.app.getState().heroRange,'24h','implicit v6->v7 upgrade restores default 24h heroRange');
+  const exp7Upgrade=application('?view=overview&hero_range=7d',v6Data,'1',v6Rel);
+  exp7Upgrade.app.start();
+  exp7Upgrade.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(exp7Upgrade.app.getState().heroRange,'7d','explicit hero_range=7d persists across v6->v7 upgrade');
+  assert.throws(()=>exp7Upgrade.app.replaceRelease({},v6Rel),/Missing chart data/);
+  exp7Upgrade.app.replaceRelease(v6Data,v6Rel);
+  assert.equal(exp7Upgrade.app.getState().heroRange,'7d');
+  click(exp7Upgrade,'[data-hero-range]',{heroRange:'all'});
+  assert.equal(exp7Upgrade.app.getState().heroRange,'all');
+  exp7Upgrade.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(exp7Upgrade.app.getState().heroRange,'all','user-clicked heroRange remains explicit across v6->v7 upgrade');
 
   // validateTimeRanges rejects malformed hours definitions.
   for(const badHours of [
