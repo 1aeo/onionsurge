@@ -644,7 +644,7 @@ function url(v,r=range,f=familyId,c=chartId){
  const p=new URLSearchParams({view:v,range:r,layout,family:f,chart:c});
  if(c===chartId&&seriesKey&&shown(chart(c)).some(s=>s.key===seriesKey))p.set('series',seriesKey);
  if(c===chartId&&bandEnabled)p.set('band','1');
- if(heroRange!==defaultHeroRange())p.set('hero_range',heroRange);
+ if(requestedHeroRange!==null)p.set('hero_range',requestedHeroRange);
  if(heroScale==='symlog')p.set('hero_scale','symlog');
  if(!heroHsdir)p.set('hero_hsdir','0');
  const out='?'+p.toString();
@@ -1288,7 +1288,7 @@ document.addEventListener('click',async e=>{
  const t=targetEl(e);if(!t)return;
  const hit=s=>t.closest(s),anchor=hit('a[href]');
  if(anchor&&(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||e.button!==0))return;
- const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d';requestedHeroRange=next;if(next!==heroRange){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
+ const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d',prevReq=requestedHeroRange;requestedHeroRange=next;if(next!==heroRange||(prevReq==='24h'&&!isHourlyRelease())){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
  const heroScaleToggle=hit('[data-hero-scale]');if(heroScaleToggle){const next=heroScaleToggle.dataset.heroScale==='symlog'?'symlog':'linear';if(next!==heroScale){heroScale=next;redrawControl(`[data-hero-scale="${heroScale}"]`);}return;}
  if(hit('[data-hero-hsdir]')){heroHsdir=!heroHsdir;redrawControl('[data-hero-hsdir]');return;}
  const allToggle=hit('[data-all-range]');if(allToggle){const nextRange=allToggle.dataset.allRange;if(periodMap.has(nextRange)){range=nextRange;redrawControl(`[data-all-range="${range}"]`);}return;}

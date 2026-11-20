@@ -1,6 +1,6 @@
 # User-owned query gateway
 
-`scripts/query_gateway.py` is a forced-command SSH entry point for the collector. It accepts only `queries` and `prom QUERY_ID START END STEP` (accepting `STEP` in `{3600, 21600, 86400}` on aligned UTC boundaries, and requiring `STEP=3600` over `[end-3600, end]` for virtual runtime IDs; the collector uses `3600s` for `current_hour`, `current24`, metadata, and population `hour`, `21600s` for `sampled_hour`, and `86400s` UTC midnight for historical `daily` and population `day`) through `SSH_ORIGINAL_COMMAND`. Paths, arbitrary PromQL,
+`scripts/query_gateway.py` is a forced-command SSH entry point for the collector. It accepts only `queries` and `prom QUERY_ID START END STEP` (accepting `STEP` in `{3600, 21600, 86400}` on aligned UTC boundaries, and requiring `STEP=3600` over `[end-3600, end]` for virtual runtime IDs; as a collector usage pattern, the collector uses `3600s` for `current_hour`, `current24`, metadata, population `hour`, and current/intra-day population `day`, `21600s` for `sampled_hour`, and `86400s` UTC midnight for historical `daily` and daily population backfill) through `SSH_ORIGINAL_COMMAND`. Paths, arbitrary PromQL,
 and shell commands are not accepted. No account or SSH configuration is changed by this
 program.
 

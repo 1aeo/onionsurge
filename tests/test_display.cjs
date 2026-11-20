@@ -1876,7 +1876,7 @@ click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
 click(heroDefault,'[data-hero-scale]',{heroScale:'linear'});
 click(heroDefault,'[data-hero-hsdir]',{});
 assert.deepEqual([heroDefault.app.getState().heroRange,heroDefault.app.getState().heroScale,heroDefault.app.getState().heroHsdir],['7d','linear',true]);
-assert.equal(new URLSearchParams(heroDefault.app.url('overview').slice(1)).has('hero_range'),false);
+assert.equal(new URLSearchParams(heroDefault.app.url('overview').slice(1)).get('hero_range'),'7d');
 click(heroDefault,'[data-hero-range]',{heroRange:'all'});
 click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
 click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
@@ -2792,10 +2792,11 @@ copyCtrl.app.start();
   exp7Upgrade.app.replaceRelease(v7NonMidnight,v7Rel);
   assert.equal(exp7Upgrade.app.getState().heroRange,'all','user-clicked heroRange remains explicit across v6->v7 upgrade');
 
-  // Explicit hero_range=24h on schema-6 fallback renders 7d, preserves request across failed swap, and upgrades to 24h when schema-7 arrives.
+  // Explicit hero_range=24h on schema-6 fallback renders 7d, preserves request across failed swap & url(), and upgrades to 24h when schema-7 arrives.
   const req24Ctrl=application('?view=overview&hero_range=24h',v6Data,'1',v6Rel);
   req24Ctrl.app.start();
   assert.equal(req24Ctrl.app.getState().heroRange,'7d','explicit hero_range=24h renders as 7d on schema-6 fallback');
+  assert.equal(new URLSearchParams(req24Ctrl.app.url('overview').slice(1)).get('hero_range'),'24h','url() retains requested hero_range=24h during schema-6 fallback');
   assert.throws(()=>req24Ctrl.app.replaceRelease({},v6Rel),/Missing chart data/);
   assert.equal(req24Ctrl.app.getState().heroRange,'7d');
   req24Ctrl.app.replaceRelease(v7NonMidnight,v7Rel);
@@ -2806,6 +2807,22 @@ copyCtrl.app.start();
   assert.equal(req24Ctrl.app.getState().heroRange,'7d');
   req24Ctrl.app.replaceRelease(v7NonMidnight,v7Rel);
   assert.equal(req24Ctrl.app.getState().heroRange,'24h','requestedHeroRange 24h survives rollback->recovery');
+
+  // Explicit ?hero_range=7d on schema-6 survives navigation + popstate + schema-7 upgrade, and clicking 7d updates fallback hero_range=24h URL.
+  const expV6Nav=application('?view=overview&hero_range=7d',v6Data,'1',v6Rel);
+  expV6Nav.app.start();
+  assert.equal(new URLSearchParams(expV6Nav.app.url('overview').slice(1)).get('hero_range'),'7d');
+  click(expV6Nav,'[data-all-range]',{allRange:'all'});
+  assert.equal(new URLSearchParams(expV6Nav.browser.location.search).get('hero_range'),'7d');
+  expV6Nav.back();
+  expV6Nav.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(expV6Nav.app.getState().heroRange,'7d','explicit hero_range=7d on v6 survives popstate and v7 upgrade');
+  const clampSwitch=application('?view=overview&hero_range=24h',v6Data,'1',v6Rel);
+  clampSwitch.app.start();
+  click(clampSwitch,'[data-hero-range]',{heroRange:'7d'});
+  assert.equal(new URLSearchParams(clampSwitch.browser.location.search).get('hero_range'),'7d','clicking 7d overwrites clamped 24h request in URL');
+  clampSwitch.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(clampSwitch.app.getState().heroRange,'7d');
 
   // validateTimeRanges rejects malformed hours definitions (including 24h minimum_coverage=0.5 parity with Python).
   for(const badHours of [
