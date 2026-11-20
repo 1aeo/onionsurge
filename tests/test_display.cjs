@@ -1683,9 +1683,17 @@ assert.ok(heroSectionPos!==-1&&toolbarPos!==-1&&heroSectionPos<toolbarPos,'hero 
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-range]').length,2);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-scale]').length,2);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-hsdir]').length,1);
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-panel]').length,2);
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel active');
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel');
+assert.match(heroHtml,/data-hero-plot="concurrent_dos_7d" data-hero-plot-range="7d"/);
+assert.match(heroHtml,/data-hero-plot="concurrent_dos_all" data-hero-plot-range="all"/);
+assert.match(heroHtml,/Last 7 days[\s\S]*7 × 24h[\s\S]*All time[\s\S]*548 × 24h/);
 assert.equal(heroDefault.app.url('overview'),'?view=overview&range=1mo&layout=full&family=directory&chart=directory_requests',
  'default hero settings omit extra query parameters');
 click(heroDefault,'[data-hero-range]',{heroRange:'all'});
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel');
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel active');
 assert.equal(heroDefault.app.getState().heroRange,'all');
 assert.equal(heroDefault.app.getState().range,'1mo','hero All time toggle leaves 6-family 1mo range unchanged');
 assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-range="all"]'));
@@ -1783,7 +1791,7 @@ application('',heroEmpty).app.drawHero(heroEmptyPlot,'7d','linear',true);
 assert.match(heroEmptyPlot.innerHTML,/No retained samples available/);
 assert.equal((heroEmptyPlot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g)||[]).length,1);
 
-for(const selector of ['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos"]']){
+for(const selector of ['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_7d"]','[data-hero-plot="concurrent_dos_all"]']){
  const heroLive=application('?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=0',data,'1',releaseContext(data,'hero-old',()=>data.end));
  heroLive.app.start();
  const before=heroLive.app.getState();
@@ -1877,12 +1885,20 @@ application('',subOneGauge).app.drawHero(subOnePlot,'7d','linear',true);
 assert.match(subOnePlot.innerHTML,/<line x1="62" y1="256\.00"[^>]*\/>\s*<text[^>]*>100%<\/text>/);
 assert.match(subOnePlot.innerHTML,/class="hero-gauge-series" d="M[^"]*L788\.00,256\.00"/);
 
-// Tiny openCircuits (<0.1%) matches across heroCard KPI meta and tooltip inspection.
+// Tiny openCircuits (<0.1% fleet record) uses local 7d windowPeak on 7d and rawPeak on All time.
 const tinyGauge=structuredClone(data),ocSeries=chart('open_circuits',tinyGauge).series[0];
 ocSeries.peaks.day.fleet_peak=1e6;
-ocSeries.history.daily=ocSeries.history.daily.map(row=>row[0]===tinyGauge.end?[row[0],100,104,1,true]:row[4]?[row[0],100,104,1,true]:row);
+ocSeries.history.daily=ocSeries.history.daily.map(row=>row[0]===tinyGauge.end?[row[0],100,104,1,true]:row[4]?[row[0],50,104,1,true]:row);
+const tiny7=ui.prepareHeroPlot(tinyGauge,'7d',true),tinyAll=ui.prepareHeroPlot(tinyGauge,'all',true);
+assert.equal(tiny7.gauges.openCircuits.windowPeak,100);
+assert.equal(tiny7.gauges.openCircuits.scalePeak,100,'7d normalizes gauge curve to 7d peak');
+assert.equal(tinyAll.gauges.openCircuits.scalePeak,1e6,'all-time keeps gauge normalized to retained fleet record');
 assert.match(application('?view=overview',tinyGauge).app.markup(),/&lt;0\.1% of 1M peak/);
-assert.match(inspectHero(tinyGauge,'7d',['End']).steps[0].tooltipHtml,/Open circuits: 100 \(&lt;0\.1%\)/);
+assert.match(inspectHero(tinyGauge,'7d',['End']).steps[0].tooltipHtml,/Open circuits: 100 \(&lt;0\.1%, 100% of 7d peak\)/);
+assert.match(inspectHero(tinyGauge,'all',['End']).steps[0].tooltipHtml,/Open circuits: 100 \(&lt;0\.1%\)/);
+const zeroWinGauge=structuredClone(tinyGauge);
+chart('open_circuits',zeroWinGauge).series[0].history.daily.forEach(row=>{if(row[0]>=zeroWinGauge.end-6*86400)row[1]=0;});
+assert.equal(ui.prepareHeroPlot(zeroWinGauge,'7d',true).gauges.openCircuits.scalePeak,1,'all-zero 7d gauge falls back cleanly to scalePeak 1');
 
 const partialHeroData=structuredClone(data);
 for(const row of chart('directory_rejections',partialHeroData).series[0].history.daily){
@@ -1978,6 +1994,31 @@ const cssText=fs.readFileSync(path.join(__dirname,'..','site','style.css'),'utf8
 for(const [base,mob] of [['.hero-card { margin-bottom: 26px','.hero-card { margin-bottom: 20px'],['.hero-kpi-grid { display:','.hero-kpi-grid { gap: 12px'],['.hero-kpi-value { font-size: 26px','.hero-kpi-value { font-size: clamp'],['.hero-plot-wrap { min-height: 360px','.hero-plot-wrap { min-height: 320px']]){
  assert.ok(cssText.includes(base)&&mobileTail.includes(mob)&&cssText.lastIndexOf(mob)>cssText.indexOf(base),`mobile ${mob} overrides base`);
 }
+const desktopMedia=cssText.match(/@media\(min-width:1000px\)\s*\{[\s\S]*?\n\}/)?.[0]||'';
+assert.match(cssText,/\.hero-panel \{ display: none;/);
+assert.match(desktopMedia,/\.hero-panels \{ display: grid;/);
+assert.match(desktopMedia,/\.hero-panel \{ display: block;/);
+assert.match(desktopMedia,/\.hero-window-control \{ display: none;/);
+{
+ const savedSetTimeout=globalThis.setTimeout,queued=[];
+ globalThis.setTimeout=(cb,ms)=>{queued.push([cb,ms]);return 0;};
+ try{
+  const hiddenSkip=application('?view=overview');
+  hiddenSkip.app.start();
+  const pAll=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_all"]');
+  const p7=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_7d"]');
+  pAll.innerHTML='stale';
+  pAll.getBoundingClientRect=()=>({top:0,width:0});
+  p7.getBoundingClientRect=()=>({top:0,width:500});
+  hiddenSkip.windowEvents.get('resize')();
+  queued.at(-1)[0]();
+  assert.equal(pAll.innerHTML,'stale','hidden zero-width hero panel skips drawHero');
+  assert.match(p7.innerHTML,/<svg /,'visible hero panel draws normally');
+ }finally{
+  globalThis.setTimeout=savedSetTimeout;
+ }
+}
+assert.match(application('?view=methods',data).app.markup(),/Last 7 days<\/b> and <b>All time<\/b> side by side on desktop/);
 assert.match(application('?view=methods',data).app.markup(),/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
 
 const copiedQueries=[];
