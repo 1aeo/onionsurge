@@ -92,6 +92,14 @@ def regular_tree(directory):
     return _scan_tree(directory)[1]
 
 
+def _valid_rel_posix(name):
+    if not isinstance(name, str) or '\\' in name or '\0' in name:
+        return False
+    relative = PurePosixPath(name)
+    return bool(relative.parts and not relative.is_absolute() and '..' not in relative.parts
+                and name == relative.as_posix())
+
+
 def checked_manifest(directory, verify_hashes=True, *, existing_files=None):
     manifest_path = directory / 'build-manifest.json'
     try:
@@ -106,6 +114,10 @@ def checked_manifest(directory, verify_hashes=True, *, existing_files=None):
         raise ValueError('Live builds cannot be packaged as offline previews')
     if manifest.get('format') != BUILD_FORMAT:
         raise ValueError('Preview manifest format is unsupported')
+    if 'schema_version' in manifest:
+        schema_version = manifest['schema_version']
+        require(type(schema_version) is int and schema_version > 0,
+                'Preview manifest schema_version must be a positive integer')
     preview_ids = {}
     for p in PREVIEW_NAMES:
         dp = directory / p
@@ -113,12 +125,9 @@ def checked_manifest(directory, verify_hashes=True, *, existing_files=None):
             pinfo = dp.stat()
             preview_ids.setdefault((pinfo.st_dev, pinfo.st_ino), set()).add(p)
     for name, expected in manifest['files'].items():
-        if not isinstance(name, str) or '\\' in name or '\0' in name or not is_sha256(expected):
+        if not _valid_rel_posix(name) or not is_sha256(expected):
             raise ValueError('Invalid staged manifest entry')
-        relative = PurePosixPath(name)
-        require(relative.parts and not relative.is_absolute() and '..' not in relative.parts
-                and name == relative.as_posix(), 'Invalid staged manifest entry')
-        path = directory / relative
+        path = directory / PurePosixPath(name)
         try:
             info = path.stat()
         except OSError as error:
@@ -128,6 +137,13 @@ def checked_manifest(directory, verify_hashes=True, *, existing_files=None):
         aliases = preview_ids.get((info.st_dev, info.st_ino))
         require(not aliases or aliases == {name}, 'Manifest path aliases a regenerated preview')
     declared = set(manifest['files'])
+    if 'release_objects' in manifest:
+        release_objects = manifest['release_objects']
+        require(isinstance(release_objects, list)
+                and all(_valid_rel_posix(item) and item not in PREVIEW_NAMES and item in declared
+                        for item in release_objects)
+                and len(release_objects) == len(set(release_objects)),
+                'Preview manifest release_objects must contain unique declared non-preview paths')
     for rel in (regular_tree(directory) if existing_files is None else existing_files):
         require(rel == 'build-manifest.json' or rel in PREVIEW_NAMES or rel in declared,
                 f'Undeclared staged asset: {rel}')

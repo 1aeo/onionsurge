@@ -31,7 +31,7 @@ python3 scripts/package_previews.py \
   --directory dist                              # Embed offline design-{1,2,3}.html & update build-manifest.json
 ```
 
-Optional `build.py` flags: pass `--time-ranges <path>` to use a custom range configuration without editing code, `--live` for live-release frontend builds, and `--refresh-reference` to rebuild the daily frozen reference cache. See [`docs/collector.md`](docs/collector.md), [`docs/query-gateway.md`](docs/query-gateway.md), and [`docs/source-install.md`](docs/source-install.md) for hourly/daily SSH aggregate collection (`3,600s` UTC hours, `21,600s` sampled 1h reference points, `86,400s` `00:00 UTC` calendar days), gateway installation, and `90` fixed query IDs / `208` operations. See [`docs/live-releases.md`](docs/live-releases.md) for the live `onionsurge-release-v1` SHA-256 verification/refresh/fallback protocol, and [`docs/performance.md`](docs/performance.md) for `Allium` / cache reuse and rendering benchmarks.
+Optional `build.py` flags: pass `--time-ranges <path>` to use a custom range configuration without editing code, `--live` for live-release frontend builds, and `--refresh-reference` to rebuild the daily frozen reference cache. Optional `collect.py` flags `--plan` (read-only catch-up/timeout planner), `--record-checkpoint`, and repeatable `--forbid-overlap` track collector state, `0600` `checkpoint.json` / `cache_committed` / `checkpoint_updated` status, SSH keys, and private seeds, and reject output or state paths that overlap the listed directories. These are path checks, not access controls: publication runners must run under a separate account that cannot read the collector's files. See [`docs/collector.md`](docs/collector.md), [`docs/query-gateway.md`](docs/query-gateway.md), and [`docs/source-install.md`](docs/source-install.md) for hourly/daily SSH aggregate collection (`3,600s` UTC hours, `21,600s` sampled 1h reference points, `86,400s` `00:00 UTC` calendar days), gateway installation, and `90` fixed query IDs / `208` operations. See [`docs/live-releases.md`](docs/live-releases.md) for the live `onionsurge-release-v1` SHA-256 verification/refresh/fallback protocol, and [`docs/performance.md`](docs/performance.md) for `Allium` / cache reuse and rendering benchmarks.
 
 ## Cohorts, Families & MetricsPort Sources
 
@@ -86,7 +86,7 @@ Generated artifacts (`dist/` offline; keep together when hosting):
 - `data.json` & `data.js` (`window.ONIONSURGE_DATA`, `<` escaped as `\u003c`), `catalogue.json` (`families`, `charts`, `methods`), and `reference/reference-YYYY-MM-DD-<12-hex>.json` (frozen distributions + script/input/config SHA-256 provenance).
 - `exports/<chart_id>-<export_suffix>.csv` (`91` files for `24h`, `7d`, `1mo`, `3mo`, `6mo`, `12mo`, `all-time`): `interval_end_utc,series,value,unit` in unscaled coarsened source units.
 - `design-{1,2,3}.html` (offline only): Single-file previews (`24h` default, `All time`, `Explorer`) with `<meta http-equiv="Content-Security-Policy">` pinning exact `sha256-...` digests for inline `<script>` and `<style>` blocks.
-- `build-manifest.json`: Canonical POSIX relative path → `SHA-256` integrity map (with `mode: "offline" | "live"` and `query_contract_sha256`).
+- `build-manifest.json`: Canonical POSIX relative path → `SHA-256` integrity map (with `mode: "offline" | "live"`, `schema_version`, `snapshot_end`, `input_sha256`, `query_contract_sha256`, and `release_objects`).
 
 ### Concurrency, Locking & Staged Promotion Invariants
 

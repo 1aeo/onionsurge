@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -28,6 +30,7 @@ class SyntheticSource:
     def __init__(self, queries, handlers):
         self.queries, self.handlers = queries, handlers
         self.calls = []
+        self.catalogue_calls = 0
         self.transform = lambda response: response
 
     @property
@@ -35,6 +38,7 @@ class SyntheticSource:
         return len(self.calls)
 
     def catalogue(self):
+        self.catalogue_calls += 1
         return self.queries
 
     def query(self, key, begin, end, step):
@@ -308,7 +312,14 @@ class SourceConfigAndCliTests(unittest.TestCase):
                 'SOURCE_SSH_KNOWN_HOSTS_FILE="${HOME}/.ssh/onionsurge_known_hosts"',
             ]) + '\n')
             cfg.chmod(0o600)
-            summary = {'snapshot_end': END, 'charts': 4, 'series': 5, 'source_requests': 1}
+            summary = {
+                'snapshot_end': END,
+                'charts': 4,
+                'series': 5,
+                'source_requests': 1,
+                'cache_committed': True,
+                'checkpoint_updated': True,
+            }
             stdout = io.StringIO()
             with mock.patch.object(collector, 'collect', return_value=summary) as mocked, redirect_stdout(stdout):
                 collector.main([
@@ -752,16 +763,25 @@ class CollectorTests(unittest.TestCase):
             state_dir = Path(folder) / 'state'
             out_path = Path(folder) / 'snapshot.json'
             with mock.patch.object(collector, 'validate_snapshot'):
-                collector.collect({}, app_dir, state_dir, out_path, end=END - DAY, source=fixture.source)
+                initial_summary = collector.collect({}, app_dir, state_dir, out_path, end=END - DAY, source=fixture.source)
+            self.assertTrue(initial_summary['cache_committed'])
+            self.assertTrue(initial_summary['checkpoint_updated'])
+            checkpoint_path = state_dir / 'checkpoint.json'
+            self.assertTrue(checkpoint_path.is_file())
+            self.assertEqual(stat.S_IMODE(checkpoint_path.lstat().st_mode), 0o600)
+            initial_cp = checkpoint_path.read_bytes()
+            self.assertEqual(json.loads(initial_cp)['observation_end'], END - DAY)
             committed_before = out_path.read_text()
             with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
                 before_rows = db.execute('SELECT count(*) FROM observations').fetchone()[0]
                 before_end_rows = db.execute('SELECT count(*) FROM observations WHERE endpoint=?', (END,)).fetchone()[0]
+                before_completions = db.execute('SELECT observation_end FROM collection_completions').fetchall()
             self.assertGreater(before_rows, 0)
             self.assertEqual(before_end_rows, 0)
+            self.assertEqual(before_completions, [(END - DAY,)])
 
             (app_dir / 'inputs/snapshot.json').write_text(committed_before)
-            for mode in ('validation', 'write', 'commit'):
+            for mode in ('validation', 'write', 'record_completion', 'commit', 'checkpoint_write'):
                 calls = {'n': 0}
                 def validate_output_fail(data, **kwargs):
                     calls['n'] += 1
@@ -778,26 +798,57 @@ class CollectorTests(unittest.TestCase):
                                 with self.assertRaisesRegex(OSError, 'disk full'):
                                     collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(out_path.read_text(), committed_before)
-                        elif mode == 'commit':
+                        elif mode in {'record_completion', 'commit'}:
                             stderr = io.StringIO()
                             real_cache_cls = collector.ObservationCache
-                            class FailingCommitCache(real_cache_cls):
-                                def commit(self):
-                                    raise sqlite3.OperationalError('simulated lock')
-                            with mock.patch.object(collector, 'ObservationCache', FailingCommitCache), redirect_stderr(stderr):
+                            if mode == 'record_completion':
+                                class FailingCache(real_cache_cls):
+                                    def record_completion(self, source_identity, observation_end):
+                                        raise sqlite3.OperationalError('simulated completion insert failure')
+                            else:
+                                class FailingCache(real_cache_cls):
+                                    def commit(self):
+                                        raise sqlite3.OperationalError('simulated lock')
+                            with mock.patch.object(collector, 'ObservationCache', FailingCache), redirect_stderr(stderr):
                                 summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(summary['snapshot_end'], END)
+                            self.assertFalse(summary['cache_committed'])
+                            self.assertFalse(summary['checkpoint_updated'])
                             self.assertEqual(json.loads(out_path.read_text())['end'], END)
                             self.assertIn('observation cache commit failed after snapshot publication', stderr.getvalue())
                             out_path.write_text(committed_before)
+                        elif mode == 'checkpoint_write':
+                            stderr = io.StringIO()
+                            real_atomic_json = collector.atomic_json
+                            def fail_checkpoint_only(path, value):
+                                if Path(path).name == 'checkpoint.json':
+                                    raise OSError('checkpoint disk full')
+                                return real_atomic_json(path, value)
+                            with mock.patch.object(collector, 'atomic_json', side_effect=fail_checkpoint_only), redirect_stderr(stderr):
+                                summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
+                            self.assertEqual(summary['snapshot_end'], END)
+                            self.assertTrue(summary['cache_committed'])
+                            self.assertFalse(summary['checkpoint_updated'])
+                            self.assertEqual(json.loads(out_path.read_text())['end'], END)
+                            self.assertIn('collector checkpoint update failed after snapshot publication', stderr.getvalue())
+                            self.assertEqual(checkpoint_path.read_bytes(), initial_cp)
+                            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                                completions = sorted(row[0] for row in db.execute(
+                                    'SELECT observation_end FROM collection_completions'))
+                            self.assertEqual(completions, [END - DAY, END])
+                            continue
                         else:
                             with self.assertRaisesRegex(ValueError, 'simulated output validation failure'):
                                 collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(out_path.read_text(), committed_before)
+                    self.assertEqual(checkpoint_path.read_bytes(), initial_cp)
                     with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
                         after_rows = db.execute('SELECT count(*) FROM observations').fetchone()[0]
                         after_end_rows = db.execute('SELECT count(*) FROM observations WHERE endpoint=?', (END,)).fetchone()[0]
+                        after_completions = db.execute('SELECT observation_end FROM collection_completions').fetchall()
                     self.assertEqual(after_rows, before_rows)
+                    self.assertEqual(after_end_rows, 0)
+                    self.assertEqual(after_completions, before_completions)
                     self.assertEqual(after_end_rows, 0)
 
     def test_chained_collection_preserves_binary_hash_counts(self):
@@ -1309,6 +1360,477 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(up_first['relay_population']['hour'][0], intraday_end)
         self.assertEqual(up_first['relay_population']['day'][0], intraday_end)
         self.assertEqual(up_first['relay_population']['daily'][0], original_first_pop)
+
+    def _private_source_env(self, root, *, extra_env=''):
+        id_file = root / 'id'
+        kh_file = root / 'kh'
+        id_file.write_text('PRIVATE-KEY\n')
+        id_file.chmod(0o600)
+        kh_file.write_text('source.example ssh-ed25519 AAAA\n')
+        kh_file.chmod(0o600)
+        cfg_file = root / 'source.env'
+        cfg_file.write_text(
+            f'SOURCE_SSH_HOST="source.example"\n'
+            f'SOURCE_SSH_USER="onionsurge-read"\n'
+            f'SOURCE_SSH_PORT="22"\n'
+            f'SOURCE_SSH_IDENTITY_FILE="{id_file}"\n'
+            f'SOURCE_SSH_KNOWN_HOSTS_FILE="{kh_file}"\n'
+            f'{extra_env}'
+        )
+        cfg_file.chmod(0o600)
+        return cfg_file, id_file, kh_file
+
+    def test_plan_collection_cold_warm_checkpoint_and_timeout_scaling(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+        v3 = copy.deepcopy(base_v4)
+        v3.update(input_schema_version=3, window_seconds=DAY, minimum_samples=360, expected_samples=720)
+        v3['versions']['runtime_resolution']['snapshot_start'] = v3['start']
+        for chart in v3['charts']:
+            chart['kind'] = 'gauge_daily_mean' if chart['kind'] == 'gauge_hour_mean' else 'counter_daily_rate'
+            chart['query'] = chart['history_queries']['daily']['value']
+            chart['quality_query'] = chart['history_queries']['daily']['eligible']
+            chart['history_queries'] = {'daily': chart['history_queries']['daily']}
+            for s in chart['series']:
+                for f in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    s.pop(f, None)
+                s['history'].pop('sampled_hour', None)
+                s['current'] = {'day': s['current']['day']}
+                if 'relay_population' in s:
+                    s['relay_population'].pop('hour', None)
+                    s['relay_population']['queries'] = {'day': s['relay_population']['queries']['day']}
+
+        short_v3 = copy.deepcopy(v3)
+        cutoff_5d = seed_end - 5 * DAY
+        for chart in short_v3['charts']:
+            for s in chart['series']:
+                if s['history']['daily']:
+                    s['history']['daily'] = [r for r in s['history']['daily'] if r[0] >= cutoff_5d]
+                if 'relay_population' in s and s['relay_population']['daily']:
+                    s['relay_population']['daily'] = [r for r in s['relay_population']['daily'] if r[0] >= cutoff_5d]
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, _, kh_file = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+            app_dir = root / 'app'
+            (app_dir / 'inputs').mkdir(parents=True)
+            (app_dir / 'catalogue').mkdir(parents=True)
+            (app_dir / 'inputs/snapshot.json').write_text(json.dumps(base_v4))
+            (app_dir / 'catalogue/queries.json').write_text(json.dumps(queries))
+            (app_dir / 'catalogue/routes.json').write_text(json.dumps(routes))
+
+            missing_state = root / 'cold_state'
+            end1 = seed_end + 3 * HOUR
+            stdout = io.StringIO()
+            with mock.patch.object(collector.subprocess, 'run') as sub_run, redirect_stdout(stdout):
+                collector.main([
+                    '--config', str(cfg_file),
+                    '--application-dir', str(app_dir),
+                    '--state-dir', str(missing_state),
+                    '--end', str(end1),
+                    '--plan',
+                ])
+            sub_run.assert_not_called()
+            self.assertFalse(missing_state.exists())
+            plan = json.loads(stdout.getvalue())
+            self.assertEqual(set(plan), {'snapshot_end', 'catchup_days', 'recommended_timeout_seconds'})
+            self.assertEqual((plan['snapshot_end'], plan['catchup_days']), (end1, 1))
+            planned_reqs = (plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
+
+            # Execute cold v4 collect and verify actual requests <= planned requests and checkpoint creation.
+            out1 = root / 'out1.json'
+            handlers = _snapshot_handlers(base_v4, routes, rate_val=1.0)
+            src = SyntheticSource(queries, handlers)
+            summary = collector.collect(cfg, app_dir, missing_state, out1, end=end1, source=src, config_path=cfg_file)
+            self.assertTrue(summary['cache_committed'])
+            self.assertTrue(summary['checkpoint_updated'])
+            self.assertEqual(src.catalogue_calls, 1)
+            self.assertLessEqual(summary['source_requests'] + src.catalogue_calls, planned_reqs)
+
+            # Warm plan 2 days ahead uses checkpoint observation_end (catchup_days == 2), not seed_end (3).
+            end2 = seed_end + 2 * DAY + 3 * HOUR
+            warm_plan = collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
+            self.assertEqual(warm_plan['catchup_days'], 2)
+
+            # Changing source.env, known_hosts, seed, queries, or routes invalidates warm_end -> cold (3d).
+            cfg_orig = cfg_file.read_text()
+            cfg_file.write_text(cfg_orig + '# rotated\n')
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            cfg_file.write_text(cfg_orig)
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 2)
+
+            kh_orig = kh_file.read_text()
+            kh_file.write_text(kh_orig + 'extra\n')
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            kh_file.write_text(kh_orig)
+
+            (app_dir / 'inputs/snapshot.json').write_text(json.dumps(base_v4) + ' ')
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            (app_dir / 'inputs/snapshot.json').write_text(json.dumps(base_v4))
+
+            q_alt = copy.deepcopy(queries)
+            q_alt['_note'] = q_alt['metadata_up']
+            (app_dir / 'catalogue/queries.json').write_text(json.dumps(q_alt))
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            (app_dir / 'catalogue/queries.json').write_text(json.dumps(queries))
+
+            r_alt = copy.deepcopy(routes)
+            r_alt['_note'] = r_alt['metadata.up']
+            (app_dir / 'catalogue/routes.json').write_text(json.dumps(r_alt))
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            (app_dir / 'catalogue/routes.json').write_text(json.dumps(routes))
+
+            # previous_end clamps baseline_end backwards; previous_end > end fails; distinguish previous_end vs base window limits.
+            clamped = collector.plan_collection(cfg, app_dir, missing_state, previous_end=seed_end - DAY, end=end2, config_path=cfg_file)
+            self.assertEqual(clamped['catchup_days'], 4)
+            with self.assertRaisesRegex(collector.CollectionError, 'precedes'):
+                collector.plan_collection(cfg, app_dir, missing_state, previous_end=end2 + HOUR, end=end2, config_path=cfg_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'manual publication workflow'):
+                collector.plan_collection(cfg, app_dir, missing_state, previous_end=seed_end - DAY, max_catchup_days=2, end=end2, config_path=cfg_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'manual collection'):
+                collector.plan_collection(cfg, app_dir, missing_state, max_catchup_days=1, end=end2, config_path=cfg_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'manual collection'):
+                collector.plan_collection(cfg, app_dir, missing_state, previous_end=seed_end - 2 * DAY, max_catchup_days=1, end=end2, config_path=cfg_file)
+
+            # Missing completion row (despite non-empty observations) and empty DB (0 committed rows) both disable warm_end cleanly.
+            with closing(sqlite3.connect(missing_state / 'observations.sqlite3')) as db:
+                comp_backup = db.execute('SELECT source_identity, observation_end FROM collection_completions').fetchall()
+                db.execute('DELETE FROM collection_completions')
+                db.commit()
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            with closing(sqlite3.connect(missing_state / 'observations.sqlite3')) as db:
+                db.executemany('INSERT INTO collection_completions VALUES (?, ?)', comp_backup)
+                db.execute('DELETE FROM observations')
+                db.commit()
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+
+            # Cold v3 sampled_hour backfill timeout scales dynamically with seed span and covers actual requests.
+            v3_app = root / 'v3_app'
+            (v3_app / 'inputs').mkdir(parents=True)
+            (v3_app / 'inputs/snapshot.json').write_text(json.dumps(v3))
+            v3_short_app = root / 'v3_short_app'
+            (v3_short_app / 'inputs').mkdir(parents=True)
+            (v3_short_app / 'inputs/snapshot.json').write_text(json.dumps(short_v3))
+            full_v3_plan = collector.plan_collection(cfg, v3_app, root / 'v3_s1', end=end1, config_path=cfg_file)
+            short_v3_plan = collector.plan_collection(cfg, v3_short_app, root / 'v3_s2', end=end1, config_path=cfg_file)
+            self.assertGreater(full_v3_plan['recommended_timeout_seconds'], short_v3_plan['recommended_timeout_seconds'])
+            short_src = SyntheticSource(queries, _snapshot_handlers(short_v3, routes, rate_val=1.0))
+            short_res = collector.collect(cfg, v3_short_app, root / 'v3_s2', root / 'v3_short_out.json',
+                                          end=end1, source=short_src, config_path=cfg_file)
+            short_planned = (short_v3_plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
+            self.assertEqual(short_src.catalogue_calls, 1)
+            self.assertLessEqual(short_res['source_requests'] + short_src.catalogue_calls, short_planned)
+
+            # Fail closed on non-private/symlink/corrupt state artifacts during --plan.
+            cp_file = missing_state / 'checkpoint.json'
+            cp_file.chmod(0o644)
+            with self.assertRaises(collector.CollectionError):
+                collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
+            cp_file.chmod(0o600)
+            cp_file.write_text('{bad json')
+            with self.assertRaises(collector.CollectionError):
+                collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
+            cp_file.unlink()
+            db_file = missing_state / 'observations.sqlite3'
+            db_file.chmod(0o644)
+            with self.assertRaises(collector.CollectionError):
+                collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
+            db_file.chmod(0o600)
+            db_file.write_bytes(b'corrupt bytes not sqlite')
+            with self.assertRaisesRegex(collector.CollectionError, 'Invalid observation cache database'):
+                collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
+            db_file.write_bytes(b'SQLite format 3')
+            with self.assertRaisesRegex(collector.CollectionError, 'Invalid observation cache database'):
+                collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
+
+    def test_record_checkpoint_and_cli_mode_validation(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, _, _ = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+            state_dir = root / 'state'
+
+            # Missing state_dir must NOT be created and must fail.
+            with self.assertRaises(collector.CollectionError):
+                collector.record_checkpoint(cfg, ROOT, state_dir, seed_end, config_path=cfg_file)
+            self.assertFalse(state_dir.exists())
+
+            # Populate state with a committed DB, remove checkpoint.json, then re-record via CLI --record-checkpoint.
+            out_path = root / 'out.json'
+            end1 = seed_end + 2 * DAY + HOUR
+            src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            collector.collect(cfg, ROOT, state_dir, out_path, end=end1, source=src, config_path=cfg_file)
+            cp_path = state_dir / 'checkpoint.json'
+            cp_path.unlink()
+
+            # Empty table -> rejected.
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                row_backup = db.execute('SELECT * FROM observations LIMIT 1').fetchone()
+                all_rows = db.execute('SELECT * FROM observations').fetchall()
+                db.execute('DELETE FROM observations')
+                db.commit()
+            with self.assertRaises(collector.CollectionError):
+                collector.record_checkpoint(cfg, ROOT, state_dir, end1, config_path=cfg_file)
+            self.assertFalse(cp_path.exists())
+
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                db.executemany('INSERT INTO observations VALUES (?,?,?,?,?)', all_rows or [row_backup])
+                db.commit()
+
+            # Non-matching endpoint or altered source identity must be rejected by --record-checkpoint even with populated observations.
+            with self.assertRaisesRegex(collector.CollectionError, 'completion record'):
+                collector.record_checkpoint(cfg, ROOT, state_dir, end1 + HOUR, config_path=cfg_file)
+            self.assertFalse(cp_path.exists())
+            alt_cfg = dict(cfg, SOURCE_SSH_HOST='other-host.internal')
+            with self.assertRaisesRegex(collector.CollectionError, 'completion record'):
+                collector.record_checkpoint(alt_cfg, ROOT, state_dir, end1)
+            self.assertFalse(cp_path.exists())
+
+            # CLI main() reads source.env bytes only once per invocation and passes config_bytes through.
+            real_read_regular = collector.read_regular_bytes
+            cfg_reads = []
+            def counting_read(path, *args, **kwargs):
+                if Path(path) == cfg_file:
+                    cfg_reads.append(path)
+                return real_read_regular(path, *args, **kwargs)
+
+            stdout = io.StringIO()
+            with mock.patch.object(collector, 'read_regular_bytes', side_effect=counting_read), redirect_stdout(stdout):
+                collector.main([
+                    '--config', str(cfg_file),
+                    '--state-dir', str(state_dir),
+                    '--end', str(end1),
+                    '--record-checkpoint',
+                ])
+            self.assertEqual(len(cfg_reads), 1)
+            self.assertEqual(json.loads(stdout.getvalue()), {'status': 'checkpoint_recorded', 'observation_end': end1})
+            self.assertEqual(stat.S_IMODE(cp_path.lstat().st_mode), 0o600)
+            cfg_reads.clear()
+            stdout_plan = io.StringIO()
+            with mock.patch.object(collector, 'read_regular_bytes', side_effect=counting_read), redirect_stdout(stdout_plan):
+                collector.main([
+                    '--config', str(cfg_file),
+                    '--state-dir', str(state_dir),
+                    '--end', str(end1 + HOUR),
+                    '--plan',
+                ])
+            self.assertEqual(len(cfg_reads), 1)
+            self.assertEqual(json.loads(stdout_plan.getvalue())['catchup_days'], 1)
+
+            # Mutually exclusive and required CLI argument combinations fail cleanly.
+            bad_invocations = [
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--plan', '--record-checkpoint'],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--output', str(out_path), '--plan'],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--output', str(out_path), '--end', str(end1), '--record-checkpoint'],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir)],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--record-checkpoint'],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--output', str(out_path), '--previous-end', str(seed_end)],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--output', str(out_path), '--max-catchup-days', '5'],
+            ]
+            for argv in bad_invocations:
+                with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited:
+                    collector.main(argv)
+                self.assertEqual(exited.exception.code, 2)
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as exited:
+                collector.main(['--config', str(cfg_file), '--state-dir', str(state_dir), '--plan', '--max-catchup-days', '0'])
+            self.assertEqual(exited.exception.code, 1)
+            self.assertEqual(stderr.getvalue(), 'Collection plan failed.\n')
+
+    def test_forbid_overlap_ssh_and_seed_isolation(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            private_seed = root / 'private-seed.json'
+            private_seed.write_text(json.dumps(base_v4))
+            private_seed.chmod(0o600)
+            cfg_file, id_file, kh_file = self._private_source_env(root, extra_env=f'SOURCE_SEED_SNAPSHOT="{private_seed}"\n')
+            cfg = collector.load_source_config(cfg_file)
+            state_dir = root / 'state'
+
+            # Every protected artifact rejects overlap via --forbid-overlap, including symlink & nonexistent descendants.
+            sym_parent = root / 'sym_parent'
+            sym_parent.symlink_to(root)
+            for forbidden in (
+                cfg_file,
+                id_file,
+                kh_file,
+                state_dir,
+                state_dir / 'nested/missing',
+                private_seed,
+                sym_parent / 'state/nested/missing',
+                sym_parent / 'kh',
+            ):
+                with self.subTest(forbidden=str(forbidden)), self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                    collector.plan_collection(cfg, ROOT, state_dir, end=seed_end, config_path=cfg_file, forbid_overlap=[forbidden])
+                src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+                with self.subTest(collect_forbidden=str(forbidden)), self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                    collector.collect(cfg, ROOT, state_dir, root / 'out.json', end=seed_end, source=src,
+                                      config_path=cfg_file, forbid_overlap=[forbidden])
+
+            # SOURCE_SEED_SNAPSHOT overlapping state_dir or config_path fails closed.
+            in_state_seed = state_dir / 'private-seed.json'
+            state_dir.mkdir(mode=0o700)
+            in_state_seed.write_text(json.dumps(base_v4))
+            in_state_seed.chmod(0o600)
+            cfg_in_state = dict(cfg, SOURCE_SEED_SNAPSHOT=str(in_state_seed))
+            with self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                collector.plan_collection(cfg_in_state, ROOT, state_dir, end=seed_end, config_path=cfg_file)
+
+            # Invalid SSH port or symlink SSH identity/known_hosts fails closed in --plan and --record-checkpoint.
+            bad_port_cfg = dict(cfg, SOURCE_SSH_PORT='70000')
+            with self.assertRaisesRegex(collector.CollectionError, 'port'):
+                collector.plan_collection(bad_port_cfg, ROOT, state_dir, end=seed_end, config_path=cfg_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'port'):
+                collector.record_checkpoint(bad_port_cfg, ROOT, state_dir, end=seed_end, config_path=cfg_file)
+
+            sym_kh = root / 'sym-kh'
+            sym_kh.symlink_to(kh_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'regular file'):
+                collector.plan_collection(dict(cfg, SOURCE_SSH_KNOWN_HOSTS_FILE=str(sym_kh)),
+                                          ROOT, state_dir, end=seed_end, config_path=cfg_file)
+
+    def test_verifier_edge_cases_staggered_gaps_sidecars_wal_output_and_case_aliases(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, id_file, kh_file = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+
+            # 1. Staggered/interleaved relay_population.daily gaps across multi-series/shared-query charts.
+            staggered = copy.deepcopy(base_v4)
+            for c_idx, chart in enumerate(staggered['charts']):
+                for s_idx, series in enumerate(chart['series']):
+                    pop_daily = series.get('relay_population', {}).get('daily', [])
+                    if len(pop_daily) >= 6:
+                        offset = (c_idx + s_idx) % 2
+                        series['relay_population']['daily'] = [
+                            row for i, row in enumerate(pop_daily)
+                            if not (2 <= i < len(pop_daily) - 2 and i % 2 == offset)
+                        ]
+            stag_app = root / 'stag_app'
+            (stag_app / 'inputs').mkdir(parents=True)
+            (stag_app / 'inputs/snapshot.json').write_text(json.dumps(staggered))
+            end_stag = seed_end + HOUR
+            stag_plan = collector.plan_collection(cfg, stag_app, root / 'stag_state', end=end_stag, config_path=cfg_file)
+            stag_planned = (stag_plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
+            stag_src = SyntheticSource(queries, _snapshot_handlers(staggered, routes, rate_val=1.0))
+            stag_res = collector.collect(cfg, stag_app, root / 'stag_state', root / 'stag_out.json',
+                                         end=end_stag, source=stag_src, config_path=cfg_file)
+            self.assertEqual(stag_src.catalogue_calls, 1)
+            self.assertLessEqual(stag_res['source_requests'] + stag_src.catalogue_calls, stag_planned)
+
+            # 2. Output cannot overwrite source.env, SSH keys, known_hosts, state_dir itself, or SQLite sidecars.
+            state_dir = root / 'state_out'
+            for bad_out in (
+                cfg_file,
+                id_file,
+                kh_file,
+                state_dir,
+                state_dir / 'observations.sqlite3-wal',
+                state_dir / 'observations.sqlite3-shm',
+                state_dir / 'observations.sqlite3-journal',
+            ):
+                src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+                with self.subTest(bad_out=str(bad_out)), self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                    collector.collect(cfg, ROOT, state_dir, bad_out, end=end_stag, source=src, config_path=cfg_file)
+
+            # 3. Non-mutating locking inspection:
+            #    (a) Rollback-journal DB works as warm under mode 0500 state_dir via ?mode=ro without creating sidecars.
+            #    (b) WAL-mode DB without -shm (with or without -wal) never creates -shm during --plan, falls back cleanly to cold,
+            #        and rejects --record-checkpoint; symlink/bad-mode sidecars and symlink checkpoint still fail closed.
+            wal_end = seed_end + DAY + HOUR
+            rb_state = root / 'rb_state'
+            rb_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            collector.collect(cfg, ROOT, rb_state, root / 'rb_out.json', end=wal_end, source=rb_src, config_path=cfg_file)
+            rb_state.chmod(0o500)
+            try:
+                rb_plan = collector.plan_collection(cfg, ROOT, rb_state, end=wal_end + HOUR, config_path=cfg_file)
+                self.assertEqual(rb_plan['catchup_days'], 1)
+                for sfx in ('-wal', '-shm', '-journal'):
+                    self.assertFalse((rb_state / f'observations.sqlite3{sfx}').exists())
+            finally:
+                rb_state.chmod(0o700)
+
+            wal_state = root / 'wal_state'
+            wal_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            collector.collect(cfg, ROOT, wal_state, root / 'wal_out.json', end=wal_end, source=wal_src, config_path=cfg_file)
+            db_path = wal_state / 'observations.sqlite3'
+            with closing(sqlite3.connect(db_path)) as db:
+                db.execute('PRAGMA journal_mode=WAL')
+                db.commit()
+            wal_file = wal_state / 'observations.sqlite3-wal'
+            shm_file = wal_state / 'observations.sqlite3-shm'
+            # WAL with -wal present and no -shm must fall back cleanly to cold (2d) without creating -shm.
+            shm_file.unlink(missing_ok=True)
+            if not wal_file.exists():
+                wal_file.write_bytes(b'\x00' * 32)
+                wal_file.chmod(0o600)
+            wal_only_plan = collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
+            self.assertEqual(wal_only_plan['catchup_days'], 2)
+            self.assertFalse(shm_file.exists())
+            with self.assertRaisesRegex(collector.CollectionError, 'shared-memory index'):
+                collector.record_checkpoint(cfg, ROOT, wal_state, end=wal_end, config_path=cfg_file)
+
+            # WAL without -wal or -shm under 0o500 also falls back to cold cleanly and creates no sidecars.
+            wal_file.unlink(missing_ok=True)
+            shm_file.unlink(missing_ok=True)
+            wal_state.chmod(0o500)
+            try:
+                wal_plan = collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
+                self.assertEqual(wal_plan['catchup_days'], 2)
+                self.assertFalse(wal_file.exists())
+                self.assertFalse(shm_file.exists())
+            finally:
+                wal_state.chmod(0o700)
+
+            for suffix in ('-wal', '-shm', '-journal'):
+                sidecar = wal_state / f'observations.sqlite3{suffix}'
+                sidecar.symlink_to(root / 'missing-sidecar')
+                with self.subTest(symlink_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
+                    collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
+                with self.subTest(ckpt_symlink_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
+                    collector.record_checkpoint(cfg, ROOT, wal_state, end=wal_end, config_path=cfg_file)
+                sidecar.unlink()
+                sidecar.write_bytes(b'sidecar')
+                sidecar.chmod(0o644)
+                with self.subTest(mode_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
+                    collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
+                sidecar.unlink()
+
+            # Symlink checkpoint.json fails closed with CollectionError during --plan.
+            cp_file = wal_state / 'checkpoint.json'
+            cp_file.unlink()
+            cp_file.symlink_to(root / 'missing-cp.json')
+            with self.assertRaisesRegex(collector.CollectionError, 'checkpoint'):
+                collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
+
+            # 4. Existing/non-existent case aliases caught on case-insensitive filesystems (e.g. macOS APFS).
+            existing_dir = root / 'ExistingDir'
+            existing_dir.mkdir()
+            case_insensitive = (root / 'existingdir').exists()
+            self.assertEqual(collector._paths_overlap(root / 'ExistingDir/sub', root / 'existingdir/sub'), case_insensitive)
+            self.assertEqual(collector._paths_overlap(root / 'ExistingDir/Sub/child', root / 'existingdir/sub'), case_insensitive)
+            self.assertEqual(collector._paths_overlap(root / 'NonExistent/sub', root / 'nonexistent/sub'), case_insensitive)
+            if case_insensitive:
+                with self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                    collector.plan_collection(cfg, ROOT, root / 'StateCase/collector', end=seed_end,
+                                              config_path=cfg_file, forbid_overlap=[root / 'statecase/collector'])
 
 
 if __name__ == '__main__':
