@@ -17,6 +17,8 @@ spec = importlib.util.spec_from_file_location('collector', ROOT / 'scripts/colle
 collector = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(collector)
 DAY = collector.DAY
+HOUR = collector.HOUR
+SAMPLED_HOUR_STEP = collector.SAMPLED_HOUR_STEP
 END = 20000 * DAY
 
 
@@ -47,36 +49,55 @@ class SyntheticSource:
         return self.transform(response)
 
 
-def seeded_chart(chart_id, cohort, keys, population):
+def seeded_chart(chart_id, cohort, keys, population, queries=None, routes=None):
+    seed_end = END - 2 * DAY
+    grid = list(range(seed_end - DAY + HOUR, seed_end + 1, HOUR))
+    sh_grid = list(range(seed_end - DAY + SAMPLED_HOUR_STEP, seed_end + 1, SAMPLED_HOUR_STEP))
+
     def series(key, historical=True):
+        cur_day = {
+            'value': 2.0 if historical else None,
+            'relays': population if historical else None,
+            'expected_relays': population,
+            'coverage': 1.0 if historical else None,
+            'valid': historical,
+        }
+        cur_hour = {'value': 2.0, 'relays': population, 'expected_relays': population, 'coverage': 1.0, 'valid': True}
         return {
             'key': key,
             'history_status': 'queried' if historical else 'not_queried',
-            'current': {'day': {
-                'value': 2.0 if historical else None,
-                'relays': population if historical else None,
-                'expected_relays': population,
-                'coverage': 1.0 if historical else None,
-                'valid': historical,
-            }},
-            'history': {'daily': [[END - 2 * DAY, 2.0, population, 1.0, True]] if historical else []},
+            'values': [[t, 2.0] for t in grid],
+            'hourly_relays': [[t, population] for t in grid],
+            'hourly_expected_relays': [[t, population] for t in grid],
+            'current': {'hour': cur_hour, 'day': cur_day},
+            'history': {
+                'daily': [[seed_end, 2.0, population, 1.0, True]] if historical else [],
+                'sampled_hour': [[t, 2.0, population, 1.0, True] for t in sh_grid] if historical else [],
+            },
         }
-    return {'id': chart_id, 'cohort_key': cohort, 'kind': 'counter_daily_rate', 'relays': population,
-            'query': 'original-current-query', 'quality_query': 'original-quality-query',
-            'series': [series(key, key != 'circuit_dead') for key in keys]}
+    chart = {'id': chart_id, 'cohort_key': cohort, 'kind': 'counter_hour_rate', 'relays': population,
+             'query': queries[routes[f'{chart_id}.current_hour.value']] if queries and routes else 'original-current-query',
+             'quality_query': queries[routes[f'{chart_id}.current_hour.eligible']] if queries and routes else 'original-quality-query',
+             'series': [series(key, key != 'circuit_dead') for key in keys]}
+    if queries and routes:
+        chart['history_queries'] = {
+            p: {s: queries[routes[f'{chart_id}.{p}.{s}']] for s in ('value', 'eligible', 'available')}
+            for p in ('daily', 'sampled_hour', 'current24')
+        }
+    return chart
 
 
 class CollectorFixture:
     def __init__(self):
         self.queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
         self.routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
-        self.seed = {'input_schema_version': 3, 'end': END - 2 * DAY, 'start': END - 3 * DAY,
-                     'window_seconds': DAY, 'minimum_samples': 360,
+        self.seed = {'input_schema_version': 4, 'end': END - 2 * DAY, 'start': END - 3 * DAY,
+                     'window_seconds': HOUR, 'minimum_samples': 24, 'expected_samples': 30,
                      'fleet': 80, 'custom': 32, 'defense': 48,
-                     'charts': [seeded_chart('circuit_rejections', 'native', ['circuit_rejections'], 80),
-                                seeded_chart('hsdir_fetches', 'custom', ['success'], 32),
-                                seeded_chart('directory_rejections', 'directory_defense', ['begindir_rejected'], 48),
-                                seeded_chart('directory_requests', 'custom', ['hs_get', 'circuit_dead'], 32)],
+                     'charts': [seeded_chart('circuit_rejections', 'native', ['circuit_rejections'], 80, self.queries, self.routes),
+                                seeded_chart('hsdir_fetches', 'custom', ['success'], 32, self.queries, self.routes),
+                                seeded_chart('directory_rejections', 'directory_defense', ['begindir_rejected'], 48, self.queries, self.routes),
+                                seeded_chart('directory_requests', 'custom', ['hs_get', 'circuit_dead'], 32, self.queries, self.routes)],
                      'versions': {'verified_runtime': [
                          {'build_id': 'stock.15', 'version': '0.4.9.15', 'base_version': '0.4.9.15', 'patched': False, 'relays': 48},
                          {'build_id': 'tor41339.9', 'version': '0.4.9.15 + tor41339.9', 'base_version': '0.4.9.15', 'patched': True, 'relays': 16}],
@@ -90,24 +111,26 @@ class CollectorFixture:
         self.attested = True
         handlers = {}
         for chart in self.seed['charts']:
-            for statistic in ['value', 'eligible', 'available']:
-                query_id = self.routes[f'{chart["id"]}.daily.{statistic}']
-                def data(t, chart=chart, statistic=statistic):
-                    rows = []
-                    for series in chart['series']:
-                        if series['key'] == 'circuit_dead':
-                            continue
-                        value = chart['relays']
-                        if statistic == 'value':
-                            value = 77 if t == END else 2
-                        elif statistic == 'eligible' and chart['id'] == 'circuit_rejections' and t == END - DAY:
-                            value = 64
-                        labels = ({'type': 'circuit_rejected'} if chart['id'] == 'circuit_rejections'
-                                  else {'action': series['key']} if chart['id'] == 'hsdir_fetches'
-                                  else {'type': series['key']})
-                        rows.append((labels, value))
-                    return rows
-                handlers.setdefault(query_id, data)
+            for period in ['current_hour', 'sampled_hour', 'daily', 'current24']:
+                for statistic in ['value', 'eligible', 'available']:
+                    query_id = self.routes[f'{chart["id"]}.{period}.{statistic}']
+                    def data(t, chart=chart, statistic=statistic, period=period):
+                        rows = []
+                        for series in chart['series']:
+                            if series['key'] == 'circuit_dead' and not (
+                                    period == 'current_hour' or statistic == 'available'):
+                                continue
+                            value = chart['relays']
+                            if statistic == 'value':
+                                value = 77 if t >= END else 2
+                            elif statistic == 'eligible' and chart['id'] == 'circuit_rejections' and t == END - DAY:
+                                value = 64
+                            labels = ({'type': 'circuit_rejected'} if chart['id'] == 'circuit_rejections'
+                                      else {'action': series['key']} if chart['id'] == 'hsdir_fetches'
+                                      else {'type': series['key']})
+                            rows.append((labels, value))
+                        return rows
+                    handlers.setdefault(query_id, data)
         for cohort in ['native', 'custom', 'directory_defense']:
             managed = [('stock.15', 'a' * 64, 48), ('UNKNOWN_BUILD', 'd' * 64, 1)] if cohort == 'native' else [
                 ('tor41339.9', 'b' * 64, 16)] if cohort == 'custom' else [('stock.15', 'a' * 64, 24)]
@@ -123,24 +146,99 @@ class CollectorFixture:
             handlers[self.routes['metadata.' + name]] = lambda t: [({}, 80)]
         for name in ['combined_zero_nonexit', 'observed_zero', 'file_fallback_zero', 'file0_observed1_conflicts']:
             handlers[self.routes['dircache.' + name]] = lambda t: [({}, 0)]
-        for key in {self.routes[f'{chart["id"]}.relay_population.day'] for chart in self.seed['charts']}:
-            def roles(t, key=key):
-                rows = []
-                for chart in self.seed['charts']:
-                    if self.routes[f'{chart["id"]}.relay_population.day'] != key:
-                        continue
-                    for series in chart['series']:
-                        metric_type = ('circuit_rejected' if chart['id'] == 'circuit_rejections'
-                                       else series['key'])
-                        n = 64 if chart['id'] == 'circuit_rejections' and t == END - DAY else chart['relays']
-                        rows.append(({'type': metric_type, 'action': '59'}, n))
-                return rows
-            handlers[key] = roles
+        for period in ('hour', 'day'):
+            for key in {self.routes[f'{chart["id"]}.relay_population.{period}'] for chart in self.seed['charts']}:
+                def roles(t, key=key, period=period):
+                    rows = []
+                    for chart in self.seed['charts']:
+                        if self.routes[f'{chart["id"]}.relay_population.{period}'] != key:
+                            continue
+                        for series in chart['series']:
+                            metric_type = ('circuit_rejected' if chart['id'] == 'circuit_rejections'
+                                           else series['key'])
+                            n = 64 if chart['id'] == 'circuit_rejections' and t == END - DAY else chart['relays']
+                            rows.append(({'type': metric_type, 'action': '59'}, n))
+                    return rows
+                handlers[key] = roles
         self.source = SyntheticSource(self.queries, handlers)
 
     def instance(self, path):
         cache = collector.ObservationCache(path, self.source, self.queries)
         return collector.Collector(self.source, cache, self.queries, self.routes, self.seed), cache
+
+
+def _series_promql_labels(chart, series):
+    if chart['id'] in collector.SCALARS:
+        return {}
+    if chart['id'] in collector.ALIASES:
+        return {'type': collector.ALIASES[chart['id']]}
+    return {('action' if chart['id'] in {'hsdir_fetches', 'hsdir_uploads'} else 'type'): series['key']}
+
+
+def _snapshot_handlers(seed, routes, *, live_native=None, rate_val=2.0):
+    native_pop = seed['fleet'] if live_native is None else live_native
+    handlers = {}
+    all_charts = seed['charts']
+    pop_for_chart = lambda c: native_pop if c['cohort_key'] == 'native' else c['relays']
+
+    for period in ('current_hour', 'sampled_hour', 'daily', 'current24'):
+        for stat_name in ('eligible', 'available', 'value'):
+            by_qid = {}
+            for c in all_charts:
+                by_qid.setdefault(routes[f'{c["id"]}.{period}.{stat_name}'], []).append(c)
+            for qid, group_charts in by_qid.items():
+                def handler(t, group_charts=group_charts, stat_name=stat_name, period=period):
+                    rows = []
+                    seen = set()
+                    for c in group_charts:
+                        pop = pop_for_chart(c)
+                        for s in c['series']:
+                            if c['id'] == 'directory_requests' and s['key'] not in c.get('display_keys', [s['key']]) and not (
+                                    period == 'current_hour' or stat_name == 'available'):
+                                continue
+                            labels = _series_promql_labels(c, s)
+                            canon = tuple(sorted(labels.items()))
+                            if canon in seen:
+                                continue
+                            seen.add(canon)
+                            if stat_name == 'value':
+                                val = rate_val if rate_val is not None else ((s['current'].get('hour', s['current']['day'])['value']) or 0)
+                            else:
+                                val = pop
+                            rows.append((labels, val))
+                    return rows
+                handlers[qid] = handler
+
+    for p in ('hour', 'day'):
+        by_qid = {}
+        for c in all_charts:
+            by_qid.setdefault(routes[f'{c["id"]}.relay_population.{p}'], []).append(c)
+        for qid, group_charts in by_qid.items():
+            def pop_handler(t, group_charts=group_charts):
+                rows = []
+                seen = set()
+                for c in group_charts:
+                    pop = pop_for_chart(c)
+                    for s in c['series']:
+                        labels = _series_promql_labels(c, s)
+                        metric_type = next(iter(labels.values()), 'scalar')
+                        if metric_type in seen:
+                            continue
+                        seen.add(metric_type)
+                        rows.append(({'type': metric_type, 'action': '59'}, pop))
+                return rows
+            handlers[qid] = pop_handler
+
+    handlers[routes['version.attestation_proof_metadata']] = lambda t: []
+    handlers[routes['metadata.flags']] = lambda t: [({'type': k}, v) for k, v in seed.get('flags', {}).items()]
+    handlers[routes['metadata.targets']] = lambda t: [({}, native_pop)]
+    handlers[routes['metadata.up']] = lambda t: [({}, native_pop)]
+    for cohort in ('native', 'custom', 'directory_defense'):
+        handlers[routes[f'cohort.{cohort}_verified_binary']] = lambda t: []
+        handlers[routes[f'cohort.{cohort}_attested']] = lambda t: []
+    for name in ('combined_zero_nonexit', 'observed_zero', 'file_fallback_zero', 'file0_observed1_conflicts'):
+        handlers[routes['dircache.' + name]] = lambda t: [({}, 0)]
+    return handlers
 
 
 class SourceConfigAndCliTests(unittest.TestCase):
@@ -376,16 +474,19 @@ class CollectorTests(unittest.TestCase):
             for series in chart['series']:
                 population = series['relay_population']
                 self.assertEqual(population['method'], 'eligible-last-flags-v1')
-                self.assertNotIn('hour', population)
-                self.assertEqual(set(population['queries']), {'day'})
-                self.assertEqual(population['queries']['day'], fixture.queries[fixture.routes[f'{chart["id"]}.relay_population.day']])
+                self.assertEqual(set(population['queries']), {'hour', 'day'})
+                for period in ('hour', 'day'):
+                    self.assertEqual(population['queries'][period],
+                                     fixture.queries[fixture.routes[f'{chart["id"]}.relay_population.{period}']])
+                    if series['current'][period]['relays'] is not None:
+                        self.assertEqual(population[period][1], series['current'][period]['relays'])
+                    else:
+                        self.assertIsNone(population[period])
                 self.assertEqual([row[0] for row in population['daily']],
                                  [row[0] for row in series['history']['daily'] if row[4]])
                 if series['key'] == 'circuit_dead':
                     self.assertIsNone(population['day'])
                     self.assertEqual(population['daily'], [])
-                elif series['current']['day']['relays'] is not None:
-                    self.assertEqual(population['day'][1], series['current']['day']['relays'])
 
     def test_population_mismatch_omits_metadata_without_replacing_measurements(self):
         fixture = CollectorFixture()
@@ -399,9 +500,9 @@ class CollectorTests(unittest.TestCase):
             finally:
                 cache.close()
         circuit = data['charts'][0]['series'][0]
-        self.assertNotIn('hour', circuit['current'])
-        self.assertNotIn('hour', circuit['relay_population'])
+        self.assertEqual(circuit['current']['hour']['value'], 77.0)
         self.assertEqual(circuit['current']['day']['value'], 77.0)
+        self.assertIsNone(circuit['relay_population']['hour'])
         self.assertIsNone(circuit['relay_population']['day'])
         self.assertEqual(circuit['relay_population']['daily'], [])
 
@@ -415,7 +516,7 @@ class CollectorTests(unittest.TestCase):
                 cache.close()
             chart = data['charts'][0]
             baseline = chart['series'][0]
-            for mutation in ('none', 'method', 'day_query', 'total', 'missing'):
+            for mutation in ('none', 'method', 'day_query', 'hour_query', 'total', 'missing'):
                 with self.subTest(mutation=mutation):
                     series = copy.deepcopy(baseline)
                     saved = series['relay_population']
@@ -423,24 +524,30 @@ class CollectorTests(unittest.TestCase):
                         saved['method'] = 'old-method'
                     elif mutation == 'day_query':
                         saved['queries']['day'] += ' '
+                    elif mutation == 'hour_query':
+                        saved['queries']['hour'] += ' '
                     elif mutation == 'total':
                         saved['daily'][0][1] += 8
                     elif mutation == 'missing':
                         saved['daily'].pop(1)
                     fixture.source.calls.clear()
                     worker, cache = fixture.instance(Path(folder) / (mutation + '.sqlite3'))
+                    worker.seed = copy.deepcopy(data)
                     try:
-                        result = worker.relay_population(chart, series, END, {})
+                        result = worker.relay_population(chart, series, END, {}, {}, {})
                     finally:
                         cache.close()
                     self.assertEqual(result['daily'], baseline['relay_population']['daily'])
                     self.assertEqual([row[0] for row in result['daily']], sorted(row[0] for row in result['daily']))
-                    self.assertFalse(any(call[3] != DAY for call in fixture.source.calls))
                     pop_calls = [call for call in fixture.source.calls if call[0].startswith('relay_population_')]
                     self.assertEqual(bool(pop_calls), mutation != 'none')
                     if mutation in ('total', 'missing'):
                         self.assertEqual(len(pop_calls), 1)
+                        self.assertEqual(pop_calls[0][3], DAY)
                         self.assertLessEqual(pop_calls[0][2] - pop_calls[0][1], DAY)
+                    elif mutation == 'hour_query':
+                        self.assertEqual(len(pop_calls), 1)
+                        self.assertEqual(pop_calls[0][3], HOUR)
 
     def test_rolling_population_uses_strict_31_day_window_and_not_future_values(self):
         eligible = {END - 31 * DAY - DAY: 99, END - 31 * DAY: 20, END - DAY: 8, END: 9, END + DAY: 1000}
@@ -458,28 +565,34 @@ class CollectorTests(unittest.TestCase):
                 data = worker.collect(END, 'f' * 64)
             finally:
                 cache.close()
-        self.assertEqual(data['input_schema_version'], 3)
-        self.assertEqual(data['window_seconds'], DAY)
-        self.assertEqual(data['minimum_samples'], 360)
+        self.assertEqual(data['input_schema_version'], 4)
+        self.assertEqual(data['window_seconds'], HOUR)
+        self.assertEqual(data['minimum_samples'], 24)
+        self.assertEqual(data['expected_samples'], 30)
         charts = {chart['id']: chart for chart in data['charts']}
         circuit = charts['circuit_rejections']['series'][0]
-        for legacy in ('values', 'hourly_relays', 'hourly_expected_relays'):
-            self.assertNotIn(legacy, circuit)
-        self.assertEqual(set(circuit['current']), {'day'})
+        self.assertEqual(len(circuit['values']), 24)
+        self.assertEqual(len(circuit['hourly_relays']), 24)
+        self.assertEqual(len(circuit['hourly_expected_relays']), 24)
+        self.assertEqual(set(circuit['current']), {'hour', 'day'})
+        self.assertEqual(circuit['current']['hour']['value'], 77.0)
         self.assertEqual(circuit['current']['day']['value'], 77.0)
         self.assertEqual(circuit['history']['daily'][0], original['charts'][0]['series'][0]['history']['daily'][0])
         self.assertEqual(circuit['history']['daily'][-2], [END - DAY, 2.0, 64, 0.8, False])
         self.assertEqual(circuit['history']['daily'][-1], [END, 77.0, 80, 1.0, True])
-        self.assertEqual(set(circuit['history']), {'daily'})
+        self.assertEqual(circuit['history']['sampled_hour'][-1], [END, 77.0, 80, 1.0, True])
+        self.assertEqual(set(circuit['history']), {'daily', 'sampled_hour'})
         directory = charts['directory_requests']; _, aux_s = directory['series']
+        self.assertEqual(aux_s['current']['hour']['value'], 77.0)
         self.assertIsNone(aux_s['current']['day']['value'])
-        self.assertEqual(aux_s['history'], {'daily': []})
-        expected = fixture.queries[fixture.routes['directory_requests.daily.value']]
+        self.assertEqual(aux_s['history'], {'daily': [], 'sampled_hour': []})
+        expected = fixture.queries[fixture.routes['directory_requests.current_hour.value']]
         self.assertEqual(directory['query'], expected)
         self.assertIn('== 3', expected)
         self.assertIn('count by(instance,type)', directory['quality_query'])
         used = {key for key, _, _, _ in fixture.source.calls}
         self.assertIn(fixture.routes['directory_requests.daily.eligible'], used)
+        self.assertIn(fixture.routes['directory_requests.current_hour.eligible'], used)
         self.assertEqual(fixture.seed, original)
 
     def test_version_counts_use_approved_hashes_and_actual_attestation_times(self):
@@ -496,13 +609,13 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(versions['runtime_unverified_relays'], 24)
         self.assertEqual(versions['metric_cohorts']['custom']['runtime_unverified'], 16)
         self.assertEqual(versions['runtime_resolution']['observed_at'], collector.iso(END - 600))
-        self.assertEqual(versions['runtime_resolution']['snapshot_start'], END - DAY)
+        self.assertEqual(versions['runtime_resolution']['snapshot_start'], END - HOUR)
         self.assertEqual(versions['runtime_resolution']['snapshot_end'], END)
         self.assertNotIn('UNKNOWN_BUILD', json.dumps(versions))
         attested = next(row for row in versions['verified_runtime'] if row['build_id'].startswith('attested-'))
         self.assertNotIn('patched', attested)
         self.assertIn(collector.iso(END - 600), attested['verification'])
-        self.assertIn('24-hour UTC day', attested['verification'])
+        self.assertIn('measured hour', attested['verification'])
         self.assertEqual(versions['cohort_labels']['patched_0_4_9_15_tor41339_9'],
                          'Patched Tor 0.4.9.15 + tor41339.9')
         for key, label in versions['cohort_labels'].items():
@@ -542,13 +655,17 @@ class CollectorTests(unittest.TestCase):
         for chart, old in zip(data['charts'], original['charts']):
             self.assertEqual(chart['relays'], 0)
             for series, prior in zip(chart['series'], old['series']):
-                self.assertNotIn('values', series)
-                self.assertNotIn('hour', series['current'])
+                self.assertEqual(len(series['values']), 24)
+                self.assertTrue(all(pt[1] is None for pt in series['values']))
+                self.assertFalse(series['current']['hour']['valid'])
+                self.assertGreaterEqual(series['current']['hour']['expected_relays'], 8)
                 self.assertFalse(series['current']['day']['valid'])
                 self.assertGreaterEqual(series['current']['day']['expected_relays'], 8)
                 self.assertEqual(series['history']['daily'][:len(prior['history']['daily'])], prior['history']['daily'])
                 self.assertTrue(all(row[1] is None and row[4] is False
                                     for row in series['history']['daily'][len(prior['history']['daily']):]))
+                self.assertTrue(all(row[1] is None and row[4] is False
+                                    for row in series['history']['sampled_hour'][len(prior['history']['sampled_hour']):]))
 
     def test_changed_attestation_file_during_collection_rejects_mixed_provenance(self):
         fixture = CollectorFixture(); calls = 0
@@ -604,9 +721,9 @@ class CollectorTests(unittest.TestCase):
             (app_dir / 'inputs/snapshot.json').write_text(json.dumps(fixture.seed))
             (app_dir / 'catalogue/queries.json').write_text(json.dumps(fixture.queries))
             (app_dir / 'catalogue/routes.json').write_text(json.dumps(fixture.routes))
-            with self.assertRaisesRegex(collector.CollectionError, '00:00 UTC'):
+            with self.assertRaisesRegex(collector.CollectionError, 'completed UTC hour'):
                 collector.collect({}, app_dir, Path(folder) / 'state', Path(folder) / 'out.json',
-                                  end=END + 3600, source=fixture.source)
+                                  end=END + 1800, source=fixture.source)
             for protected in (
                 collector.ROOT / 'catalogue/queries.json',
                 collector.ROOT / 'catalogue/routes.json',
@@ -646,7 +763,7 @@ class CollectorTests(unittest.TestCase):
             (app_dir / 'inputs/snapshot.json').write_text(committed_before)
             for mode in ('validation', 'write', 'commit'):
                 calls = {'n': 0}
-                def validate_output_fail(data):
+                def validate_output_fail(data, **kwargs):
                     calls['n'] += 1
                     if calls['n'] == 2:
                         raise ValueError('simulated output validation failure')
@@ -723,7 +840,7 @@ class CollectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             worker, cache = fixture.instance(Path(folder) / 'pop.sqlite3')
             try:
-                pop = worker.relay_population(chart, series, END, {})
+                pop = worker.relay_population(chart, series, END, {}, {}, {})
             finally:
                 cache.close()
         self.assertNotIn(END - 2 * DAY, [row[0] for row in pop['daily']])
@@ -896,7 +1013,7 @@ class CollectorTests(unittest.TestCase):
             app_dir = root / 'app'; (app_dir / 'inputs').mkdir(parents=True)
             for bad_seed in ('{}', '{"end":"bad"}'):
                 (app_dir / 'inputs/snapshot.json').write_text(bad_seed)
-                with self.subTest(bad_seed=bad_seed), self.assertRaisesRegex(ValueError, 'Generation label'):
+                with self.subTest(bad_seed=bad_seed), self.assertRaisesRegex(ValueError, 'schema version|Generation label'):
                     collector.collect({}, app_dir, root / 'state', root / 'out.json',
                                       end=END, source=CollectorFixture().source)
 
@@ -982,20 +1099,7 @@ class CollectorTests(unittest.TestCase):
                 if chart['cohort_key'] == 'native':
                     for series in chart['series']:
                         series['current']['day'].pop('expected_relays', None)
-            handlers = {
-                routes['circuit_rejections.daily.available']: lambda t, n=live_native: [({'type': 'circuit_rejected'}, n)],
-                routes['hsdir_fetches.daily.available']: lambda t: [({'action': 'success'}, seed['custom'])],
-                routes['directory_rejections.daily.available']: lambda t: [({'type': 'begindir_rejected'}, seed['defense'])],
-                routes['version.attestation_proof_metadata']: lambda t: [],
-                routes['metadata.flags']: lambda t: [({'type': k}, v) for k, v in seed['flags'].items()],
-                routes['metadata.targets']: lambda t, n=live_native: [({}, n)],
-                routes['metadata.up']: lambda t, n=live_native: [({}, n)],
-            }
-            for cohort in ('native', 'custom', 'directory_defense'):
-                handlers[routes[f'cohort.{cohort}_verified_binary']] = lambda t: []
-                handlers[routes[f'cohort.{cohort}_attested']] = lambda t: []
-            for name in ('combined_zero_nonexit', 'observed_zero', 'file_fallback_zero', 'file0_observed1_conflicts'):
-                handlers[routes['dircache.' + name]] = lambda t: [({}, 0)]
+            handlers = _snapshot_handlers(seed, routes, live_native=live_native, rate_val=None)
             with self.subTest(live_native=live_native), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder).resolve()
                 app_dir = root / 'app'; (app_dir / 'inputs').mkdir(parents=True)
@@ -1135,6 +1239,76 @@ class CollectorTests(unittest.TestCase):
                 ])
             self.assertEqual(json.loads(stdout.getvalue())['snapshot_end'], END)
 
+
+
+    def test_v3_seed_upgrades_cleanly_to_v4_with_sampled_hour_backfill_and_intraday_collection(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        v3 = copy.deepcopy(base_v4)
+        seed_end = int(v3['end'])
+        v3.update(input_schema_version=3, window_seconds=DAY, minimum_samples=360, expected_samples=720)
+        if 'runtime_resolution' in v3['versions']:
+            v3['versions']['runtime_resolution']['snapshot_start'] = v3['start']
+        for chart in v3['charts']:
+            chart['kind'] = 'gauge_daily_mean' if chart['kind'] == 'gauge_hour_mean' else 'counter_daily_rate'
+            chart['query'] = chart['history_queries']['daily']['value']
+            chart['quality_query'] = chart['history_queries']['daily']['eligible']
+            chart['history_queries'] = {'daily': chart['history_queries']['daily']}
+            for series in chart['series']:
+                for field in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    series.pop(field, None)
+                series['history'].pop('sampled_hour', None)
+                series['current'] = {'day': series['current']['day']}
+                if 'relay_population' in series:
+                    series['relay_population'].pop('hour', None)
+                    series['relay_population']['queries'] = {'day': series['relay_population']['queries']['day']}
+        # Seed a recognizable immutable qualified daily row (0.0343) and role row on primary chart.
+        first_series = v3['charts'][0]['series'][0]
+        first_day_ts = int(first_series['history']['daily'][0][0])
+        qual_row = next(row for row in first_series['history']['daily'] if row[4])
+        qual_row[1] = 0.0343
+        qual_ts = int(qual_row[0])
+        original_first_pop = copy.deepcopy(first_series['relay_population']['daily'][0])
+
+        with self.assertRaisesRegex(ValueError, 'schema version'):
+            collector.validate_snapshot(v3)
+        collector.validate_snapshot(v3, allow_v3_seed=True)
+
+        intraday_end = seed_end + 3 * HOUR
+        handlers = _snapshot_handlers(v3, routes, rate_val=100.0)
+        source = SyntheticSource(queries, handlers)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            app_dir = root / 'app'; (app_dir / 'inputs').mkdir(parents=True)
+            (app_dir / 'inputs/snapshot.json').write_text(json.dumps(v3))
+            out_path = root / 'upgraded.json'
+            collector.collect({}, app_dir, root / 'state', out_path, end=intraday_end, source=source)
+            upgraded = json.loads(out_path.read_text())
+
+        collector.validate_snapshot(upgraded)
+        self.assertEqual(upgraded['input_schema_version'], 4)
+        self.assertEqual(upgraded['end'], intraday_end)
+        self.assertEqual(upgraded['start'], intraday_end - DAY)
+        self.assertEqual(upgraded['window_seconds'], HOUR)
+        self.assertEqual(upgraded['minimum_samples'], 24)
+        self.assertEqual(upgraded['expected_samples'], 30)
+
+        up_first = upgraded['charts'][0]['series'][0]
+        up_qual_row = next(row for row in up_first['history']['daily'] if row[0] == qual_ts)
+        self.assertEqual(up_qual_row[1], 0.0343)
+        self.assertEqual(up_first['history']['daily'][-1][0], seed_end)
+        self.assertEqual([pt[0] for pt in up_first['values']],
+                         list(range(intraday_end - DAY + HOUR, intraday_end + 1, HOUR)))
+        target_sh = (intraday_end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+        expected_first_sh = max(first_day_ts - DAY + SAMPLED_HOUR_STEP, target_sh - 560 * DAY)
+        self.assertEqual(up_first['history']['sampled_hour'][0][0], expected_first_sh)
+        self.assertEqual(up_first['history']['sampled_hour'][-1][0], target_sh)
+        self.assertEqual(up_first['current']['hour']['value'], 100.0)
+        self.assertEqual(up_first['current']['day']['value'], 100.0)
+        self.assertEqual(up_first['relay_population']['hour'][0], intraday_end)
+        self.assertEqual(up_first['relay_population']['day'][0], intraday_end)
+        self.assertEqual(up_first['relay_population']['daily'][0], original_first_pop)
 
 
 if __name__ == '__main__':

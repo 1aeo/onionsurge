@@ -19,7 +19,7 @@ from io_helpers import BUILD_FORMAT, cleanup_warning, file_sha256, filesystem_co
 from reference_statistics import describe_reference, frozen_reference, retained_peak
 from time_ranges import DEFAULT_TIME_RANGES_PATH, load_time_ranges, resolve_period_bounds, validate_time_ranges
 from validation import PUBLIC_VERSION_FIELDS, validate_snapshot
-from windows import DAY, MINIMUM_POPULATION_COVERAGE, finite_number, require, usable_measurement, valid_rows
+from windows import DAY, MINIMUM_POPULATION_COVERAGE, finite_number, hourly_observations, require, usable_measurement, valid_rows
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,7 +46,7 @@ def scaled_display(value, scale, relays=1):
 def _validated_export_periods(charts, period_bounds):
     """Compute CSV window bounds and reject colliding exports/<chart_id>-<suffix>.csv paths."""
     period_exports = [
-        (p['export_suffix'], p['window']['unit'] == 'all_time', None if p['window']['unit'] == 'all_time' else period_start)
+        (p['export_suffix'], p['window']['unit'], None if p['window']['unit'] == 'all_time' else period_start)
         for p, period_start, _ in period_bounds
     ]
     seen = set()
@@ -81,7 +81,7 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
     labels = data['versions']['cohort_labels']
     cohorts = data['versions']['metric_cohorts']
     builds_meta = {
-        key: ('Latest complete UTC day', 'Earlier running versions are not recorded.',
+        key: ('Latest complete hour', 'Earlier running versions are not recorded.',
               '; '.join(f'{label}: {int(cohort[k])} relays' for k, label in labels.items() if cohort.get(k)))
         for key, cohort in cohorts.items()
     }
@@ -92,43 +92,55 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
                            'scope': scope, 'historical_scope': hist_scope}
         scale = chart['display_scale']
         for series in chart['series']:
-            current = series['current']['day']
-            expected = current.setdefault('expected_relays', max(8, chart['relays']))
-            value, n = current.get('value'), current.get('relays')
-            coverage = current.setdefault('coverage', n / expected if n and expected else None)
-            current.setdefault('valid', usable_measurement(value, n)
-                               and coverage is not None and MINIMUM_POPULATION_COVERAGE <= coverage <= 1)
+            for period in ('hour', 'day'):
+                current = series['current'][period]
+                expected = current.setdefault('expected_relays',
+                                              series['hourly_expected_relays'][-1][1] if period == 'hour'
+                                              else max(8, chart['relays']))
+                value, n = current.get('value'), current.get('relays')
+                coverage = current.setdefault('coverage', n / expected if n and expected else None)
+                current.setdefault('valid', usable_measurement(value, n)
+                                   and coverage is not None and MINIMUM_POPULATION_COVERAGE <= coverage <= 1)
             raw_daily = series['history']['daily']
             daily_rows = valid_rows(raw_daily, alignment=DAY)
             daily_ts = [row[0] for row in daily_rows]
             cutoff_end = bisect_right(daily_ts, cutoff)
             cutoff_rows = daily_rows[:cutoff_end]
             ratios = {row[0]: Fraction(row[1]) / int(row[2]) for row in daily_rows}
+            recent = hourly_observations(series)
             series['reference'] = {
-                'day': describe_reference(reference['distributions'][chart['id']][series['key']]['day'], current)
+                period: describe_reference(reference['distributions'][chart['id']][series['key']][period],
+                                           series['current'][period])
+                for period in ('hour', 'day')
             }
             series['peaks'] = {
-                'day': retained_peak(raw_daily, current, data['end'], valid_daily=daily_rows, ratios=ratios)
+                'hour': retained_peak(series['history']['sampled_hour'], series['current']['hour'], data['end'], recent),
+                'day': retained_peak(raw_daily, series['current']['day'], data['end'], valid_daily=daily_rows, ratios=ratios),
             }
             series['historical_averages'], population_windows = historical_averages_and_windows(
                 raw_daily, data['end'], time_ranges=time_ranges, daily_rows=daily_rows, bounds=avg_bounds)
             series['relay_counts'] = relay_counts(series, data['end'], series['historical_averages'], population_windows)
             for period_def, _, comp_start in period_bounds:
+                if period_def['window']['unit'] == 'hours':
+                    continue
                 period = period_def['summary_key']
                 summary = series['historical_averages'][period]
                 summary['display'] = scaled_display(summary['value'], scale)
                 comp_rows = (cutoff_rows if comp_start is None
                              else daily_rows[bisect_left(daily_ts, comp_start + DAY, 0, cutoff_end):cutoff_end])
-                summary['comparison'] = historical_comparison(comp_rows, current, ref_end,
+                summary['comparison'] = historical_comparison(comp_rows, series['current']['day'], ref_end,
                                                               summary['status'] == 'ready', ratios=ratios)
-            current['display'] = scaled_display(value if current['valid'] else None, scale)
-            ref = series['reference']['day']
-            current['reference_display'] = scaled_display(ref['mean_per_relay'], scale, n)
-            peak = series['peaks']['day']
-            current['peak_display'] = scaled_display(peak['fleet_peak'] if peak else None, scale)
-            rank = ref['current_percentile']
-            ref['display_rank'] = display_numbers.percentage(rank, suffix=False, boundaries=(90, 95, 99, 100)) if rank is not None else None
-    data['schema_version'] = 6
+            for period in ('hour', 'day'):
+                current = series['current'][period]
+                value, n = current.get('value'), current.get('relays')
+                current['display'] = scaled_display(value if current['valid'] else None, scale)
+                ref = series['reference'][period]
+                current['reference_display'] = scaled_display(ref['mean_per_relay'], scale, n)
+                peak = series['peaks'][period]
+                current['peak_display'] = scaled_display(peak['fleet_peak'] if peak else None, scale)
+                rank = ref['current_percentile']
+                ref['display_rank'] = display_numbers.percentage(rank, suffix=False, boundaries=(90, 95, 99, 100)) if rank is not None else None
+    data['schema_version'] = 7
     data['time_ranges'] = time_ranges
     data.update(reference_cutoff=ref_end, reference_window=reference['window'],
                 reference_id=ref_id, reference_sha256=ref_sha, reference_document='reference/' + ref_id + '.json')
@@ -152,7 +164,7 @@ def live_index(page):
         '<meta name="robots" content="noindex,nofollow">': '',
         '<script src="data.js"></script>': '',
         '<script src="app.js"></script>': '<script src="app.js"></script><script src="live.js"></script>',
-        'Local preview · saved measurements': 'Daily UTC measurements',
+        'Local preview · saved measurements': 'Hourly UTC measurements',
         '<a href="data.json" download>download the chart data and methods (JSON)</a>':
             '<a href="data/manifest.json" download>download the release manifest (JSON)</a>',
     }
@@ -188,24 +200,33 @@ def write_outputs(data, reference_json, stage, *, live=False):
     (stage / 'exports').mkdir(exist_ok=True)
     timestamp_labels = {}
     for chart in data['charts']:
-        all_series_rows = [
+        all_daily_rows = [
             (series['key'], {row[0]: row[1] if row[4] else None for row in series['history']['daily'] if row[0] <= data_end})
             for series in chart['series']
         ]
-        all_endpoints = sorted({t for _, mapping in all_series_rows for t in mapping})
+        daily_endpoints = sorted({t for _, mapping in all_daily_rows for t in mapping})
+        all_hourly_rows = [
+            (series['key'], {row[0]: row[1] for row in series['values'] if row[0] <= data_end})
+            for series in chart['series']
+        ]
+        hourly_endpoints = sorted({t for _, mapping in all_hourly_rows for t in mapping})
         unit = chart['unit']
-        for t in all_endpoints:
+        for t in (*daily_endpoints, *hourly_endpoints):
             if t not in timestamp_labels:
                 timestamp_labels[t] = datetime.fromtimestamp(t, timezone.utc).isoformat()
-        for suffix, is_all_time, period_start in period_exports:
-            idx = 0 if is_all_time else bisect_right(all_endpoints, period_start)
+        for suffix, window_unit, period_start in period_exports:
+            if window_unit == 'hours':
+                endpoints, series_rows = hourly_endpoints, all_hourly_rows
+            else:
+                endpoints, series_rows = daily_endpoints, all_daily_rows
+            idx = 0 if window_unit == 'all_time' else bisect_right(endpoints, period_start)
             with (stage / 'exports' / f'{chart["id"]}-{suffix}.csv').open('w', encoding='utf-8', newline='') as handle:
                 writer = csv.writer(handle)
                 writer.writerow(['interval_end_utc', 'series', 'value', 'unit'])
                 writer.writerows(
                     (timestamp_labels[t], series_key, mapping.get(t), unit)
-                    for t in islice(all_endpoints, idx, None)
-                    for series_key, mapping in all_series_rows
+                    for t in islice(endpoints, idx, None)
+                    for series_key, mapping in series_rows
                 )
     manifest = {'format': BUILD_FORMAT, 'mode': 'live' if live else 'offline', 'snapshot_end': data_end,
                 'input_sha256': data['provenance']['aggregate_input_sha256'],

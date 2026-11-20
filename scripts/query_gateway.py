@@ -21,7 +21,7 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import query_protocol as access
 
-DAY = access.DAY
+HOUR = access.HOUR
 MAX_SOURCE_AGE = 180
 GROUPS = {'daemon_group_a', 'daemon_group_b'}
 VERSION = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
@@ -97,7 +97,7 @@ def parse(command, queries, now):
     request = access.parse(command, queries, now)
     require(request[0] in ('queries', 'prom'), 'command_not_allowed')
     if request[0] == 'prom' and request[1] in VIRTUAL_QUERIES:
-        require(request[4] == DAY and request[3] - request[2] == DAY,
+        require(request[4] == HOUR and request[3] - request[2] == HOUR,
                 'attestation_range_limit')
     return request
 
@@ -169,13 +169,13 @@ def _check_private_labels(labels):
 
 def private_matrix(payload, begin, end):
     """Validate bounded private source data, which never becomes a response."""
-    return access.validate_matrix(payload, begin, end, DAY, max_series=4096, max_points=3,
+    return access.validate_matrix(payload, begin, end, HOUR, max_series=4096, max_points=3,
                                  check_labels=_check_private_labels, codes=_PRIV_CODES, return_envelope=False)
 
 
 def private_query(expression, begin, end, port, opener=None):
     return access.fetch_prometheus(
-        expression, begin, end, DAY, port=port, opener=opener,
+        expression, begin, end, HOUR, port=port, opener=opener,
         validate=lambda payload, b, e, _: private_matrix(payload, b, e),
     )
 
@@ -196,10 +196,10 @@ def indexed(rows, keys):
 def attested_responses(document, digest, begin, end, port, fetch=None):
     """Revalidate private epochs; expose only canonical counts and proof times."""
     empty = {'status': 'success', 'data': {'resultType': 'matrix', 'result': []}}
-    if not document['records'] or all(row['start_time_seconds'] > end - DAY for row in document['records']):
+    if not document['records'] or all(row['start_time_seconds'] > end - HOUR for row in document['records']):
         return {key: empty for key in VIRTUAL_QUERIES}
     fetch = private_query if fetch is None else fetch
-    first = max(0, begin - DAY)
+    first = max(0, begin - HOUR)
     raw = {key: fetch(query, first, end, port) for key, query in document['selectors'].items()}
     processes = {key: indexed(raw[key], ('instance', 'unit')) for key in ('pid', 'start', 'info')}
     sources = {key: indexed(raw[key], ('instance',)) for key in ('health', 'source_time')}
@@ -211,8 +211,8 @@ def attested_responses(document, digest, begin, end, port, fetch=None):
         active_groups = set()
         for record in document['records']:
             key, source = (record['source'], record['unit']), (record['source'],)
-            valid = record['start_time_seconds'] <= endpoint - DAY
-            for timestamp in (endpoint - DAY, endpoint):
+            valid = record['start_time_seconds'] <= endpoint - HOUR
+            for timestamp in (endpoint - HOUR, endpoint):
                 pid = processes['pid'].get((timestamp, key))
                 start = processes['start'].get((timestamp, key))
                 info = processes['info'].get((timestamp, key))
@@ -244,7 +244,7 @@ def attested_responses(document, digest, begin, end, port, fetch=None):
             labels = (('sha256', digest), ('type', 'continuity'))
             observations['attestation_proof_metadata'][labels].append([endpoint, str(endpoint)])
     return {key: access.aggregate_response({'status': 'success', 'data': {'resultType': 'matrix',
-            'result': [{'metric': dict(labels), 'values': values} for labels, values in sorted(points.items())]}}, begin, end, DAY)
+            'result': [{'metric': dict(labels), 'values': values} for labels, values in sorted(points.items())]}}, begin, end, HOUR)
             for key, points in observations.items()}
 
 

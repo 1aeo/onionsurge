@@ -11,8 +11,10 @@ import urllib.request
 MAX_RESPONSE = 8 * 1024**2
 MAX_POINTS = 169
 MAX_RANGE = 7 * 86400
+HOUR = 3600
+SAMPLED_HOUR_STEP = 21600
 DAY = 86400
-STEPS = (DAY,)
+STEPS = (HOUR, SAMPLED_HOUR_STEP, DAY)
 LABELS = {'type', 'action', 'build_id', 'sha256', 'dircache', 'dircache_source'}
 NUMERIC_VALUE = re.compile(r'^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z')
 LABEL_REPLACE_DEST = re.compile(r'\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,')
@@ -145,9 +147,9 @@ def parse(command, queries, now):
         if key not in queries or not all(_INT10_RE.fullmatch(x) for x in (begin, end, step)):
             raise AccessError('invalid_query_request')
         begin, end, step = map(int, (begin, end, step))
-        if not 0 <= begin < end <= int(now // DAY) * DAY:
+        if not 0 <= begin < end <= (int(now) // HOUR) * HOUR:
             raise AccessError('invalid_time_range')
-        if step not in STEPS or begin % DAY or end % DAY:
+        if step not in STEPS or begin % step or end % step:
             raise AccessError('unaligned_range')
         if end - begin > MAX_RANGE or (end - begin) // step + 1 > MAX_POINTS:
             raise AccessError('range_limit')

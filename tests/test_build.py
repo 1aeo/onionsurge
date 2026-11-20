@@ -149,11 +149,11 @@ class BuildTests(unittest.TestCase):
 
     def test_exports_match_qualified_daily_means_and_source_units(self):
         from time_ranges import DEFAULT_TIME_RANGES_PATH, period_window_bounds
-        self.assertEqual(self.data['schema_version'], 6)
+        self.assertEqual(self.data['schema_version'], 7)
         periods = self.data['time_ranges']['periods']
         self.assertEqual(
             [p['id'] for p in periods],
-            ['7d', '1mo', '3mo', '6mo', '12mo', 'all'],
+            ['24h', '7d', '1mo', '3mo', '6mo', '12mo', 'all'],
         )
         expected_csvs = {
             f"{chart['id']}-{period['export_suffix']}.csv"
@@ -162,7 +162,7 @@ class BuildTests(unittest.TestCase):
         }
         actual_csvs = {p.name for p in (self.output / 'exports').glob('*.csv')}
         self.assertEqual(actual_csvs, expected_csvs)
-        self.assertEqual(len(actual_csvs), 78)
+        self.assertEqual(len(actual_csvs), 91)
         self.assertEqual(
             self.data['provenance']['time_ranges_sha256'],
             hashlib.sha256(DEFAULT_TIME_RANGES_PATH.read_bytes()).hexdigest(),
@@ -189,6 +189,10 @@ class BuildTests(unittest.TestCase):
                         self.assertLessEqual(ts, self.data['end'])
                 for series in chart['series']:
                     values = [float(r['value']) for r in rows if r['series'] == series['key'] and r['value']]
+                    if period['window']['unit'] == 'hours':
+                        expected_vals = [float(v) for _, v in series['values'] if v is not None]
+                        self.assertEqual(values, expected_vals)
+                        continue
                     summary = series['historical_averages'][period['summary_key']]
                     self.assertEqual(len(values), summary['days'])
                     if summary['status'] == 'ready':
@@ -206,6 +210,8 @@ class BuildTests(unittest.TestCase):
         for chart_id in ('hsdir_fetches', 'directory_rejections', 'protocol_closes'):
             for series in by_id[chart_id]['series']:
                 for period in periods:
+                    if period['window']['unit'] == 'hours':
+                        continue
                     key = period['summary_key']
                     summary = series['historical_averages'][key]
                     self.assertGreaterEqual(summary['days'], 1, (chart_id, series['key'], key))
@@ -222,6 +228,8 @@ class BuildTests(unittest.TestCase):
             if series['key'] in {'hs_get', 'hs_post', 'no_request'}:
                 continue
             for period in periods:
+                if period['window']['unit'] == 'hours':
+                    continue
                 key = period['summary_key']
                 summary = series['historical_averages'][key]
                 self.assertEqual(summary['days'], 0, (series['key'], key))

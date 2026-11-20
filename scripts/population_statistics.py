@@ -56,16 +56,18 @@ def _summary(windows, records, available=True, *, prevalidated_records=False):
 
 
 def relay_counts(series, snapshot_end, historical_averages, historical_windows):
-    """Missing role evidence leaves roles unknown without changing the day set."""
-    require('day' not in historical_windows and set(historical_windows) == set(historical_averages),
-            'Historical averages and windows must share non-day summary keys')
+    """Missing role evidence leaves roles unknown without changing the window set."""
+    require(not ({'hour', 'day'} & set(historical_windows)) and set(historical_windows) == set(historical_averages),
+            'Historical averages and windows must share non-current summary keys')
     population = series.get('relay_population', {})
-    n = series['current']['day'].get('relays')
-    row = population.get('day')
-    require(row is None or (isinstance(row, (list, tuple)) and row and timestamp(row[0])),
-            'Invalid relay population record')
-    result = {'day': _summary([] if n is None else [(snapshot_end, n)],
-                              {int(row[0]): row} if row is not None else {})}
+    result = {}
+    for period in ('hour', 'day'):
+        n = series['current'][period].get('relays')
+        row = population.get(period)
+        require(row is None or (isinstance(row, (list, tuple)) and row and timestamp(row[0])),
+                'Invalid relay population record')
+        result[period] = _summary([] if n is None else [(snapshot_end, n)],
+                                  {int(row[0]): row} if row is not None else {})
     daily = {(ints := _parse_record(item))[0]: ints for item in population.get('daily', [])}
     for period, points in historical_windows.items():
         result[period] = _summary([(pt[0], pt[2]) for pt in points], daily,

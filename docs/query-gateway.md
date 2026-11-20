@@ -1,8 +1,6 @@
 # User-owned query gateway
 
-`scripts/query_gateway.py` is a forced-command SSH entry point for the daily
-collector. It accepts only `queries` and `prom QUERY_ID START END STEP` (with `STEP=86400`
-and UTC-midnight endpoints) through `SSH_ORIGINAL_COMMAND`. Paths, arbitrary PromQL,
+`scripts/query_gateway.py` is a forced-command SSH entry point for the collector. It accepts only `queries` and `prom QUERY_ID START END STEP` (with `STEP` in `{3600, 21600, 86400}` on aligned UTC boundaries: `3600s` for `current_hour`, `current24`, metadata, and population `hour`; `21600s` for `sampled_hour`; `86400s` UTC midnight for `daily` and population `day`) through `SSH_ORIGINAL_COMMAND`. Paths, arbitrary PromQL,
 and shell commands are not accepted. No account or SSH configuration is changed by this
 program.
 
@@ -55,9 +53,9 @@ Four fixed virtual IDs are gateway-computed descriptors, not Prometheus metrics:
 | `attested_custom_runtime` | Custom-metric cohort counts by that build ID |
 | `attestation_proof_metadata` | Actual observation timestamps and hashes by active public proof group and canonical build ID; a continuity row contains the attestation-file hash and evaluation endpoint |
 
-Virtual requests must use exactly two adjacent `00:00:00 UTC` daily endpoints (`86,400 s` apart).
+Virtual requests must use exactly two adjacent completed UTC-hour endpoints (`3,600 s` apart, `STEP=3600`).
 For each endpoint, PID, start time, and the metric mapping must match the evidence both
-there and one day (`86,400 s`) earlier. Source health must be 1 and its timestamp must be
+there and one hour (`3,600 s`) earlier. Source health must be 1 and its timestamp must be
 within the preceding 180 seconds at both points. Missing, restarted, remapped or
 stale members contribute no verified count. Current metric membership determines
 each cohort. Members already represented by fresh, fingerprint-verified managed

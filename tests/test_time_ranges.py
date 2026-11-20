@@ -19,7 +19,7 @@ from time_ranges import (
     period_window_bounds,
     validate_time_ranges,
 )
-from windows import DAY
+from windows import DAY, HOUR
 
 
 class TimeRangeConfigTests(unittest.TestCase):
@@ -34,23 +34,23 @@ class TimeRangeConfigTests(unittest.TestCase):
             {'version', 'default_range', 'legacy_aliases', 'card_slots', 'periods'},
         )
         self.assertEqual(cfg['version'], 1)
-        self.assertEqual(cfg['default_range'], '1mo')
+        self.assertEqual(cfg['default_range'], '24h')
         self.assertEqual(
             cfg['legacy_aliases'],
-            {'24h': '1mo', '30d': '1mo', '1m': '1mo', '3m': '3mo', '6m': '6mo', '12m': '12mo'},
+            {'30d': '1mo', '1m': '1mo', '3m': '3mo', '6m': '6mo', '12m': '12mo'},
         )
-        self.assertEqual(cfg['card_slots'], {'fallback_dynamic': '1mo', 'fixed': ['6mo', 'all']})
+        self.assertEqual(cfg['card_slots'], {'fallback_dynamic': '6mo', 'fixed': ['24h', 'all']})
         self.assertEqual(
             [p['id'] for p in cfg['periods']],
-            ['7d', '1mo', '3mo', '6mo', '12mo', 'all'],
+            ['24h', '7d', '1mo', '3mo', '6mo', '12mo', 'all'],
         )
         self.assertEqual(
             [p['summary_key'] for p in cfg['periods']],
-            ['seven_days', 'one_month', 'three_months', 'six_months', 'twelve_months', 'all_time'],
+            ['twenty_four_hours', 'seven_days', 'one_month', 'three_months', 'six_months', 'twelve_months', 'all_time'],
         )
         self.assertEqual(
             [p['export_suffix'] for p in cfg['periods']],
-            ['7d', '1mo', '3mo', '6mo', '12mo', 'all-time'],
+            ['24h', '7d', '1mo', '3mo', '6mo', '12mo', 'all-time'],
         )
         self.assertTrue(all(p['minimum_coverage'] == 0 for p in cfg['periods']))
         for bounded_cov in (0, 0.0, 0.9, 1):
@@ -69,18 +69,18 @@ class TimeRangeConfigTests(unittest.TestCase):
         ]
         for token in bad_tokens:
             cfg = self.fixture()
-            cfg['periods'][0]['id'] = token
+            cfg['periods'][1]['id'] = token
             with self.subTest(field='id', token=token), self.assertRaises(ValueError):
                 validate_time_ranges(cfg)
 
             cfg = self.fixture()
-            cfg['periods'][0]['export_suffix'] = token
+            cfg['periods'][1]['export_suffix'] = token
             with self.subTest(field='export_suffix', token=token), self.assertRaises(ValueError):
                 validate_time_ranges(cfg)
 
         for bad_suffix in ['foo_bar', 'a-b-c-d-e-f-g-h-i', 'aaaa-bbbb-cccc-dddd-eeee-ffff-gggg']:
             cfg = self.fixture()
-            cfg['periods'][0]['export_suffix'] = bad_suffix
+            cfg['periods'][1]['export_suffix'] = bad_suffix
             with self.subTest(bad_suffix=bad_suffix), self.assertRaises(ValueError):
                 validate_time_ranges(cfg)
 
@@ -89,20 +89,20 @@ class TimeRangeConfigTests(unittest.TestCase):
             'hour', 'sampled_hour', 'hourly_relays', 'hourly_expected_relays', 'current24',
         ]:
             cfg = self.fixture()
-            cfg['periods'][0]['summary_key'] = bad_summary
+            cfg['periods'][1]['summary_key'] = bad_summary
             with self.subTest(bad_summary=bad_summary), self.assertRaises(ValueError):
                 validate_time_ranges(cfg)
 
-        for bad_alias in ['hour', 'sampled_hour', 'hourly_relays', 'hourly_expected_relays', 'current24']:
+        for bad_alias in ['hour', 'sampled_hour', 'hourly_relays', 'hourly_expected_relays', 'current24', '24h']:
             cfg = self.fixture()
             cfg['legacy_aliases'] = {bad_alias: '1mo'}
             with self.subTest(bad_alias=bad_alias), self.assertRaises(ValueError):
                 validate_time_ranges(cfg)
 
-        # '24h' legacy alias remains valid so legacy URLs redirect to '1mo'
-        cfg = self.fixture()
-        cfg['legacy_aliases'] = {'24h': '1mo'}
-        self.assertEqual(validate_time_ranges(cfg)['legacy_aliases'], {'24h': '1mo'})
+        # '24h' legacy alias remains valid only when no '24h' hours period is declared
+        cfg = custom_three_period_config()
+        cfg['legacy_aliases'] = {'24h': '14d'}
+        self.assertEqual(validate_time_ranges(cfg)['legacy_aliases'], {'24h': '14d'})
 
     def test_validation_enforces_schema_uniqueness_bounds_and_slots(self):
         mutations = [
@@ -125,29 +125,35 @@ class TimeRangeConfigTests(unittest.TestCase):
             lambda c: c['periods'][0].update(average_label='\ufeff\x85'),
             lambda c: c['periods'][0].update(plot_label=''),
             lambda c: c['periods'][0].update(plot_label='\ufeff'),
-            lambda c: c['periods'][0].update(window={'unit': 'hours', 'count': 24, 'comparison_lag_days': 0}),
-            lambda c: c['periods'][0].update(window={'unit': 'days', 'count': 1, 'comparison_lag_days': 0}),
-            lambda c: c['periods'][0].update(window={'unit': 'days', 'count': 36501, 'comparison_lag_days': 0}),
-            lambda c: c['periods'][0].update(window={'unit': 'days', 'count': True, 'comparison_lag_days': 0}),
-            lambda c: c['periods'][0].update(window={'unit': 'days', 'count': 7.0, 'comparison_lag_days': 0}),
-            lambda c: c['periods'][0].update(window={'unit': 'days', 'count': 7, 'comparison_lag_days': 2}),
-            lambda c: c['periods'][1].update(window={'unit': 'months', 'count': 0, 'comparison_lag_days': 0}),
-            lambda c: c['periods'][1].update(window={'unit': 'months', 'count': 1201, 'comparison_lag_days': 0}),
-            lambda c: c['periods'][1].update(window={'unit': 'months', 'count': 1, 'comparison_lag_days': 2}),
+            lambda c: c['periods'][1].update(id='24h'),
+            lambda c: c['periods'][1].update(export_suffix='24h'),
+            lambda c: c['periods'][0].update(id='24hr'),
+            lambda c: c['periods'][0].update(export_suffix='24hr'),
+            lambda c: c['periods'][1].update(window={'unit': 'hours', 'count': 24, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][0].update(window={'unit': 'hours', 'count': 12, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][0].update(window={'unit': 'hours', 'count': 24, 'comparison_lag_days': 1}),
+            lambda c: c['periods'][1].update(window={'unit': 'days', 'count': 1, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][1].update(window={'unit': 'days', 'count': 36501, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][1].update(window={'unit': 'days', 'count': True, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][1].update(window={'unit': 'days', 'count': 7.0, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][1].update(window={'unit': 'days', 'count': 7, 'comparison_lag_days': 2}),
+            lambda c: c['periods'][2].update(window={'unit': 'months', 'count': 0, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][2].update(window={'unit': 'months', 'count': 1201, 'comparison_lag_days': 0}),
+            lambda c: c['periods'][2].update(window={'unit': 'months', 'count': 1, 'comparison_lag_days': 2}),
             lambda c: c['periods'][-1].update(window={'unit': 'all_time', 'count': 1, 'comparison_lag_days': 0}),
             lambda c: c['periods'][-1].update(window={'unit': 'all_time', 'count': None, 'comparison_lag_days': 1}),
-            lambda c: c['periods'][0].update(minimum_coverage=-0.0),
-            lambda c: c['periods'][0].update(minimum_coverage=-0.1),
             lambda c: c['periods'][1].update(minimum_coverage=-0.0),
             lambda c: c['periods'][1].update(minimum_coverage=-0.1),
-            lambda c: c['periods'][0].update(minimum_coverage=1.1),
-            lambda c: c['periods'][0].update(minimum_coverage=True),
-            lambda c: c['periods'][0].update(minimum_coverage=float('nan')),
+            lambda c: c['periods'][2].update(minimum_coverage=-0.0),
+            lambda c: c['periods'][2].update(minimum_coverage=-0.1),
+            lambda c: c['periods'][1].update(minimum_coverage=1.1),
+            lambda c: c['periods'][1].update(minimum_coverage=True),
+            lambda c: c['periods'][1].update(minimum_coverage=float('nan')),
             lambda c: c['periods'][-1].update(minimum_coverage=0.5),
             lambda c: c['periods'][-1].update(minimum_coverage=-0.0),
-            lambda c: c['periods'][0].update(minimum_comparison_windows=0),
-            lambda c: c['periods'][0].update(minimum_comparison_windows=10001),
-            lambda c: c['periods'][0].update(minimum_comparison_windows=True),
+            lambda c: c['periods'][1].update(minimum_comparison_windows=0),
+            lambda c: c['periods'][1].update(minimum_comparison_windows=10001),
+            lambda c: c['periods'][1].update(minimum_comparison_windows=True),
             lambda c: c.update(default_range='missing'),
             lambda c: c.update(legacy_aliases={'': '1mo'}),
             lambda c: c.update(legacy_aliases={'  ': '1mo'}),
@@ -156,12 +162,14 @@ class TimeRangeConfigTests(unittest.TestCase):
             lambda c: c.update(legacy_aliases={'\ufeff\x85\x1c ': '1mo'}),
             lambda c: c.update(legacy_aliases={'a' * 33: '1mo'}),
             lambda c: c.update(legacy_aliases={'7d': '1mo'}),
+            lambda c: c.update(legacy_aliases={'24h': '1mo'}),
             lambda c: c.update(legacy_aliases={'constructor': '1mo'}),
-            lambda c: c.update(legacy_aliases={'24h': 'missing'}),
+            lambda c: c.update(legacy_aliases={'alias': 'missing'}),
             lambda c: c.update(card_slots={'fallback_dynamic': '1mo', 'fixed': ['6mo']}),
-            lambda c: c.update(card_slots={'fallback_dynamic': '1mo', 'fixed': ['6mo', '6mo']}),
-            lambda c: c.update(card_slots={'fallback_dynamic': '6mo', 'fixed': ['6mo', 'all']}),
-            lambda c: c.update(card_slots={'fallback_dynamic': '1mo', 'fixed': ['6mo', 'all'], 'extra': '1mo'}),
+            lambda c: c.update(card_slots={'fallback_dynamic': '1mo', 'fixed': ['24h', '24h']}),
+            lambda c: c.update(card_slots={'fallback_dynamic': '24h', 'fixed': ['24h', 'all']}),
+            lambda c: c.update(card_slots={'fallback_dynamic': '1mo', 'fixed': ['6mo', 'all']}),
+            lambda c: c.update(card_slots={'fallback_dynamic': '6mo', 'fixed': ['24h', 'all'], 'extra': '1mo'}),
         ]
         for mutate in mutations:
             cfg = self.fixture()
@@ -199,7 +207,13 @@ class TimeRangeConfigTests(unittest.TestCase):
         by_id = {p['id']: p for p in cfg['periods']}
         end_leap = timestamp('2024-03-31')
         self.assertEqual(
-            period_window_bounds(end_leap + 5 * 3600, by_id['7d']),
+            period_window_bounds(end_leap + 5 * HOUR, by_id['24h']),
+            (end_leap + 5 * HOUR - 24 * HOUR, end_leap + 5 * HOUR),
+        )
+        with self.assertRaises(ValueError):
+            comparison_window_bounds(end_leap + 5 * HOUR, by_id['24h'])
+        self.assertEqual(
+            period_window_bounds(end_leap + 5 * HOUR, by_id['7d']),
             (end_leap - 7 * DAY, end_leap),
         )
         self.assertEqual(
@@ -270,7 +284,7 @@ class TimeRangeConfigTests(unittest.TestCase):
             cli_data = json.loads((cli_out / 'data.json').read_text())
             self.assertEqual(data, cli_data)
 
-            self.assertEqual(data['schema_version'], 6)
+            self.assertEqual(data['schema_version'], 7)
             self.assertEqual(data['time_ranges'], custom)
             self.assertEqual(
                 data['provenance']['time_ranges_sha256'],
@@ -307,7 +321,7 @@ class TimeRangeConfigTests(unittest.TestCase):
             )
             self.assertEqual(
                 set(series['relay_counts']),
-                {'day', 'fourteen_days', 'two_months', 'all_time'},
+                {'hour', 'day', 'fourteen_days', 'two_months', 'all_time'},
             )
             self.assertEqual(series['historical_averages']['fourteen_days']['days'], 14)
             self.assertEqual(series['historical_averages']['fourteen_days']['comparison']['n'], 14)

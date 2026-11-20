@@ -11,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import utc_timestamp as epoch
 from reference_statistics import reference_window, quantile, describe_reference, retained_peak, frozen_reference
-from windows import DAY, calendar_window
+from windows import DAY, SAMPLED_HOUR_STEP, calendar_window
 
 
 def sha(value):
@@ -24,9 +24,10 @@ def current(value, relays=1, valid=True):
 
 def charts(t):
     past = t // DAY * DAY - 3 * DAY
-    return [{'id': 'test', 'history_status': 'ready', 'kind': 'counter_daily_rate',
+    return [{'id': 'test', 'history_status': 'ready', 'kind': 'counter_hour_rate',
              'query': 'q', 'quality_query': 'cq', 'history_queries': {},
              'series': [{'key': 'a', 'history': {
+                 'sampled_hour': [[past, 4, 2, 1, True]],
                  'daily': [[past, 4, 2, 1, True]]}}]}]
 
 
@@ -121,9 +122,12 @@ class ReferenceTests(unittest.TestCase):
         source = charts(t)
         rows = source[0]['series'][0]['history']['daily']
         rows.append(copy.deepcopy(rows[0]))
+        source[0]['series'][0]['history']['sampled_hour'].append(
+            copy.deepcopy(source[0]['series'][0]['history']['sampled_hour'][0]))
         with tempfile.TemporaryDirectory() as folder:
             payload, _, _, _ = frozen_reference(source, t, Path(folder), sha('input'))
             self.assertEqual(len(payload['distributions']['test']['a']['day']), 1)
+            self.assertEqual(len(payload['distributions']['test']['a']['hour']), 1)
         rows[-1][1] += 1
         with tempfile.TemporaryDirectory() as folder:
             with self.assertRaisesRegex(ValueError, 'Conflicting'):
@@ -163,7 +167,8 @@ class ReferenceTests(unittest.TestCase):
             lambda p: dict(p, distributions=[]),
             lambda p: dict(p, distributions={'test': None}),
             lambda p: dict(p, distributions={'test': {'a': []}}),
-            lambda p: dict(p, distributions={'test': {'a': {'day': {}}}}),
+            lambda p: dict(p, distributions={'test': {'a': {'hour': []}}}),
+            lambda p: dict(p, distributions={'test': {'a': {'hour': [], 'day': {}}}}),
         ]
         with tempfile.TemporaryDirectory() as folder:
             frozen_reference(charts(t), t, Path(folder), sha('source'))
@@ -176,10 +181,10 @@ class ReferenceTests(unittest.TestCase):
                         frozen_reference(charts(t), t, Path(folder), sha('source'))
             # Empty arrays are a valid reference, unlike empty objects.
             empty = copy.deepcopy(original)
-            empty['distributions']['test']['a'] = {'day': []}
+            empty['distributions']['test']['a'] = {'hour': [], 'day': []}
             path.write_text(json.dumps(empty))
             payload, _, _, _ = frozen_reference(charts(t), t, Path(folder), sha('source'))
-            self.assertEqual(payload['distributions']['test']['a']['day'], [])
+            self.assertEqual(payload['distributions']['test']['a'], {'hour': [], 'day': []})
 
     def test_cache_requires_original_generation_provenance(self):
         t = epoch('2026-11-18T00:00:00')
@@ -218,14 +223,23 @@ class ReferenceTests(unittest.TestCase):
     def test_cache_and_new_references_keep_the_declared_utc_midnight_grid(self):
         t = epoch('2026-11-18T00:00:00')
         source = charts(t)
+        extra_h = copy.deepcopy(source[0]['series'][0]['history']['sampled_hour'][0])
+        extra_h[0] += SAMPLED_HOUR_STEP
+        source[0]['series'][0]['history']['sampled_hour'].append(extra_h)
         extra = copy.deepcopy(source[0]['series'][0]['history']['daily'][0])
         extra[0] += 3600
         source[0]['series'][0]['history']['daily'].append(extra)
         with tempfile.TemporaryDirectory() as folder:
             payload, _, _, _ = frozen_reference(source, t, folder, sha('source'))
             self.assertEqual(len(payload['distributions']['test']['a']['day']), 1)
+            self.assertEqual(len(payload['distributions']['test']['a']['hour']), 2)
             path = next(Path(folder).rglob('*.json'))
             payload['distributions']['test']['a']['day'].append([extra[0], 1000])
+            path.write_text(json.dumps(payload))
+            with self.assertRaisesRegex(ValueError, 'Invalid reference cache observation'):
+                frozen_reference(source, t, folder, sha('source'))
+            payload['distributions']['test']['a']['day'].pop()
+            payload['distributions']['test']['a']['hour'].append([extra[0], 1000])
             path.write_text(json.dumps(payload))
             with self.assertRaisesRegex(ValueError, 'Invalid reference cache observation'):
                 frozen_reference(source, t, folder, sha('source'))

@@ -32,15 +32,21 @@ def coarsened_role_row(end, n, classified=None):
 
 
 def metadata(series, end):
-    relays = series['current']['day']['relays']
-    return {'method': METHOD, 'queries': {'day': 'sum(example_day)'},
-            'day': coarsened_role_row(end, relays) if relays is not None else None,
+    hour_relays = series['current']['hour']['relays']
+    day_relays = series['current']['day']['relays']
+    return {'method': METHOD,
+            'queries': {'hour': 'sum(example_hour)', 'day': 'sum(example_day)'},
+            'hour': coarsened_role_row(end, hour_relays) if hour_relays is not None else None,
+            'day': coarsened_role_row(end, day_relays) if day_relays is not None else None,
             'daily': [coarsened_role_row(row[0], row[2]) for row in series['history']['daily'] if row[2] is not None]}
 
 
 class PopulationSummaryTests(unittest.TestCase):
     def calculate(self, rows, population=None, current=None, time_ranges=None):
-        series = {'current': current or {'day': {'relays': 20}}}
+        cur = {'hour': {'relays': 16}, 'day': {'relays': 20}}
+        if current:
+            cur.update(current)
+        series = {'current': cur}
         if population is not None:
             series['relay_population'] = population
         averages, windows = historical_averages_and_windows(rows, END, time_ranges=time_ranges)
@@ -113,10 +119,10 @@ class PopulationSummaryTests(unittest.TestCase):
         _, counts_strict = self.calculate([[END, 1, 100, 1, True]], time_ranges=self.strict_ranges())
         self.assertEqual(
             set(counts),
-            {'day', 'seven_days', 'one_month', 'three_months', 'six_months', 'twelve_months', 'all_time'},
+            {'hour', 'day', 'seven_days', 'one_month', 'three_months', 'six_months', 'twelve_months', 'all_time'},
         )
         for period, total in [
-            ('day', 20), ('seven_days', 100), ('one_month', 100), ('three_months', 100),
+            ('hour', 16), ('day', 20), ('seven_days', 100), ('one_month', 100), ('three_months', 100),
             ('six_months', 100), ('twelve_months', 100), ('all_time', 100),
         ]:
             result = counts[period]
@@ -158,11 +164,15 @@ class PopulationSummaryTests(unittest.TestCase):
         }
         rows = [[END - i * DAY, 10, 100, 1, True] for i in range(14)]
         averages, windows = historical_averages_and_windows(rows, END, time_ranges=custom)
-        series = {'current': {'day': {'relays': 100}}, 'relay_population': {'daily': [role_row(r[0], 100) for r in rows]}}
+        series = {'current': {'hour': {'relays': 80}, 'day': {'relays': 100}},
+                  'relay_population': {'daily': [role_row(r[0], 100) for r in rows]}}
         counts = relay_counts(series, END, averages, windows)
-        self.assertEqual(set(counts), {'day', 'fourteen_days', 'two_months', 'all_time'})
+        self.assertEqual(set(counts), {'hour', 'day', 'fourteen_days', 'two_months', 'all_time'})
+        self.assertEqual(counts['hour']['total'], 80)
         self.assertEqual(counts['fourteen_days']['total'], 100)
         self.assertIsNone(counts['two_months']['total'])
+        with self.assertRaisesRegex(ValueError, 'summary keys'):
+            relay_counts(series, END, {'hour': {'status': 'ready'}}, {'hour': []})
         with self.assertRaisesRegex(ValueError, 'summary keys'):
             relay_counts(series, END, {'day': {'status': 'ready'}}, {'day': []})
         with self.assertRaisesRegex(ValueError, 'summary keys'):
@@ -250,13 +260,15 @@ class PopulationInputTests(unittest.TestCase):
         validate_snapshot(clone_snapshot(SOURCE))
         data, population = self.fixture()
         validate_snapshot(data)
-        population.update(day=None, daily=[])
+        population.update(hour=None, day=None, daily=[])
         validate_snapshot(data)
 
     def test_closed_maps_method_queries_and_scalar_counts(self):
-        mutations = [lambda p: p.update(extra='no'), lambda p: p.pop('day'),
+        mutations = [lambda p: p.update(extra='no'), lambda p: p.pop('hour'), lambda p: p.pop('day'),
                      lambda p: p.update(method='current-flags'),
+                     lambda p: p['queries'].pop('hour'),
                      lambda p: p['queries'].update(extra='no'),
+                     lambda p: p['queries'].update(hour=' '),
                      lambda p: p['queries'].update(day=' '),
                      lambda p: p['queries'].update(day={}),
                      lambda p: p.update(daily=None)]

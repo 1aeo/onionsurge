@@ -5,9 +5,9 @@ import re
 import unicodedata
 from coarsening import is_coarsened_count, is_coarsened_value
 from population_statistics import METHOD as POPULATION_METHOD
-from windows import (DAY, MAX_SAFE_INT, MINIMUM_POPULATION_COVERAGE, RESERVED_JSON_KEYS,
-                     finite_number, is_sha256, non_negative, nonblank, population, require,
-                     timestamp, usable_measurement)
+from windows import (DAY, HOUR, MAX_SAFE_INT, MINIMUM_POPULATION_COVERAGE, RESERVED_JSON_KEYS,
+                     SAMPLED_HOUR_STEP, finite_number, hourly_observations, is_sha256, non_negative,
+                     nonblank, population, require, timestamp, usable_measurement)
 
 ID = re.compile(r'^[a-z][a-z0-9_-]{0,95}$')
 COLOR = re.compile(r'^#[0-9a-fA-F]{6}$')
@@ -27,7 +27,8 @@ PRIVATE_KEYS = {'host', 'hostname', 'instance', 'relay_fingerprint', 'member_id'
 BAD_KEYS = RESERVED_JSON_KEYS | PRIVATE_KEYS
 TOP_FIELDS = set('generated_at start end window_seconds minimum_samples expected_samples fleet custom defense flags families product history_methods versions snapshot_flags dircache_cohort sources charts input_schema_version input_provenance'.split())
 CHART_FIELDS = set('id family title unit note relays kind query quality_query series display_keys start end definition metrics metric_origin family_id display_scale display_unit headline_unit primary_series introduced_note history_status history_queries cohort_key'.split())
-SERIES_FIELDS = set('name key color history history_status current relay_population'.split())
+SERIES_FIELDS = set('name key color values history history_status current hourly_relays hourly_expected_relays relay_population'.split())
+SERIES_FIELDS_V3 = set('name key color history history_status current relay_population'.split())
 CURRENT_FIELDS = set('value relays expected_relays valid coverage'.split())
 VERSION_FIELDS = set('as_of verified_runtime runtime_unverified_relays runtime_verified_total native_total default_cli_only verification cli_warning metric_cohorts history earlier_version_scope binary_hash_counts provenance runtime_binary_hash_verified_total runtime_resolution cohort_labels'.split())
 PUBLIC_VERSION_FIELDS = set('as_of verified_runtime runtime_unverified_relays runtime_verified_total native_total metric_cohorts cohort_labels runtime_binary_hash_verified_total runtime_resolution'.split())
@@ -83,7 +84,7 @@ def _count_string(value):
         return False
 
 
-def _promql_ranges(query, *, want_ranges=True):
+def _promql_ranges(query, *, want_ranges=True, expected={'1d'}):
     if not isinstance(query, str):
         return False
     unterminated = False
@@ -98,8 +99,8 @@ def _promql_ranges(query, *, want_ranges=True):
     stripped = PROMQL_TOKEN.sub(_strip, query)
     if unterminated or not stripped.strip():
         return False
-    ranges = [m.group(1) for m in PROMQL_RANGE.finditer(stripped)]
-    return set(ranges) == {'1d'} if want_ranges else not ranges
+    ranges = {m.group(1) for m in PROMQL_RANGE.finditer(stripped)}
+    return ranges == expected if want_ranges else not ranges
 
 
 def _check_aligned_ts(t, previous, end, context, alignment=DAY):
@@ -117,14 +118,16 @@ def _prom_result(resp, expected_type, err_resp, err_result):
     return result['result']
 
 
-def _relay_population(series, end):
+def _relay_population(series, end, *, schema_version=4):
     if 'relay_population' not in series:
         return
     value = series['relay_population']
-    require(isinstance(value, dict) and set(value) == {'method', 'queries', 'day', 'daily'}, 'Invalid relay population fields')
+    expected_keys = {'method', 'queries', 'hour', 'day', 'daily'} if schema_version == 4 else {'method', 'queries', 'day', 'daily'}
+    expected_query_keys = {'hour', 'day'} if schema_version == 4 else {'day'}
+    require(isinstance(value, dict) and set(value) == expected_keys, 'Invalid relay population fields')
     require(value['method'] == POPULATION_METHOD, 'Unsupported relay population method')
     queries = value['queries']
-    require(isinstance(queries, dict) and set(queries) == {'day'} and all(nonblank(q) for q in queries.values()),
+    require(isinstance(queries, dict) and set(queries) == expected_query_keys and all(nonblank(q) for q in queries.values()),
             'Relay population queries must be explicit nonblank text')
 
     def row_valid(row, t, n):
@@ -135,8 +138,9 @@ def _relay_population(series, end):
         require(row[2] <= row[1], 'Relay population classification exceeds its eligible count')
         require(all(row[4] + row[index] <= row[2] for index in (3, 5, 6, 7)), 'Middle-only flags overlap another role')
 
-    if value['day'] is not None:
-        row_valid(value['day'], end, series['current']['day'].get('relays'))
+    for period in (('hour', 'day') if schema_version == 4 else ('day',)):
+        if value[period] is not None:
+            row_valid(value[period], end, series['current'][period].get('relays'))
     require(isinstance(value['daily'], list), 'Daily relay populations must be an array')
     measured = {row[0]: row[2] for row in series['history']['daily']}
     previous = None
@@ -146,7 +150,7 @@ def _relay_population(series, end):
         row_valid(row, previous, measured.get(previous))
 
 
-def _metadata(data):
+def _metadata(data, *, ts_alignment=DAY):
     require(isinstance(data.get('generated_at'), str), 'Generation label must be text')
     product = data.get('product', {})
     fields(product, PRODUCT_FIELDS, 'Unknown product metadata field')
@@ -181,18 +185,19 @@ def _metadata(data):
             require(canonical not in seen_metrics, 'Duplicate aggregate flag series')
             seen_metrics.add(canonical)
             value = row.get('value')
-            require(isinstance(value, list) and len(value) == 2 and timestamp(value[0]) and value[0] % DAY == 0
+            require(isinstance(value, list) and len(value) == 2 and timestamp(value[0]) and value[0] % ts_alignment == 0
                     and _count_string(value[1]),
-                    'Aggregate flag values must be UTC-midnight timestamp/coarsened count-string pairs')
+                    'Aggregate flag values must be aligned timestamp/coarsened count-string pairs')
 
 
-def _points(rows, alignment, end, *, chart_id, series_key, kind):
+def _points(rows, alignment, end, *, chart_id, series_key, kind, window_seconds=DAY):
     require(isinstance(rows, list), 'Observations must be arrays')
     previous = None
     for row in rows:
         require(isinstance(row, list) and len(row) == 5, 'Invalid observation shape')
         previous = _check_aligned_ts(row[0], previous, end, 'Observation', alignment)
-        require(is_coarsened_value(chart_id, series_key, kind, row[1]), 'Invalid or uncoarsened observation value')
+        require(is_coarsened_value(chart_id, series_key, kind, row[1], window_seconds=window_seconds),
+                'Invalid or uncoarsened observation value')
         require(row[2] is None or is_coarsened_count(row[2]), 'Invalid or uncoarsened reporting population')
         require(row[3] is None or (non_negative(row[3]) and row[3] <= 1), 'Invalid coverage')
         require(type(row[4]) is bool, 'Qualification must be a boolean')
@@ -205,7 +210,7 @@ def _points(rows, alignment, end, *, chart_id, series_key, kind):
                     'Qualified row contradicts its measurement or coverage')
 
 
-def _validate_versions(data, start, end):
+def _validate_versions(data, start, end, *, ts_alignment=DAY):
     versions = data.get('versions', {})
     fields(versions, VERSION_FIELDS, 'Unknown runtime metadata field')
     labels = versions.get('cohort_labels')
@@ -273,10 +278,16 @@ def _validate_versions(data, start, end):
     fields(res, {'observed_at', 'resolved_relays', 'matched_process_epochs', 'mismatches', 'snapshot_start', 'snapshot_end', 'source_sha256'}, 'Unknown runtime resolution field')
     require('observed_at' not in res or isinstance(res['observed_at'], str), 'Runtime observation label must be text')
     require(all(is_coarsened_count(res[k]) for k in ('resolved_relays', 'matched_process_epochs', 'mismatches') if k in res), 'Invalid coarsened runtime resolution count')
-    require(all(timestamp(res[k]) and res[k] % DAY == 0 for k in ('snapshot_start', 'snapshot_end') if k in res), 'Invalid runtime resolution timestamp')
-    require(('snapshot_start' in res) == ('snapshot_end' in res)
-            and ('snapshot_start' not in res or (res['snapshot_start'] == start and res['snapshot_end'] == end)),
-            'Runtime resolution window disagrees with snapshot day')
+    require(all(timestamp(res[k]) and res[k] % ts_alignment == 0 for k in ('snapshot_start', 'snapshot_end') if k in res),
+            'Invalid coarsened runtime resolution timestamp' if ts_alignment == DAY else 'Invalid runtime resolution timestamp')
+    if ts_alignment == HOUR:
+        require(('snapshot_start' in res) == ('snapshot_end' in res)
+                and ('snapshot_start' not in res or (res['snapshot_end'] == end and res['snapshot_start'] in (end - HOUR, start))),
+                'Runtime resolution window disagrees with snapshot')
+    else:
+        require(('snapshot_start' in res) == ('snapshot_end' in res)
+                and ('snapshot_start' not in res or (res['snapshot_start'] == start and res['snapshot_end'] == end)),
+                'Runtime resolution window disagrees with snapshot day')
     hashes = res.get('source_sha256', {})
     fields(hashes, RUNTIME_SOURCE_FIELDS, 'Unknown public runtime source label')
     require(all(is_sha256(v) for v in hashes.values()), 'Runtime source identities must be hashes')
@@ -299,23 +310,15 @@ def _validate_versions(data, start, end):
     return cohorts, labels, cohort_totals
 
 
-def _validate_series(series, chart, end):
-    require(nonblank(series.get('name')), 'Unknown or invalid series field')
-    require('history_status' not in series or isinstance(series['history_status'], str), 'Series history status must be text')
-    require(isinstance(series.get('color'), str) and COLOR.fullmatch(series['color']), 'Invalid series color')
-    history = series.setdefault('history', {})
-    fields(history, {'daily'}, 'Invalid historical observations')
-    rows = history.setdefault('daily', [])
-    _points(rows, DAY, end, chart_id=chart['id'], series_key=series['key'], kind=chart['kind'])
-    current = series.get('current', {})
-    require(isinstance(current, dict) and set(current) == {'day'}, 'Current duration must contain only day')
-    measurement = current['day']
+def _validate_current_measurement(measurement, chart, *, period, window_seconds):
     fields(measurement, CURRENT_FIELDS, 'Unknown current measurement field')
     value, n = measurement.get('value'), measurement.get('relays')
-    require(is_coarsened_value(chart['id'], series['key'], chart['kind'], value), 'Invalid or uncoarsened current value')
+    require(is_coarsened_value(chart['id'], chart['_cur_series_key'], chart['kind'], value, window_seconds=window_seconds),
+            'Invalid or uncoarsened current value')
     require(n is None or is_coarsened_count(n), 'Invalid or uncoarsened current population')
     expected = measurement.get('expected_relays', max(8, chart['relays']))
-    require(population(expected) and is_coarsened_count(expected) and expected >= chart['relays'],
+    require(population(expected) and is_coarsened_count(expected)
+            and (period == 'hour' or expected >= chart['relays']),
             'Invalid current qualification denominator')
     require(n is None or n <= expected, 'Current coverage exceeds its qualification denominator')
     require(n not in (None, 0) or value is None, 'Unreported current interval cannot carry a measurement')
@@ -334,42 +337,110 @@ def _validate_series(series, chart, end):
         else:
             require(usable_measurement(value, n) and n >= 8 and finite_number(coverage)
                     and MINIMUM_POPULATION_COVERAGE <= coverage <= 1, 'Current qualification contradicts population/coverage')
+    return value, n, expected, has_cov, coverage
+
+
+def _validate_hourly_series(series, chart, end):
+    for field in ('values', 'hourly_relays', 'hourly_expected_relays'):
+        require(isinstance(series.get(field), list), f'Hourly {field} must be an array')
+    expected_grid = list(range(end - DAY + HOUR, end + 1, HOUR))
+    vals, hr, hexp = series['values'], series['hourly_relays'], series['hourly_expected_relays']
+    require(len(vals) == len(hr) == len(hexp) == 24,
+            'Current measurements and populations must cover the same 24 hourly endpoints')
+    for expected_t, v_pt, n_pt, e_pt in zip(expected_grid, vals, hr, hexp, strict=True):
+        for pt in (v_pt, n_pt, e_pt):
+            require(isinstance(pt, list) and len(pt) == 2 and timestamp(pt[0]), 'Invalid hourly point shape')
+        require(v_pt[0] == expected_t and n_pt[0] == expected_t and e_pt[0] == expected_t,
+                'Current measurements and populations must cover the same 24 hourly endpoints')
+        require(is_coarsened_value(chart['id'], series['key'], chart['kind'], v_pt[1], window_seconds=HOUR),
+                'Invalid or uncoarsened hourly value')
+        require(n_pt[1] is None or is_coarsened_count(n_pt[1]), 'Invalid or uncoarsened hourly population')
+        require(is_coarsened_count(e_pt[1]) and population(e_pt[1])
+                and (n_pt[1] is None or n_pt[1] <= e_pt[1]), 'Invalid hourly expected population')
+    hourly = hourly_observations(series)
+    require(all(row[1] is None or (row[4] and row[2] >= 8) for row in hourly), 'Unqualified hourly value must be null')
+    return hourly
+
+
+def _validate_series(series, chart, end, *, schema_version=4):
+    require(nonblank(series.get('name')), 'Unknown or invalid series field')
+    require('history_status' not in series or isinstance(series['history_status'], str), 'Series history status must be text')
+    require(isinstance(series.get('color'), str) and COLOR.fullmatch(series['color']), 'Invalid series color')
+    chart_ctx = dict(chart, _cur_series_key=series['key'])
+    hourly = _validate_hourly_series(series, chart, end) if schema_version == 4 else None
+    history = series.setdefault('history', {})
+    allowed_hist = {'daily', 'sampled_hour'} if schema_version == 4 else {'daily'}
+    fields(history, allowed_hist, 'Invalid historical observations')
+    rows = history.setdefault('daily', [])
+    _points(rows, DAY, end, chart_id=chart['id'], series_key=series['key'], kind=chart['kind'], window_seconds=DAY)
+    if schema_version == 4:
+        sh_rows = history.setdefault('sampled_hour', [])
+        _points(sh_rows, SAMPLED_HOUR_STEP, end, chart_id=chart['id'], series_key=series['key'],
+                kind=chart['kind'], window_seconds=HOUR)
+    current = series.get('current', {})
+    if schema_version == 4:
+        require(isinstance(current, dict) and set(current) == {'hour', 'day'}, 'Both current durations must be explicit')
+        h_val, h_n, h_exp, _, _ = _validate_current_measurement(current['hour'], chart_ctx, period='hour', window_seconds=HOUR)
+        require(h_exp == series['hourly_expected_relays'][-1][1], 'Headline and plotted expected population disagree')
+        if 'valid' in current['hour']:
+            require(current['hour']['valid'] == hourly[-1][4], 'Headline and plotted qualification disagree')
+        last_h_val = series['values'][-1][1]
+        require((h_val is None and last_h_val is None) or (h_val is not None and last_h_val is not None
+                and math.isclose(h_val, last_h_val, rel_tol=1e-12, abs_tol=1e-12)),
+                'Headline and plotted final hour disagree')
+        require(h_n == series['hourly_relays'][-1][1], 'Headline and plotted population disagree')
+    else:
+        require(isinstance(current, dict) and set(current) == {'day'}, 'Current duration must contain only day')
+    value, n, _, has_cov, coverage = _validate_current_measurement(current['day'], chart_ctx, period='day', window_seconds=DAY)
     if rows and rows[-1][0] == end:
         _, last_val, last_relays, last_cov, last_valid = rows[-1]
         require((value is None and last_val is None) or (value is not None and last_val is not None
                 and math.isclose(value, last_val, rel_tol=1e-12, abs_tol=1e-12)), 'Headline and plotted final day disagree')
         require(n == last_relays, 'Headline and plotted daily population disagree')
-        require('valid' not in measurement or measurement['valid'] == last_valid, 'Headline and plotted daily qualification disagree')
+        require('valid' not in current['day'] or current['day']['valid'] == last_valid, 'Headline and plotted daily qualification disagree')
         if has_cov and coverage is not None and last_cov is not None:
             require(math.isclose(coverage, last_cov, abs_tol=1e-12), 'Headline and plotted daily coverage disagree')
-    _relay_population(series, end)
+    _relay_population(series, end, schema_version=schema_version)
     if series['key'] in chart['display_keys']:
-        require(type(measurement.get('valid')) is bool, 'Displayed series needs explicit validity')
-        require(series.get('history_status') == 'queried' and bool(history.get('daily')), 'Displayed series is missing historical observations')
+        periods = ('hour', 'day') if schema_version == 4 else ('day',)
+        require(all(type(current[p].get('valid')) is bool for p in periods), 'Displayed series needs explicit validity')
+        require(series.get('history_status') == 'queried' and all(bool(history.get(p)) for p in allowed_hist),
+                'Displayed series is missing historical observations')
 
 
-def validate_snapshot(data):
+def validate_snapshot(data, *, allow_v3_seed=False):
     _public_json(data)
     fields(data, TOP_FIELDS, 'Unknown field outside public snapshot shape')
-    _metadata(data)
+    schema_version = data.get('input_schema_version')
+    require(type(schema_version) is int and (schema_version == 4 or (allow_v3_seed and schema_version == 3)),
+            'Unsupported input schema version')
+    ts_alignment = HOUR if schema_version == 4 else DAY
+    _metadata(data, ts_alignment=ts_alignment)
     require(all(is_coarsened_count(data.get(k)) for k in ('fleet', 'custom', 'defense')), 'Invalid coarsened top-level population')
     provenance = data.get('input_provenance', {})
     fields(provenance, {'description', 'snapshot_end', 'source_public_data_sha256'}, 'Unknown input provenance field')
     require('description' not in provenance or isinstance(provenance['description'], str), 'Input provenance description must be text')
     require('source_public_data_sha256' not in provenance or is_sha256(provenance['source_public_data_sha256']),
             'Input provenance source identity must be a SHA-256 digest')
-    require(type(data.get('input_schema_version')) is int and data['input_schema_version'] == 3, 'Unsupported input schema version')
     start, end = data.get('start'), data.get('end')
-    require(timestamp(start) and timestamp(end) and end <= 8640000000000 and start % DAY == 0 and end % DAY == 0 and end - start == DAY,
-            'Snapshot must contain one complete UTC-midnight-aligned 24-hour period')
+    require(timestamp(start) and timestamp(end) and end <= 8640000000000
+            and start % ts_alignment == 0 and end % ts_alignment == 0 and end - start == DAY,
+            'Snapshot must contain one complete UTC-aligned 24-hour period' if schema_version == 4
+            else 'Snapshot must contain one complete UTC-midnight-aligned 24-hour period')
     start, end = int(start), int(end)
     for probe in data.get('snapshot_flags', {}).values():
         for row in probe['response']['data']['result']:
             require(row['value'][0] <= end, 'Aggregate flag timestamp is beyond the snapshot')
     require('snapshot_end' not in provenance or (timestamp(provenance['snapshot_end']) and provenance['snapshot_end'] == end),
             'Input provenance snapshot mismatch')
-    require(data.get('window_seconds') == DAY and data.get('minimum_samples') == 360
-            and ('expected_samples' not in data or data['expected_samples'] == 720), 'Unsupported daily measurement contract')
+    if schema_version == 4:
+        require(data.get('window_seconds') == HOUR and data.get('minimum_samples') == 24
+                and ('expected_samples' not in data or data['expected_samples'] == 30),
+                'Unsupported hourly measurement contract')
+    else:
+        require(data.get('window_seconds') == DAY and data.get('minimum_samples') == 360
+                and ('expected_samples' not in data or data['expected_samples'] == 720),
+                'Unsupported daily measurement contract')
     charts, families = data.get('charts', []), data.get('families', [])
     require(isinstance(charts, list) and bool(charts) and isinstance(families, list) and len(families) == 6, 'Expected charts and six families')
     for chart in charts:
@@ -395,8 +466,12 @@ def validate_snapshot(data):
     fields(sources, SOURCE_FIELDS, 'Unknown source metadata field')
     require(all(isinstance(sources.get(k), str) and sources[k] for k in ('feed', 'collector')), 'Source labels must be text')
     require(sources.get('current_observation_end') == end, 'Source snapshot mismatch')
-    cohorts, labels, cohort_totals = _validate_versions(data, start, end)
+    cohorts, labels, cohort_totals = _validate_versions(data, start, end, ts_alignment=ts_alignment)
     checked_cohort_labels = set()
+    allowed_kinds = {'counter_hour_rate', 'gauge_hour_mean'} if schema_version == 4 else {'counter_daily_rate', 'gauge_daily_mean'}
+    expected_cur_range = {'1h'} if schema_version == 4 else {'1d'}
+    expected_hq = {'daily': {'1d'}, 'sampled_hour': {'1h'}, 'current24': {'1d'}} if schema_version == 4 else {'daily': {'1d'}}
+    series_fields = SERIES_FIELDS if schema_version == 4 else SERIES_FIELDS_V3
     for chart in charts:
         require(all(isinstance(chart.get(k), str) for k in ('family', 'title', 'unit', 'note', 'definition', 'metric_origin', 'display_unit', 'headline_unit')),
                 'Chart labels must be text')
@@ -405,20 +480,25 @@ def validate_snapshot(data):
         require(isinstance(chart.get('metrics'), list) and bool(chart['metrics']) and all(isinstance(m, str) and m for m in chart['metrics']),
                 'Metrics must be an array of strings')
         require(chart.get('start') == start and chart.get('end') == end, 'Chart snapshot mismatch')
-        require(isinstance(chart.get('kind'), str) and chart['kind'] in {'counter_daily_rate', 'gauge_daily_mean'}, 'Unknown measurement kind')
+        require(isinstance(chart.get('kind'), str) and chart['kind'] in allowed_kinds, 'Unknown measurement kind')
         require(is_coarsened_count(chart.get('relays')) and finite_number(chart.get('display_scale')) and chart['display_scale'] > 0,
                 'Invalid chart population or scale')
         require(chart.get('history_status') == 'ready', 'History input is not ready')
         require(all(nonblank(chart.get(k)) for k in ('query', 'quality_query', 'unit')), 'Missing query or unit')
-        require(_promql_ranges(chart['query']) and _promql_ranges(chart['quality_query']), 'Chart query must declare only the [1d] daily range')
+        require(_promql_ranges(chart['query'], expected=expected_cur_range)
+                and _promql_ranges(chart['quality_query'], expected=expected_cur_range),
+                'Chart query must declare only the [1h] hourly range' if schema_version == 4
+                else 'Chart query must declare only the [1d] daily range')
         queries = chart.get('history_queries')
-        require(isinstance(queries, dict) and set(queries) == {'daily'}, 'Invalid historical query periods')
-        for query in queries.values():
+        require(isinstance(queries, dict) and set(queries) == set(expected_hq), 'Invalid historical query periods')
+        for period_key, query in queries.items():
             require(isinstance(query, dict) and set(query) == {'value', 'eligible', 'available'}
                     and all(nonblank(v) for v in query.values()), 'Invalid historical query definition')
-            require(_promql_ranges(query['value']) and _promql_ranges(query['eligible'])
+            want_r = expected_hq[period_key]
+            require(_promql_ranges(query['value'], expected=want_r)
+                    and _promql_ranges(query['eligible'], expected=want_r)
                     and _promql_ranges(query['available'], want_ranges=False),
-                    'Historical daily queries must use [1d] ranges for value/eligible and an instant selector for available')
+                    'Historical query ranges do not match the period contract')
         first_nonblank = None
         for ch in chart['unit']:
             cat = unicodedata.category(ch)
@@ -431,7 +511,7 @@ def validate_snapshot(data):
         require(isinstance(chart.get('series'), list) and bool(chart['series']), 'Series must be a nonempty array')
         keys = []
         for series in chart['series']:
-            fields(series, SERIES_FIELDS, 'Unknown or invalid series field')
+            fields(series, series_fields, 'Unknown or invalid series field')
             keys.append(series.get('key'))
         require(all(isinstance(k, str) and ID.fullmatch(k) for k in keys) and len(keys) == len(set(keys)), 'Invalid or duplicate series ID')
         require(isinstance(chart.get('display_keys'), list) and bool(chart['display_keys'])
@@ -448,5 +528,5 @@ def validate_snapshot(data):
             checked_cohort_labels.add(ckey)
         require(cohort_totals[ckey] == chart['relays'], 'Chart build population mismatch')
         for series in chart['series']:
-            _validate_series(series, chart, end)
+            _validate_series(series, chart, end, schema_version=schema_version)
     return data

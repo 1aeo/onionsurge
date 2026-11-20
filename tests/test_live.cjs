@@ -134,7 +134,7 @@ const loader=(storage,overrides={})=>createReleaseLoader({baseUrl,fetch:storage.
 function withoutPopulation(series){delete series.relay_population;delete series.relay_counts;}
 function withoutComparisons(series){for(const average of Object.values(series.historical_averages))delete average.comparison;}
 function withBoundedMinimumCoverage(data,minCov=0.9){
- for(const period of data.time_ranges.periods)if(period.window.unit!=='all_time')period.minimum_coverage=minCov;
+ for(const period of data.time_ranges.periods)if(period.window.unit==='days'||period.window.unit==='months')period.minimum_coverage=minCov;
  for(const chart of data.charts)for(const series of chart.series){withoutPopulation(series);syncHistoricalAverages(series,data.time_ranges.periods,data.end);}
  return data;
 }
@@ -143,6 +143,7 @@ function syncHistoricalAverages(series,periodDefs,end){
  const validDaily=series.history.daily.filter(row=>row[4]&&row[0]<=dayEnd);
  const next={};
  for(const periodDef of periodDefs){
+  if(periodDef.window.unit==='hours')continue;
   const key=periodDef.summary_key,isAllTime=periodDef.window.unit==='all_time';
   const pStart=isAllTime?null:periodStartTs(dayEnd,periodDef);
   const points=pStart===null?validDaily:validDaily.filter(row=>row[0]-86400>=pStart);
@@ -173,22 +174,53 @@ function syncHistoricalAverages(series,periodDefs,end){
  series.historical_averages=next;
 }
 
+function toV6Data(src){
+ const data=structuredClone(src);
+ data.schema_version=6;data.window_seconds=86400;
+ const dayEnd=Math.floor(data.end/86400)*86400;
+ data.end=dayEnd;data.start=dayEnd-86400;
+ const dailyPeriods=data.time_ranges.periods.filter(p=>p.window.unit!=='hours');
+ const defId=dailyPeriods.find(p=>p.id==='1mo')?.id||dailyPeriods[0].id;
+ data.time_ranges={version:1,default_range:defId,legacy_aliases:{'24h':defId,'30d':defId},card_slots:{fallback_dynamic:defId,fixed:['6mo','all']},periods:dailyPeriods};
+ for(const c of data.charts){
+  c.kind=c.kind==='gauge_hour_mean'?'gauge_daily_mean':'counter_daily_rate';
+  c.start=data.start;c.end=data.end;
+  c.query=c.history_queries.daily.value;c.quality_query=c.history_queries.daily.eligible;
+  c.history_queries={daily:c.history_queries.daily};
+  for(const s of c.series){
+   delete s.values;delete s.hourly_relays;delete s.hourly_expected_relays;
+   delete s.history.sampled_hour;delete s.current.hour;delete s.reference.hour;delete s.peaks.hour;
+   if(s.relay_population){delete s.relay_population.hour;delete s.relay_population.queries.hour;}
+   if(s.relay_counts)delete s.relay_counts.hour;
+  }
+ }
+ return data;
+}
+function toV6Ref(srcRef){
+ const ref=structuredClone(srcRef);
+ for(const group of Object.values(ref.distributions))for(const periods of Object.values(group))delete periods.hour;
+ return ref;
+}
+
 function populationData(){
  const data=withBoundedMinimumCoverage(structuredClone(current.data),0.9),chart=data.charts[0],series=chart.series[0],end=data.end;
  withoutComparisons(series);
  const dayEnd=Math.floor(end/86400)*86400;
  const day=series.current.day,expected=day.expected_relays;
  Object.assign(day,{value:null,relays:16,coverage:16/expected,valid:false});
- series.reference.day.current_percentile=null;
+ Object.assign(series.current.hour,{value:null,relays:16,expected_relays:expected,coverage:16/expected,valid:false});
+ series.values[23]=[end,null];series.hourly_relays[23]=[end,16];series.hourly_expected_relays[23]=[end,expected];
+ series.reference.day.current_percentile=null;series.reference.hour.current_percentile=null;
  series.history.daily=[[dayEnd-2*86400,0,8,1,true],[dayEnd-86400,24,24,1,true],[dayEnd,null,16,16/expected,false]];
  syncHistoricalAverages(series,data.time_ranges.periods,end);
- series.relay_population={method:'eligible-last-flags-v1',queries:{day:'sum(example_day)'},
-  day:[end,16,16,8,0,0,8,8],
+ series.relay_population={method:'eligible-last-flags-v1',queries:{hour:'sum(example_hour)',day:'sum(example_day)'},
+  hour:[end,16,16,8,0,0,8,8],day:[end,16,16,8,0,0,8,8],
   daily:[[dayEnd-2*86400,8,8,8,0,0,8,8],[dayEnd-86400,24,24,8,8,0,16,16],[dayEnd,16,16,8,0,0,8,8]]};
  const complete=(total,guard,middle_only,exit,hsdir,v2dir,windows,relayWindows)=>({total,guard,middle_only,exit,hsdir,v2dir,role_bounds:null,
   measured_windows:windows,classified_windows:windows,relay_windows:relayWindows,classified_relay_windows:relayWindows,coverage:1});
- series.relay_counts={day:complete(16,8,0,0,8,8,1,16)};
+ series.relay_counts={hour:complete(16,8,0,0,8,8,1,16),day:complete(16,8,0,0,8,8,1,16)};
  for(const period of data.time_ranges.periods){
+  if(period.window.unit==='hours')continue;
   const key=period.summary_key;
   series.relay_counts[key]=period.window.unit==='all_time'
    ?complete(16,8,4,0,12,12,2,32)
@@ -206,6 +238,7 @@ function comparisonData(){
  series.history.daily=[[dayEnd-3*86400,8,8,1,true],[dayEnd-2*86400,16,8,1,true],
   [cutoff,24,8,1,true],[dayEnd,2*n,n,1,true]];
  for(const periodDef of data.time_ranges.periods){
+  if(periodDef.window.unit==='hours')continue;
   const period=periodDef.summary_key,average=series.historical_averages[period];
   Object.assign(average,{days:4,end:dayEnd,observed_start:dayEnd-4*86400,observed_end:dayEnd});
   if(periodDef.window.unit==='all_time')Object.assign(average,{start:dayEnd-4*86400,status:'ready',value:(48+2*n)/4,display:String((48+2*n)/4),
@@ -427,32 +460,49 @@ test('candidate schema, required object set and reference semantics are checked'
  const changes=[
   {manifestChange:manifest=>manifest.data_schema_version=4},
   {manifestChange:manifest=>manifest.data_schema_version=5},
-  {manifestChange:manifest=>manifest.observation_end+=3600},
+  {manifestChange:manifest=>manifest.data_schema_version=6},
+  {manifestChange:manifest=>manifest.observation_end+=1800},
   {dataChange:data=>data.schema_version=4},
-  {dataChange:data=>data.end+=3600},
+  {dataChange:data=>data.end+=1800},
   {dataChange:data=>data.families[0].primary='missing'},
+  {dataChange:data=>data.charts[0].kind='counter_daily_rate'},
+  {dataChange:data=>delete data.charts[0].history_queries.current24},
   {dataChange:data=>data.charts[0].series[0].history.daily[0][1]=-1},
   {dataChange:data=>data.charts[0].series[0].history.daily[0][2]=9},
+  {dataChange:data=>data.charts[0].series[0].history.sampled_hour.push([data.start+3600,1,8,1,true])},
   {dataChange:data=>data.charts[0].series[0].values=[]},
+  {dataChange:data=>{const s=data.charts[0].series[0];s.hourly_relays[0][1]=8;s.hourly_expected_relays[0][1]=100;s.values[0][1]=1;}},
   {dataChange:data=>data.charts[0].series[0].current.day.value+=10},
+  {dataChange:data=>data.charts[0].series[0].current.hour.value+=10},
   {manifestChange:manifest=>delete manifest.objects['exports/transport_rejections-1mo.csv']},
-  {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-24h.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
+  {manifestChange:manifest=>delete manifest.objects['exports/transport_rejections-24h.csv']},
   {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-1h.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
+  {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-024h.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
+  {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-23h.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
   {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-30m.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
   {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-60s.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
+  {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-01d.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
+  {manifestChange:manifest=>{manifest.objects['exports/transport_rejections-foo-1h.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
   {manifestChange:manifest=>{manifest.objects['exports/transport-rejections-24h.csv']=manifest.objects['exports/transport_rejections-1mo.csv'];delete manifest.objects['exports/transport_rejections-1mo.csv'];}},
   {manifestChange:manifest=>manifest.objects['https://bad.test/data.json']=entry(Buffer.from('{}'))},
   {manifestChange:manifest=>manifest.objects['../data.json']=entry(Buffer.from('{}'))},
   {referenceChange:reference=>reference.window.end-=86400},
   {referenceChange:reference=>reference.method_sha256='d'.repeat(64)},
   {referenceChange:reference=>reference.distributions.transport_rejections.conn_rejected.day.pop()},
+  {referenceChange:reference=>reference.distributions.transport_rejections.conn_rejected.hour.pop()},
  ];
  for(const [index,change] of changes.entries())await t.test(String(index),async()=>{
   const bad=fixture('bad-'+index,change),storage=server([bad,previous],bad,previous);
   const result=await loader(storage).load();assert.equal(result.descriptor.id,'previous');
  });
  for(const key of ['hour','sampled_hour','hourly_relays','hourly_expected_relays','current24']){
-  assert.throws(()=>parseLiveJson(Buffer.from(JSON.stringify({[key]:1}))),/Sub-24h field/);
+  assert.deepEqual(parseLiveJson(Buffer.from(JSON.stringify({[key]:1}))),{[key]:1});
+  const v6Obj=fixture('v6-forbid-'+key,{
+   referenceChange:ref=>{for(const g of Object.values(ref.distributions))for(const p of Object.values(g))delete p.hour;},
+   dataChange:data=>{Object.assign(data,toV6Data(data));data[key]=1;},
+   manifestChange:m=>{m.data_schema_version=6;},
+  });
+  assert.throws(()=>checkData(v6Obj.data,v6Obj.manifest),/Sub-24h field/);
  }
 });
 
@@ -517,7 +567,9 @@ test('a successful empty current cohort is an admissible release, not a broken c
     if(daily.length&&daily.at(-1)[0]===data.end)daily[daily.length-1]=[data.end,null,0,0,false];
     syncHistoricalAverages(series,data.time_ranges.periods,data.end);
     Object.assign(series.current.day,{valid:false,value:null,relays:0,coverage:0,display:'Unavailable'});
-    series.reference.day.current_percentile=null;
+    Object.assign(series.current.hour,{valid:false,value:null,relays:0,coverage:0,display:'Unavailable'});
+    series.values[23]=[data.end,null];series.hourly_relays[23]=[data.end,0];
+    series.reference.day.current_percentile=null;series.reference.hour.current_percentile=null;
    }
   }
  }});
@@ -602,11 +654,14 @@ test('historical comparison calendar starts clamp leap years and month ends',()=
    for(const series of chart.series){
     withoutPopulation(series);
     for(const row of series.history.daily)row[0]+=delta;
+    for(const row of series.history.sampled_hour)row[0]+=delta;
+    for(const arr of [series.values,series.hourly_relays,series.hourly_expected_relays])for(const row of arr)row[0]+=delta;
     if(series!==data.charts[0].series[0])syncHistoricalAverages(series,data.time_ranges.periods,end);
    }
   }
   const series=data.charts[0].series[0];
   for(const periodDef of data.time_ranges.periods){
+   if(periodDef.window.unit==='hours')continue;
    const period=periodDef.summary_key,average=series.historical_averages[period];
    average.start=periodDef.window.unit==='all_time'?average.start+delta:periodStartTs(end,periodDef);
    if(period==='six_months')assert.equal(average.start,Date.parse(startText)/1000);
@@ -747,6 +802,7 @@ test('fractional historical means use integer sums for Middle-only exclusivity',
  series.relay_population.day=[end,104,104,96,8,0,0,0];
  series.relay_population.daily=times.map((t,index)=>[t,index===2?104:96,index===2?104:96,96,index===2?8:0,0,0,0]);
  for(const periodDef of data.time_ranges.periods){
+  if(periodDef.window.unit==='hours')continue;
   const period=periodDef.summary_key,avg=series.historical_averages[period];
   avg.days=3;avg.coverage=3/avg.expected_days;
   Object.assign(series.relay_counts[period],{measured_windows:3,classified_windows:3,
@@ -767,7 +823,7 @@ test('fractional historical means use integer sums for Middle-only exclusivity',
 });
 
 test('missing and partial flag history cannot silently shorten a historical mean',()=>{
- const periodKeys=current.data.time_ranges.periods.map(p=>p.summary_key);
+ const periodKeys=current.data.time_ranges.periods.filter(p=>p.window.unit!=='hours').map(p=>p.summary_key);
  for(const partial of [false,true]){
   const data=populationData(),series=data.charts[0].series[0];
   if(partial)series.relay_population.daily[1]=[series.relay_population.daily[1][0],24,16,8,8,0,8,8];
@@ -794,7 +850,7 @@ test('missing and partial flag history cannot silently shorten a historical mean
 });
 
 test('role bounds include wholly missing windows and reject narrower or fabricated intervals',()=>{
- const periodKeys=current.data.time_ranges.periods.map(p=>p.summary_key);
+ const periodKeys=current.data.time_ranges.periods.filter(p=>p.window.unit!=='hours').map(p=>p.summary_key);
  const fixture=()=>{
   const data=populationData(),series=data.charts[0].series[0];
   series.relay_population.daily.splice(1,1);
@@ -977,9 +1033,11 @@ test('classic browser scripts share a scope and bootstrap a verified daily dashb
  assert.equal(vm.runInContext('createObservatory',context),factory,'the app factory remains available');
  await ready.promise;
  assert.match(html,/Observed through/);
- assert.match(html,/Updated daily \(00:00 UTC\)/);
- assert.match(html,/data-all-range="1mo"/);
- assert.match(html,/Last 1 month average/);
+ assert.match(html,/Updated hourly/);
+ assert.match(html,/data-all-range="24h"/);
+ assert.match(html,/data-hero-range="24h"/);
+ assert.match(html,/Last complete hour/);
+ assert.match(html,/24-hour average/);
  assert.equal(storage.calls.length,defaultObjectCount+2,'root, manifest and every release object were requested');
  assert.equal(environment.created.length,defaultObjectCount+1,'verified release objects and manifest received Blob downloads');
  assert.equal(vm.runInContext('typeof createReleaseLoader',context),'undefined','loader declarations stay private');
@@ -1023,11 +1081,12 @@ test('render failure disposes only rejected resources and preserves active ident
  assert.equal(app.context.downloads.size,2);controller.stop();
 });
 
-test('visible timer refreshes every 3600 seconds and returning from hidden can refresh',async()=>{
+test('visible timer refreshes every 300 seconds and returning from hidden can refresh',async()=>{
  const environment=controllerBrowser(),render=renderer();let now=0,calls=0;
  const controller=createLiveController(environment.browser,render.make,{now:()=>now,loader:{async load(){calls++;return verified('one');}}});
- await controller.refresh();const refresh=[...environment.timers.values()].find(timer=>timer.ms===3600000);
- environment.browser.document.visibilityState='hidden';now=4000;refresh.fn();await pause(0);assert.equal(calls,1);
+ await controller.refresh();const refresh=[...environment.timers.values()].find(timer=>timer.ms===300000);
+ assert.ok(refresh,'refresh timer runs at 300s');
+ environment.browser.document.visibilityState='hidden';now=400;refresh.fn();await pause(0);assert.equal(calls,1);
  environment.browser.document.visibilityState='visible';environment.documentEvents.get('visibilitychange')();await pause(0);assert.equal(calls,2);
  environment.documentEvents.get('visibilitychange')();await pause(0);assert.equal(calls,2);
  controller.stop();
@@ -1052,7 +1111,8 @@ test('live failure never displays accidental bundled sample data',async()=>{
 
 test('window_seconds, invalid non-null current value, and subnormal comparison checks work properly',async()=>{
  for(const patch of [
-  data=>{data.window_seconds=3600;},
+  data=>{data.window_seconds=86400;},
+  data=>{data.window_seconds=1800;},
   data=>{
    const series=data.charts[0].series[0];
    series.history.daily=series.history.daily.slice(0,-1);
@@ -1070,12 +1130,14 @@ test('window_seconds, invalid non-null current value, and subnormal comparison c
   referenceChange:ref=>{
    const c=source.charts[0],s=c.series[0];
    ref.distributions[c.id][s.key].day=[[ref.window.end-86400,0]];
+   ref.distributions[c.id][s.key].hour=[[ref.window.end-21600,0]];
   },
   dataChange:data=>{
    const c=data.charts[0],s=c.series[0],n=c.relays,end=data.end;
    s.history.daily=Array.from({length:8},(_,i)=>[end-(7-i)*86400,i===7?subnormal:0,n,1,true]);
    s.current.day={value:subnormal,relays:n,expected_relays:Math.max(8,n),coverage:1,valid:true};
    Object.assign(s.reference.day,{n:1,current_percentile:100,flat_zero:false});
+   Object.assign(s.reference.hour,{n:1,current_percentile:100,flat_zero:false});
    withoutPopulation(s);
    syncHistoricalAverages(s,data.time_ranges.periods,end);
    s.historical_averages.seven_days.display='<0.01';
@@ -1092,64 +1154,75 @@ test('window_seconds, invalid non-null current value, and subnormal comparison c
 });
 
 test('time_ranges validation rejects invalid bounds, sub-24h tokens and bad provenance',()=>{
+ const hourPeriod=d=>d.time_ranges.periods.find(p=>p.window.unit==='hours');
+ const dayPeriod=d=>d.time_ranges.periods.find(p=>p.window.unit==='days');
+ const monPeriod=d=>d.time_ranges.periods.find(p=>p.window.unit==='months');
  for(const mutate of [
   d=>{delete d.time_ranges;},
   d=>{d.time_ranges.version=2;},
   d=>{d.time_ranges.extra=true;},
   d=>{d.time_ranges.periods=[];},
-  d=>{d.time_ranges.periods=Array.from({length:17},(_,i)=>({...structuredClone(d.time_ranges.periods[0]),id:`p${i}`,summary_key:`p_${i}`,export_suffix:`p${i}`}));},
-  d=>{d.time_ranges.periods=d.time_ranges.periods.filter(p=>p.window.unit!=='all_time');d.time_ranges.card_slots.fixed=['7d','6mo'];},
+  d=>{d.time_ranges.periods=Array.from({length:17},(_,i)=>({...structuredClone(dayPeriod(d)),id:`p${i}`,summary_key:`p_${i}`,export_suffix:`p${i}`}));},
+  d=>{d.time_ranges.periods=d.time_ranges.periods.filter(p=>p.window.unit!=='all_time');d.time_ranges.card_slots.fixed=['24h','6mo'];},
   d=>{const dup=structuredClone(d.time_ranges.periods.at(-1));dup.id='all2';dup.summary_key='all_two';dup.export_suffix='all-two';d.time_ranges.periods.push(dup);},
-  d=>{d.time_ranges.periods[0].id='24h';},
-  d=>{d.time_ranges.periods[0].id='1d';},
-  d=>{d.time_ranges.periods[0].id='1h';},
-  d=>{d.time_ranges.periods[0].id='30m';},
-  d=>{d.time_ranges.periods[0].id='60s';},
-  d=>{d.time_ranges.periods[0].id='1m';},
-  d=>{d.time_ranges.periods[0].id='foo-24h';},
-  d=>{d.time_ranges.periods[0].export_suffix='24h';},
-  d=>{d.time_ranges.periods[0].export_suffix='1h';},
-  d=>{d.time_ranges.periods[0].export_suffix='30m';},
-  d=>{d.time_ranges.periods[0].export_suffix='foo-24h';},
-  d=>{d.time_ranges.periods[0].summary_key='day';},
+  d=>{const dup=structuredClone(hourPeriod(d));dup.id='h2';dup.summary_key='hours_two';dup.export_suffix='h2';d.time_ranges.periods.push(dup);},
+  d=>{hourPeriod(d).id='12h';},
+  d=>{hourPeriod(d).export_suffix='12h';},
+  d=>{hourPeriod(d).window.count=12;},
+  d=>{hourPeriod(d).window.comparison_lag_days=1;},
+  d=>{hourPeriod(d).minimum_coverage=0.5;},
+  d=>{d.time_ranges.card_slots.fixed=['6mo','all'];},
+  d=>{d.time_ranges.legacy_aliases['24h']='1mo';},
+  d=>{dayPeriod(d).id='24h';},
+  d=>{dayPeriod(d).id='1d';},
+  d=>{dayPeriod(d).id='1h';},
+  d=>{dayPeriod(d).id='30m';},
+  d=>{dayPeriod(d).id='60s';},
+  d=>{dayPeriod(d).id='1m';},
+  d=>{dayPeriod(d).id='foo-24h';},
+  d=>{dayPeriod(d).export_suffix='24h';},
+  d=>{dayPeriod(d).export_suffix='1h';},
+  d=>{dayPeriod(d).export_suffix='30m';},
+  d=>{dayPeriod(d).export_suffix='foo-24h';},
+  d=>{dayPeriod(d).summary_key='day';},
   ...['hour','sampled_hour','hourly_relays','hourly_expected_relays','current24'].flatMap(key=>[
-   d=>{d.time_ranges.periods[0].summary_key=key;},
+   d=>{dayPeriod(d).summary_key=key;},
    d=>{d.time_ranges.legacy_aliases[key]='1mo';},
   ]),
-  d=>{d.time_ranges.periods[0].label='   ';},
-  d=>{d.time_ranges.periods[0].window.count=1;},
-  d=>{d.time_ranges.periods[0].window.count=36501;},
-  d=>{d.time_ranges.periods[0].window.comparison_lag_days=2;},
-  d=>{d.time_ranges.periods[1].window.count=0;},
-  d=>{d.time_ranges.periods[1].window.count=1201;},
+  d=>{dayPeriod(d).label='   ';},
+  d=>{dayPeriod(d).window.count=1;},
+  d=>{dayPeriod(d).window.count=36501;},
+  d=>{dayPeriod(d).window.comparison_lag_days=2;},
+  d=>{monPeriod(d).window.count=0;},
+  d=>{monPeriod(d).window.count=1201;},
   d=>{d.time_ranges.periods.at(-1).window.count=365;},
   d=>{d.time_ranges.periods.at(-1).window.comparison_lag_days=1;},
-  d=>{d.time_ranges.periods[0].minimum_coverage=-0;},
-  d=>{d.time_ranges.periods[0].minimum_coverage=-0.1;},
-  d=>{d.time_ranges.periods[0].minimum_coverage=1.1;},
-  d=>{d.time_ranges.periods[1].minimum_coverage=-0;},
-  d=>{d.time_ranges.periods[1].minimum_coverage=-0.1;},
-  d=>{d.time_ranges.periods[1].minimum_coverage=1.1;},
+  d=>{dayPeriod(d).minimum_coverage=-0;},
+  d=>{dayPeriod(d).minimum_coverage=-0.1;},
+  d=>{dayPeriod(d).minimum_coverage=1.1;},
+  d=>{monPeriod(d).minimum_coverage=-0;},
+  d=>{monPeriod(d).minimum_coverage=-0.1;},
+  d=>{monPeriod(d).minimum_coverage=1.1;},
   d=>{d.time_ranges.periods.at(-1).minimum_coverage=0.5;},
   d=>{d.time_ranges.periods.at(-1).minimum_coverage=-0;},
-  d=>{d.time_ranges.periods[0].minimum_comparison_windows=0;},
-  d=>{d.time_ranges.periods[0].minimum_comparison_windows=10001;},
+  d=>{dayPeriod(d).minimum_comparison_windows=0;},
+  d=>{dayPeriod(d).minimum_comparison_windows=10001;},
   d=>{d.time_ranges.default_range='missing';},
-  d=>{d.time_ranges.periods[0].label='🚀'.repeat(81);},
-  d=>{d.time_ranges.periods[0].average_label='🚀'.repeat(81);},
-  d=>{d.time_ranges.periods[0].plot_label='🚀'.repeat(81);},
-  d=>{d.time_ranges.periods[0].label='\uFEFF';},
-  d=>{d.time_ranges.periods[0].average_label='\x85';},
-  d=>{d.time_ranges.periods[0].plot_label='\x1f';},
+  d=>{dayPeriod(d).label='🚀'.repeat(81);},
+  d=>{dayPeriod(d).average_label='🚀'.repeat(81);},
+  d=>{dayPeriod(d).plot_label='🚀'.repeat(81);},
+  d=>{dayPeriod(d).label='\uFEFF';},
+  d=>{dayPeriod(d).average_label='\x85';},
+  d=>{dayPeriod(d).plot_label='\x1f';},
   d=>{d.time_ranges.legacy_aliases['🚀'.repeat(33)]='1mo';},
   d=>{d.time_ranges.legacy_aliases['7d']='1mo';},
   d=>{d.time_ranges.legacy_aliases['   ']='1mo';},
   d=>{d.time_ranges.legacy_aliases['\uFEFF']='1mo';},
   d=>{d.time_ranges.legacy_aliases['\x85']='1mo';},
   d=>{d.time_ranges.legacy_aliases['\x1c']='1mo';},
-  d=>{d.time_ranges.legacy_aliases['24h']='missing';},
+  d=>{d.time_ranges.legacy_aliases['legacy_missing']='missing';},
   d=>{d.time_ranges.card_slots.fixed=['6mo','6mo'];},
-  d=>{d.time_ranges.card_slots.fallback_dynamic='6mo';},
+  d=>{d.time_ranges.card_slots.fallback_dynamic='24h';},
   d=>{d.provenance.time_ranges_sha256='bad';},
   d=>{d.provenance.time_ranges_method_sha256='bad';},
  ]){
@@ -1158,9 +1231,9 @@ test('time_ranges validation rejects invalid bounds, sub-24h tokens and bad prov
   assert.throws(()=>checkData(data,current.manifest),/time_ranges|all_time|minimum_coverage|identity/);
  }
  const unicodeData=structuredClone(current.data);
- unicodeData.time_ranges.periods[0].label='🚀'.repeat(80);
- unicodeData.time_ranges.periods[0].average_label='🚀'.repeat(80);
- unicodeData.time_ranges.periods[0].plot_label='🚀'.repeat(80);
+ dayPeriod(unicodeData).label='🚀'.repeat(80);
+ dayPeriod(unicodeData).average_label='🚀'.repeat(80);
+ dayPeriod(unicodeData).plot_label='🚀'.repeat(80);
  unicodeData.time_ranges.legacy_aliases['🚀'.repeat(32)]='7d';
  assert.equal(checkData(unicodeData,current.manifest),unicodeData,
   'supplementary Unicode code-point counts match Python len() at 80 and 32 boundary');
@@ -1173,6 +1246,7 @@ test('time_ranges validation rejects invalid bounds, sub-24h tokens and bad prov
   const ch=current.data.charts.find(c=>c.id===cid);
   const prim=ch.series.find(s=>s.key===ch.primary_series)||ch.series[0];
   for(const p of current.data.time_ranges.periods){
+   if(p.window.unit==='hours')continue;
    const avg=prim.historical_averages[p.summary_key];
    assert.equal(avg.status,'ready',`${cid} ${p.id} is ready in rebuilt data`);
    assert.ok(avg.days>0&&Number.isFinite(avg.value));
@@ -1246,9 +1320,11 @@ test('custom arbitrary time_ranges and up to 512 manifest objects load with zero
  await assert.rejects(loader(server([overCap],overCap,null)).load(),/Invalid release objects/);
 });
 
-test('cold fallback admits a verified schema_version 5 previous release when v6 current fails',async()=>{
+test('schema_version 6 is admitted on root.current while v5 stays restricted to cold previous fallback',async()=>{
  const v5Previous=fixture('v5-prev',{
+  referenceChange:ref=>Object.assign(ref,toV6Ref(ref)),
   dataChange:data=>{
+   Object.assign(data,toV6Data(data));
    data.schema_version=5;
    delete data.time_ranges;
    delete data.provenance.time_ranges_sha256;
@@ -1261,17 +1337,47 @@ test('cold fallback admits a verified schema_version 5 previous release when v6 
  });
  assert.equal(v5Previous.manifest.data_schema_version,5);
  assert.equal(v5Previous.objects.size,2+source.charts.length*2);
- const brokenV6=fixture('v6-bad');
- const storage=server([brokenV6,v5Previous],brokenV6,v5Previous);
- storage.files.delete('releases/v6-bad/exports/transport_rejections-1mo.csv');
- const fallbackResult=await loader(storage).load();
- assert.equal(fallbackResult.descriptor.id,'v5-prev');
- assert.equal(fallbackResult.fallback,true);
- assert.equal(fallbackResult.data.schema_version,5);
- assert.equal(fallbackResult.objects.size,2+source.charts.length*2);
-
- // Reject v5 if offered as root.current without fallback.
- await assert.rejects(loader(server([v5Previous],v5Previous,null)).load(),/Unsupported release manifest/);
+ const v6Release=fixture('v6-rel',{
+  referenceChange:ref=>Object.assign(ref,toV6Ref(ref)),
+  dataChange:data=>Object.assign(data,toV6Data(data)),
+ });
+ assert.equal(v6Release.manifest.data_schema_version,6);
+ assert.equal(v6Release.objects.size,2+source.charts.length*6);
+ const brokenV7=fixture('v7-bad');
+ for(const [label,prev,expectedVer,expectedSize] of [
+  ['v5',v5Previous,5,2+source.charts.length*2],
+  ['v6',v6Release,6,2+source.charts.length*6],
+ ]){
+  const storage=server([brokenV7,prev],brokenV7,prev);
+  storage.files.delete('releases/v7-bad/exports/transport_rejections-24h.csv');
+  const fallbackResult=await loader(storage).load();
+  assert.equal(fallbackResult.descriptor.id,prev.descriptor.id);
+  assert.equal(fallbackResult.fallback,true);
+  assert.equal(fallbackResult.data.schema_version,expectedVer);
+  assert.equal(fallbackResult.objects.size,expectedSize);
+ }
+ // Primary v5 stays rejected, while primary v6 is admitted cleanly for zero-downtime v6->v7 rollout.
+ await assert.rejects(loader(server([v5Previous],v5Previous,null)).load(),/Unsupported release manifest/,'v5 rejected as root.current');
+ const v6Storage=server([v6Release],v6Release,null),v6Read=loader(v6Storage);
+ const v6Primary=await v6Read.load();
+ assert.equal(v6Primary.fallback,false);
+ assert.equal(v6Primary.data.schema_version,6);
+ assert.equal(v6Primary.objects.size,2+source.charts.length*6);
+ v6Storage.calls.length=0;
+ const v6Reused=await v6Read.load(v6Primary);
+ assert.equal(v6Reused.fallback,false);
+ assert.equal(v6Reused.descriptor.id,'v6-rel');
+ assert.deepEqual(v6Storage.calls.map(c=>c.key),['manifest.json']);
+ // Reject schema 6 if observation_end is non-midnight or if it injects an hours period or hourly keys.
+ const v6NonMid=fixture('v6-non-mid',{
+  referenceChange:ref=>Object.assign(ref,toV6Ref(ref)),
+  dataChange:data=>{Object.assign(data,toV6Data(data));},
+  manifestChange:m=>{m.observation_end+=3600;},
+ });
+ await assert.rejects(loader(server([v6NonMid],v6NonMid,null)).load(),/Invalid release provenance/);
+ const v6HoursData=structuredClone(v6Release.data);
+ v6HoursData.time_ranges=structuredClone(source.time_ranges);
+ assert.throws(()=>checkData(v6HoursData,v6Release.manifest),/Sub-24h time_ranges/);
  // Reject v5 if it injects unexpected time_ranges.
  const badV5=structuredClone(v5Previous.data);
  badV5.time_ranges=structuredClone(source.time_ranges);
@@ -1288,9 +1394,10 @@ test('cold fallback admits a verified schema_version 5 previous release when v6 
     if(f.primary===source.charts[1].id)f.primary='connection-rate';
    }
    data.time_ranges={
-    version:1,default_range:'7d',legacy_aliases:{},
-    card_slots:{fallback_dynamic:'7d',fixed:['rate7d','all']},
+    version:1,default_range:'24h',legacy_aliases:{},
+    card_slots:{fallback_dynamic:'7d',fixed:['24h','all']},
     periods:[
+     structuredClone(source.time_ranges.periods[0]),
      {id:'7d',summary_key:'seven_days',export_suffix:'7d',label:'7d',average_label:'7d',plot_label:'7d',window:{unit:'days',count:7,comparison_lag_days:0},minimum_coverage:0.9,minimum_comparison_windows:6},
      {id:'rate7d',summary_key:'rate_seven_days',export_suffix:'rate-7d',label:'r7d',average_label:'r7d',plot_label:'r7d',window:{unit:'days',count:14,comparison_lag_days:0},minimum_coverage:0.9,minimum_comparison_windows:6},
      structuredClone(source.time_ranges.periods.at(-1)),
@@ -1306,9 +1413,47 @@ test('cold fallback admits a verified schema_version 5 previous release when v6 
  assert.throws(()=>checkData(colliding.data,colliding.manifest),/Incomplete release object set/);
 });
 
+test('non-midnight hourly schema 7 release and hyphenated -24h.csv exports validate cleanly',async()=>{
+ const nonMid=fixture('non-mid-v7',{
+  exportSources:{'connection-rate':source.charts[0].id},
+  referenceChange:ref=>{
+   ref.distributions['connection-rate']=ref.distributions[source.charts[0].id];
+   delete ref.distributions[source.charts[0].id];
+  },
+  dataChange:data=>{
+   const shift=13*3600,dayEnd=data.end;
+   data.end=dayEnd+shift;data.start=data.end-86400;
+   data.charts[0].id='connection-rate';
+   for(const f of data.families){
+    f.children=f.children.map(id=>id===source.charts[0].id?'connection-rate':id);
+    if(f.primary===source.charts[0].id)f.primary='connection-rate';
+   }
+   for(const c of data.charts){
+    c.start=data.start;c.end=data.end;
+    for(const s of c.series){
+     withoutPopulation(s);
+     s.values=s.values.map(([t,v])=>[t+shift,v]);
+     s.hourly_relays=s.hourly_relays.map(([t,v])=>[t+shift,v]);
+     s.hourly_expected_relays=s.hourly_expected_relays.map(([t,v])=>[t+shift,v]);
+     s.current.hour.value=s.values[23][1];s.current.hour.relays=s.hourly_relays[23][1];
+     s.current.hour.expected_relays=s.hourly_expected_relays[23][1];
+     s.current.hour.coverage=s.current.hour.relays!=null?s.current.hour.relays/s.current.hour.expected_relays:null;
+     s.current.hour.valid=s.current.hour.value!==null&&s.current.hour.relays>=8&&s.current.hour.coverage>=0.9;
+    }
+   }
+  },
+ });
+ const loaded=await loader(server([nonMid],nonMid,null)).load();
+ assert.equal(loaded.manifest.data_schema_version,7);
+ assert.ok(loaded.objects.has('exports/connection-rate-24h.csv'));
+ assert.equal(loaded.data.end%86400,13*3600);
+});
+
 test('warm refresh does not promote a schema-5 active fallback bundle to current release status',async()=>{
  const v5Previous=fixture('v5-active',{
+  referenceChange:ref=>Object.assign(ref,toV6Ref(ref)),
   dataChange:data=>{
+   Object.assign(data,toV6Data(data));
    data.schema_version=5;
    delete data.time_ranges;
    delete data.provenance.time_ranges_sha256;
@@ -1319,9 +1464,9 @@ test('warm refresh does not promote a schema-5 active fallback bundle to current
    }
   },
  });
- const brokenV6=fixture('v6-broken');
- const storage=server([brokenV6,v5Previous],brokenV6,v5Previous);
- storage.files.delete('releases/v6-broken/exports/transport_rejections-1mo.csv');
+ const brokenV7=fixture('v7-broken');
+ const storage=server([brokenV7,v5Previous],brokenV7,v5Previous);
+ storage.files.delete('releases/v7-broken/exports/transport_rejections-24h.csv');
  const read=loader(storage);
  const environment=controllerBrowser(),render=renderer();
  const controller=createLiveController(environment.browser,render.make,{loader:read});
@@ -1369,10 +1514,15 @@ test('optional query_contract_sha256 provenance matches verified manifest when p
 
 test('signed negative zero (-0) is rejected across live data, reference and time_ranges checks',()=>{
  assert.deepEqual(Object.is(parseLiveJson(Buffer.from('[-0]'))[0],-0),true,'raw parser keeps parseLiveJson([-0]) contract');
- for(const [label,dataChange,rx] of [
+  for(const [label,dataChange,rx] of [
   ['history value',d=>{d.charts[0].series[0].history.daily[0][1]=-0;},/Invalid observation value/],
   ['history relays',d=>{d.charts[0].series[0].history.daily[0][2]=-0;},/Invalid historical observation/],
   ['history coverage',d=>{d.charts[0].series[0].history.daily[0][3]=-0;},/Invalid historical observation/],
+  ['hourly value ts',d=>{d.charts[0].series[0].values[0][0]=-0;},/Invalid hourly observation timestamp/],
+  ['hourly value',d=>{d.charts[0].series[0].values[0][1]=-0;},/Invalid hourly observation values/],
+  ['hourly relays',d=>{const s=d.charts[0].series[0];s.hourly_relays[0][1]=-0;s.values[0][1]=null;},/Invalid hourly observation values/],
+  ['current hour value',d=>{d.charts[0].series[0].current.hour.value=-0;},/Invalid current\/reference summary/],
+  ['current hour relays',d=>{d.charts[0].series[0].current.hour.relays=-0;},/Invalid current\/reference summary/],
   ['current value',d=>{d.charts[0].series[0].current.day.value=-0;},/Invalid current\/reference summary/],
   ['current relays',d=>{d.charts[0].series[0].current.day.relays=-0;},/Invalid current\/reference summary/],
   ['expected relays',d=>{d.charts[0].series[0].current.day.expected_relays=-0;},/Invalid current denominator/],
@@ -1404,11 +1554,13 @@ test('signed negative zero (-0) is rejected across live data, reference and time
  const negRef=structuredClone(originalReference);
  negRef.distributions[source.charts[0].id][source.charts[0].series[0].key].day[0][1]=-0;
  assert.throws(()=>checkReference(negRef,source),/Invalid observation value/);
+ const dayIdx=tr=>tr.periods.findIndex(p=>p.window.unit==='days');
+ const monIdx=tr=>tr.periods.findIndex(p=>p.window.unit==='months');
  for(const [patch,rx] of [
-  [tr=>{tr.periods[0].window.comparison_lag_days=-0;},/time_ranges.*window/],
+  [tr=>{tr.periods[dayIdx(tr)].window.comparison_lag_days=-0;},/time_ranges.*window/],
   [tr=>{tr.periods.at(-1).window.comparison_lag_days=-0;},/time_ranges.*window/],
-  [tr=>{tr.periods[0].window.unit=['days'];},/Unsupported time_ranges window unit/],
-  [tr=>{tr.periods[1].window.unit=['months'];},/Unsupported time_ranges window unit/],
+  [tr=>{tr.periods[dayIdx(tr)].window.unit=['days'];},/Unsupported time_ranges window unit/],
+  [tr=>{tr.periods[monIdx(tr)].window.unit=['months'];},/Unsupported time_ranges window unit/],
  ]){
   const tr=structuredClone(source.time_ranges);patch(tr);
   assert.throws(()=>validateTimeRanges(tr),rx);
@@ -1432,9 +1584,14 @@ test('signed negative zero (-0) is rejected across live data, reference and time
      chart.start=d.start;chart.end=d.end;
      const expected=Math.max(8,chart.relays);
      for(const s of chart.series){
-      withoutPopulation(s);s.history.daily=[];
+      withoutPopulation(s);s.history.daily=[];s.history.sampled_hour=[];
+      s.values=Array.from({length:24},(_,i)=>[d.start+(i+1)*3600,null]);
+      s.hourly_relays=Array.from({length:24},(_,i)=>[d.start+(i+1)*3600,null]);
+      s.hourly_expected_relays=Array.from({length:24},(_,i)=>[d.start+(i+1)*3600,expected]);
       s.current.day={value:null,relays:null,expected_relays:expected,coverage:null,valid:false};
+      s.current.hour={value:null,relays:null,expected_relays:expected,coverage:null,valid:false};
       s.reference.day={n:0,current_percentile:null,flat_zero:false,mean_per_relay:null};
+      s.reference.hour={n:0,current_percentile:null,flat_zero:false,mean_per_relay:null};
       syncHistoricalAverages(s,d.time_ranges.periods,d.end);
      }
     }

@@ -22,7 +22,7 @@ validation still follow parsing. See the [live-release contract](live-releases.m
 
 Allium's palette quantization, rebinning, uptime padding and incomplete-tail
 removal are measurement or image-rendering choices for a different workload.
-OnionSurge keeps its existing samples, gaps, direct 24-hour estimates and SVG
+OnionSurge keeps its existing samples, gaps, direct hourly and 24-hour estimates and SVG
 geometry. Its 13 charts do not justify Allium's large raster process pools.
 
 ## Reproduce the renderer comparison
@@ -37,7 +37,7 @@ node scripts/benchmark_charts.cjs --baseline /path/to/baseline-app.cjs
 
 The optional baseline is a CommonJS-compatible `site/app.js` with the same UI
 contract. `scripts/benchmark_charts.cjs` checks SVG rendering (`svgCases`) and markup rendering (`markupCases`),
-including every configured daily time range (`7d`, `1mo`, `3mo`, `6mo`, `12mo`, and `all` by default) in Grid and Full width. Only source-credit
+including hero views (`24h`, `7d`, `all`) and every configured time range (`24h`, `7d`, `1mo`, `3mo`, `6mo`, `12mo`, and `all` by default) in Grid and Full width. Only source-credit
 text and the credited empty-chart wrapper are normalized. Other output
 differences fail the comparison; a baseline predating intentional UI changes
 must be compared separately for chart geometry and measurements.
@@ -64,10 +64,9 @@ historical medians, not service-level guarantees.
 | Write all build outputs | 67.35 ms | 59.24 ms |
 
 A captured two-release replay reduced requests from 30 to 16 and decoded response
-bytes from 3,465,602 to 2,069,592. The 14 reused objects were 13 All time CSVs and
+bytes from 3,465,602 to 2,069,592 in that earlier `30d | all` benchmark. The 14 reused objects were 13 All time CSVs and
 the frozen reference. Their 1,396,010 bytes were 40.3% of that release's object
-payload. Reuse varies with the data: a new UTC day or reference generation can
-change those objects. Cold loads still obtain every required object.
+payload. Reuse varies with the data: an updated UTC hour/day or reference generation changes the affected objects. Cold loads still obtain every required object.
 
 The backend's sort-once change saved about 3 ms per build. Whole warm preparation
 measured 209.20 ms before and 206.13 ms after; it is a small build improvement.

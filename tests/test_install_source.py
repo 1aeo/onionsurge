@@ -163,7 +163,7 @@ class SourceInstallTests(unittest.TestCase):
     def test_admin_cli_reads_only_pinned_blobs_and_uses_strict_mock_ssh(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve(); home, _ = home_fixture(folder)
-            keyfile = root / 'publisher.pub'; keyfile.write_text(public_key() + ' stripped-comment\n')
+            keyfile = root / 'publisher.pub'; keyfile.write_text(public_key() + ' stripped-comment\n'); keyfile.chmod(0o600)
             evidence = root / 'evidence.json'; evidence.write_text(payload()['attestations']); evidence.chmod(0o600)
             receipt = root / 'receipt.json'; calls = []
             def run(arguments, **kwargs):
@@ -212,7 +212,7 @@ class SourceInstallTests(unittest.TestCase):
                     installer.install(bad, home)
 
             root = Path(folder).resolve()
-            keyfile = root / 'publisher.pub'; keyfile.write_text(public_key() + '\n')
+            keyfile = root / 'publisher.pub'; keyfile.write_text(public_key() + '\n'); keyfile.chmod(0o600)
             evidence = root / 'evidence.json'; evidence.write_text(payload()['attestations']); evidence.chmod(0o600)
             base_argv = ['--admin-target', 'SYNTHETIC_ADMIN', '--publisher-public-key', str(keyfile),
                          '--allowed-address', '127.0.0.1', '--attestations', str(evidence),
