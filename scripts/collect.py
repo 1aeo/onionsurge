@@ -795,14 +795,73 @@ def _resolve_overlap_variants(path):
     return (full_resolved,) if parent_resolved == full_resolved else (full_resolved, parent_resolved)
 
 
+def _deepest_existing_decompose(path):
+    """Return `(existing_ancestor, tail_parts)` for overlap comparison without modifying disk."""
+    for idx, candidate in enumerate((path, *path.parents)):
+        try:
+            info = candidate.lstat()
+        except OSError:
+            continue
+        if idx == 0 and stat.S_ISLNK(info.st_mode):
+            continue
+        return candidate, path.relative_to(candidate).parts
+    return path, ()
+
+
+def _is_case_insensitive_at(directory):
+    target = directory if directory.is_dir() else directory.parent
+    try:
+        target_dev = target.stat().st_dev
+        with os.scandir(target) as it:
+            for entry in it:
+                swapped = entry.name.swapcase()
+                if swapped == entry.name:
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                    other = (target / swapped).lstat()
+                except OSError:
+                    return False
+                return (info.st_dev, info.st_ino) == (other.st_dev, other.st_ino)
+        for candidate in (target, *target.parents):
+            name = candidate.name
+            swapped = name.swapcase()
+            if not name or swapped == name:
+                continue
+            if candidate.parent.stat().st_dev != target_dev:
+                break
+            try:
+                info = candidate.stat()
+                other = candidate.with_name(swapped).stat()
+            except OSError:
+                return False
+            return (info.st_dev, info.st_ino) == (other.st_dev, other.st_ino)
+    except OSError:
+        pass
+    return sys.platform == 'darwin'
+
+
+def _variant_overlaps(a, b):
+    if filesystem_contains(a, b) or filesystem_contains(b, a):
+        return True
+    anc_a, tail_a = _deepest_existing_decompose(a)
+    anc_b, tail_b = _deepest_existing_decompose(b)
+    try:
+        info_a, info_b = anc_a.lstat(), anc_b.lstat()
+    except OSError:
+        return False
+    if (info_a.st_dev, info_a.st_ino) != (info_b.st_dev, info_b.st_ino):
+        return False
+    if _is_case_insensitive_at(anc_a):
+        tail_a = tuple(part.casefold() for part in tail_a)
+        tail_b = tuple(part.casefold() for part in tail_b)
+    return (tail_b[:len(tail_a)] == tail_a) if len(tail_a) <= len(tail_b) else (tail_a[:len(tail_b)] == tail_b)
+
+
 def _paths_overlap(left, right):
     left_variants = _resolve_overlap_variants(left)
     right_variants = _resolve_overlap_variants(right)
-    return any(
-        filesystem_contains(a, b) or filesystem_contains(b, a)
-        for a in left_variants
-        for b in right_variants
-    )
+    return any(_variant_overlaps(a, b) for a in left_variants for b in right_variants)
 
 
 def _assert_disjoint(protected_paths, forbidden_paths, message):
@@ -838,11 +897,25 @@ def _cache_has_rows(db_path, *, require_table=False):
         raise CollectionError('Observation cache must be a private owned regular file') from error
     _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077),
              'Observation cache must be a private owned regular file')
+    sidecars = {}
+    for suffix in ('-wal', '-shm', '-journal'):
+        sidecar = db_path.with_name(db_path.name + suffix)
+        try:
+            s_info = sidecar.lstat()
+        except FileNotFoundError:
+            sidecars[suffix] = False
+        except OSError as error:
+            raise CollectionError('Observation cache sidecar must be a private owned regular file') from error
+        else:
+            _require(stat.S_ISREG(s_info.st_mode) and s_info.st_uid == os.geteuid() and not (s_info.st_mode & 0o077),
+                     'Observation cache sidecar must be a private owned regular file')
+            sidecars[suffix] = True
     if info.st_size == 0:
         _require(not require_table, 'Observation cache must contain committed rows before recording a checkpoint')
         return False
+    mode_query = 'mode=ro' if (sidecars['-wal'] or sidecars['-shm']) else 'mode=ro&immutable=1'
     try:
-        conn = sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?mode=ro', uri=True)
+        conn = sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?{mode_query}', uri=True)
         try:
             return conn.execute('SELECT 1 FROM observations LIMIT 1').fetchone() is not None
         except sqlite3.OperationalError as error:
@@ -864,7 +937,10 @@ def _inspect_warm_checkpoint(state, source_identity_sha256, now_hour):
     checkpoint_path = state / 'checkpoint.json'
     cp = None
     if os.path.lexists(checkpoint_path):
-        cp_raw = _read_bounded(checkpoint_path, MAX_CONFIG_BYTES, private=True)
+        try:
+            cp_raw = _read_bounded(checkpoint_path, MAX_CONFIG_BYTES, private=True)
+        except OSError as error:
+            raise CollectionError('Invalid collector checkpoint') from error
         cp = parse_json(cp_raw)
         _require(isinstance(cp, dict), 'Invalid collector checkpoint')
     has_rows = _cache_has_rows(state / 'observations.sqlite3', require_table=False)
@@ -879,12 +955,6 @@ def _inspect_warm_checkpoint(state, source_identity_sha256, now_hour):
 def _batch_capacity(step, *, population=False):
     max_pts = POPULATION_BATCH_POINTS if population else access.MAX_POINTS
     return max(1, min(max_pts, 1 + (access.MAX_RANGE // step)))
-
-
-def _batch_count(point_count, step, *, population=False):
-    if point_count <= 0:
-        return 0
-    return math.ceil(point_count / _batch_capacity(step, population=population))
 
 
 def _contiguous_run_batches(times, step, *, population=False):
@@ -905,129 +975,136 @@ def _contiguous_run_batches(times, step, *, population=False):
     return batches + math.ceil(run_len / cap)
 
 
-def _plan_max_requests(routes, queries, charts, end, *, warm_end, catchup_days):
-    """Return exact worst-case sequential gateway request count for collect()."""
-    requests = 1  # Initial catalogue handshake (`queries`).
-    virtual_hits = {routes['version.attestation_proof_metadata']: 2}
-    for cohort in COHORT_NAMES:
-        virtual_hits[routes[f'cohort.{cohort}_attested']] = 1
+def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
+    """Simulate Collector.collect traversal to bound worst-case sequential gateway calls."""
+    cached = {}
+    requests = 1  # Initial source.catalogue() handshake.
+    effective_warm = min(warm_end, baseline_end) if warm_end is not None else None
+    warm_day_cutoff = (effective_warm // DAY) * DAY if effective_warm is not None else None
+    warm_sh_cutoff = (effective_warm // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP if effective_warm is not None else None
 
-    hour_end_cached = set()
-    hour_end_covered = set()
-
-    def record_hour_end(query_id):
-        if query_id in VIRTUAL_QUERIES:
+    def fetch(query_id, step, times, *, population=False):
+        nonlocal requests
+        if not times:
             return
-        hour_end_cached.add(query_id)
+        if query_id in VIRTUAL_QUERIES:
+            requests += len(times)
+            return
+        seen = cached.setdefault((query_id, step), set())
+        missing = [t for t in times if t not in seen]
+        if not missing:
+            return
+        requests += _contiguous_run_batches(missing, step, population=population)
+        seen.update(missing)
 
-    for q_id, count in virtual_hits.items():
-        if q_id in VIRTUAL_QUERIES:
-            requests += count
-        else:
-            record_hour_end(q_id)
+    charts_by_id = {c['id']: c for c in seed['charts']}
+    for _, chart_id, _ in COHORT_ANCHORS:
+        if chart_id in charts_by_id:
+            fetch(routes[f'{chart_id}.current_hour.available'], HOUR, [end])
+
+    current_times = list(range(end - DAY + HOUR, end + 1, HOUR))
+    context_times = list(range(end - POPULATION_CONTEXT_DAYS * DAY, end + 1, HOUR))
+    target_day = (end // DAY) * DAY
+    target_sh = (end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+
+    for chart in seed['charts']:
+        cid = chart['id']
+        cur_hr_elig_q = routes[f'{cid}.current_hour.eligible']
+        cur_hr_avail_q = routes[f'{cid}.current_hour.available']
+        cur_hr_val_q = routes[f'{cid}.current_hour.value']
+        daily_elig_q = routes[f'{cid}.daily.eligible']
+        cur24_elig_q = routes[f'{cid}.current24.eligible']
+        pop_day_q = routes[f'{cid}.relay_population.day']
+        pop_hour_q = routes[f'{cid}.relay_population.hour']
+
+        for series in chart['series']:
+            fetch(cur_hr_elig_q, HOUR, context_times)
+            fetch(cur_hr_avail_q, HOUR, current_times)
+            fetch(cur_hr_val_q, HOUR, current_times)
+
+            history = series.get('history', {})
+            daily_rows = history.get('daily', [])
+            sh_rows = history.get('sampled_hour', [])
+            fetched_raw_n = set()
+            fetched_cur24 = False
+            final_daily_end = int(daily_rows[-1][0]) if daily_rows else None
+
+            if daily_rows:
+                daily_start = int(daily_rows[-1][0]) + DAY
+                if warm_day_cutoff is not None:
+                    daily_start = max(daily_start, warm_day_cutoff + DAY)
+                daily_times = list(range(daily_start, target_day + 1, DAY))
+                if daily_times:
+                    fetch(daily_elig_q, DAY, daily_times)
+                    fetch(routes[f'{cid}.daily.available'], DAY, daily_times)
+                    fetch(routes[f'{cid}.daily.value'], DAY, daily_times)
+                    fetched_raw_n.update(daily_times)
+                    final_daily_end = daily_times[-1]
+
+                if not sh_rows:
+                    raw_first = max(int(daily_rows[0][0]) - DAY + SAMPLED_HOUR_STEP,
+                                    target_sh - SAMPLED_HOUR_BACKFILL_MAX_DAYS * DAY)
+                    first_sh = ((raw_first + SAMPLED_HOUR_STEP - 1) // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+                else:
+                    first_sh = int(sh_rows[-1][0]) + SAMPLED_HOUR_STEP
+                if warm_sh_cutoff is not None:
+                    first_sh = max(first_sh, warm_sh_cutoff + SAMPLED_HOUR_STEP)
+                sh_times = list(range(first_sh, target_sh + 1, SAMPLED_HOUR_STEP))
+                if sh_times:
+                    fetch(routes[f'{cid}.sampled_hour.eligible'], SAMPLED_HOUR_STEP, sh_times)
+                    fetch(routes[f'{cid}.sampled_hour.available'], SAMPLED_HOUR_STEP, sh_times)
+                    fetch(routes[f'{cid}.sampled_hour.value'], SAMPLED_HOUR_STEP, sh_times)
+
+                if not (end % DAY == 0 and final_daily_end == end):
+                    fetch(cur24_elig_q, HOUR, [end])
+                    fetch(routes[f'{cid}.current24.available'], HOUR, [end])
+                    fetch(routes[f'{cid}.current24.value'], HOUR, [end])
+                    fetched_cur24 = True
+
+            expected_c = {int(r[0]): r[2] for r in daily_rows if r[4]}
+            for t in fetched_raw_n:
+                expected_c[t] = None
+            retained = series.get('relay_population', {})
+            retained_day_ok = (retained.get('method') == POPULATION_METHOD
+                               and retained.get('queries', {}).get('day') == queries.get(pop_day_q))
+            reused_dates = (
+                {int(r[0]) for r in retained.get('daily', [])
+                 if int(r[0]) in expected_c and expected_c[int(r[0])] is not None and r[1] == expected_c[int(r[0])]}
+                if retained_day_ok else set()
+            )
+            targets = sorted(expected_c.keys() - reused_dates)
+            if warm_day_cutoff is not None:
+                targets = [t for t in targets if t > warm_day_cutoff]
+            if targets:
+                missing_n = [t for t in targets if t not in fetched_raw_n]
+                if missing_n:
+                    fetch(daily_elig_q, DAY, missing_n)
+                fetch(pop_day_q, DAY, targets, population=True)
+
+            if daily_rows:
+                cur_day_n = series.get('current', {}).get('day', {}).get('relays')
+                reused_day_end = (end in reused_dates)
+                reuses_seed_day = (not fetched_raw_n and not fetched_cur24 and end == seed['end']
+                                   and end % DAY == 0 and retained_day_ok
+                                   and retained.get('day') is not None and retained['day'][1] == cur_day_n)
+                if not (reused_day_end and end % DAY == 0 and final_daily_end == end) and not reuses_seed_day:
+                    if end not in fetched_raw_n and not fetched_cur24:
+                        fetch(cur24_elig_q, HOUR, [end])
+                    fetch(pop_day_q, HOUR, [end])
+
+            fetch(cur_hr_elig_q, HOUR, [end])
+            fetch(pop_hour_q, HOUR, [end])
+
+    proof_q = routes['version.attestation_proof_metadata']
+    fetch(proof_q, HOUR, [end])
     for cohort in COHORT_NAMES:
-        record_hour_end(routes[f'cohort.{cohort}_verified_binary'])
-    for k in METADATA_KEYS:
-        record_hour_end(routes[f'metadata.{k}'])
+        fetch(routes[f'cohort.{cohort}_verified_binary'], HOUR, [end])
+        fetch(routes[f'cohort.{cohort}_attested'], HOUR, [end])
+    fetch(proof_q, HOUR, [end])
+    for key in METADATA_KEYS:
+        fetch(routes[f'metadata.{key}'], HOUR, [end])
     for _, op in DIRCACHE_OPERATIONS:
-        record_hour_end(routes[f'dircache.{op}'])
-
-    chart_ids = {c['id'] for c in charts}
-    anchor_avail = {routes[f'{cid}.current_hour.available'] for _, cid, _ in COHORT_ANCHORS if cid in chart_ids}
-    context_points = (POPULATION_CONTEXT_DAYS * DAY) // HOUR + 1
-    hour_points = DAY // HOUR
-
-    for q_id in {routes[f'{c["id"]}.current_hour.eligible'] for c in charts}:
-        requests += _batch_count(context_points, HOUR)
-        hour_end_covered.add(q_id)
-    for q_id in {routes[f'{c["id"]}.current_hour.available'] for c in charts}:
-        if q_id in anchor_avail:
-            requests += 1 + _batch_count(hour_points - 1, HOUR)
-        else:
-            requests += _batch_count(hour_points, HOUR)
-        hour_end_covered.add(q_id)
-    for q_id in {routes[f'{c["id"]}.current_hour.value'] for c in charts}:
-        requests += _batch_count(hour_points, HOUR)
-        hour_end_covered.add(q_id)
-
-    for c in charts:
-        record_hour_end(routes[f'{c["id"]}.relay_population.hour'])
-
-    daily_charts = [c for c in charts if any(s.get('history', {}).get('daily') for s in c['series'])]
-    if daily_charts:
-        for c in daily_charts:
-            for stat_name in ('eligible', 'available', 'value'):
-                record_hour_end(routes[f'{c["id"]}.current24.{stat_name}'])
-            record_hour_end(routes[f'{c["id"]}.relay_population.day'])
-    else:
-        for c in charts:
-            record_hour_end(routes[f'{c["id"]}.relay_population.day'])
-
-    requests += len(hour_end_cached - hour_end_covered)
-
-    if daily_charts:
-        daily_step_queries = {
-            routes[f'{c["id"]}.daily.{stat_name}']
-            for c in daily_charts for stat_name in ('eligible', 'available', 'value')
-        }
-        requests += len(daily_step_queries) * _batch_count(catchup_days, DAY)
-
-        target_sh = (end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
-        sh_earliest_by_q = {}
-        for c in daily_charts:
-            missing_sh = [int(s['history']['daily'][0][0]) for s in c['series']
-                          if s.get('history', {}).get('daily') and not s['history'].get('sampled_hour')]
-            if missing_sh and warm_end is None:
-                earliest_start = min(missing_sh)
-                for stat_name in ('eligible', 'available', 'value'):
-                    q_id = routes[f'{c["id"]}.sampled_hour.{stat_name}']
-                    prev = sh_earliest_by_q.get(q_id)
-                    sh_earliest_by_q[q_id] = earliest_start if prev is None else min(prev, earliest_start)
-        sh_queries = {
-            routes[f'{c["id"]}.sampled_hour.{stat_name}']
-            for c in daily_charts for stat_name in ('eligible', 'available', 'value')
-        }
-        for q_id in sh_queries:
-            if q_id in sh_earliest_by_q:
-                raw_first = max(sh_earliest_by_q[q_id] - DAY + SAMPLED_HOUR_STEP,
-                                target_sh - SAMPLED_HOUR_BACKFILL_MAX_DAYS * DAY)
-                first_sh = ((raw_first + SAMPLED_HOUR_STEP - 1) // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
-                sh_pts = max(0, ((target_sh - first_sh) // SAMPLED_HOUR_STEP) + 1)
-            else:
-                sh_pts = catchup_days * (DAY // SAMPLED_HOUR_STEP)
-            requests += _batch_count(sh_pts, SAMPLED_HOUR_STEP)
-
-        pop_day_queries = {routes[f'{c["id"]}.relay_population.day'] for c in daily_charts}
-        requests += len(pop_day_queries) * _batch_count(catchup_days, DAY, population=True)
-
-        if warm_end is None:
-            missing_pop_by_q = {}
-            missing_elig_by_q = {}
-            for c in daily_charts:
-                pop_q = routes[f'{c["id"]}.relay_population.day']
-                elig_q = routes[f'{c["id"]}.daily.eligible']
-                for s in c['series']:
-                    daily_rows = s.get('history', {}).get('daily', [])
-                    if not daily_rows:
-                        continue
-                    seed_end_daily = int(daily_rows[-1][0])
-                    qualified = {int(r[0]): r[2] for r in daily_rows if r[4] and int(r[0]) <= seed_end_daily}
-                    retained = s.get('relay_population', {})
-                    if (retained.get('method') == POPULATION_METHOD
-                            and retained.get('queries', {}).get('day') == queries.get(pop_q)):
-                        present = {int(r[0]) for r in retained.get('daily', [])
-                                   if int(r[0]) in qualified and r[1] == qualified[int(r[0])]}
-                    else:
-                        present = set()
-                    gap_dates = qualified.keys() - present
-                    if gap_dates:
-                        missing_pop_by_q.setdefault(pop_q, set()).update(gap_dates)
-                        missing_elig_by_q.setdefault(elig_q, set()).update(gap_dates)
-            for q_id, dates in missing_pop_by_q.items():
-                requests += _contiguous_run_batches(dates, DAY, population=True)
-            for q_id, dates in missing_elig_by_q.items():
-                requests += _contiguous_run_batches(dates, DAY, population=False)
-
+        fetch(routes[f'dircache.{op}'], HOUR, [end])
     return requests
 
 
@@ -1047,14 +1124,6 @@ def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
     seed_path, private_seed = resolve_seed_path(config, app, seed)
     catalogue_dir = (app / 'catalogue') if (app / 'catalogue/queries.json').is_file() else (ROOT / 'catalogue')
     queries_path, routes_path = catalogue_dir / 'queries.json', catalogue_dir / 'routes.json'
-    if output is not None:
-        out = Path(output).absolute()
-        _require(out.resolve() not in {seed_path.resolve(), seed_path.absolute(),
-                                        (state / 'observations.sqlite3').resolve(),
-                                        (state / 'checkpoint.json').resolve(),
-                                        (state / 'collect.lock').resolve(),
-                                        queries_path.resolve(), routes_path.resolve()},
-                 'Collector output overlaps its source, catalogue, or cache')
     known_hosts_bytes = None
     if require_ssh:
         _, identity_path, known_hosts_path, _, _, known_hosts_bytes = _validate_ssh_files(config)
@@ -1071,6 +1140,22 @@ def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
                 raise CollectionError('Source SSH file must be a readable regular file') from error
         if known_hosts_path is not None and os.path.lexists(known_hosts_path):
             known_hosts_bytes = _read_bounded(known_hosts_path, MAX_KNOWN_HOSTS_BYTES)
+    if output is not None:
+        out = Path(output).absolute()
+        state_files = tuple(
+            state / name for name in (
+                'observations.sqlite3', 'observations.sqlite3-wal', 'observations.sqlite3-shm',
+                'observations.sqlite3-journal', 'checkpoint.json', 'collect.lock',
+            )
+        )
+        protected_out = [p for p in (cfg_path, identity_path, known_hosts_path, seed_path,
+                                     queries_path, routes_path, *state_files) if p is not None]
+        _assert_disjoint([out], protected_out, 'Collector output overlaps its source, catalogue, or cache')
+        # Output cannot overwrite state_dir itself or enclose it, while unrelated files inside state_dir remain permitted.
+        _require(not any(filesystem_contains(ov, sv)
+                         for ov in _resolve_overlap_variants(out)
+                         for sv in _resolve_overlap_variants(state)),
+                 'Collector output overlaps its source, catalogue, or cache')
     if private_seed:
         seed_conflicts = [state] + ([cfg_path] if cfg_path is not None else [])
         _assert_disjoint([seed_path], seed_conflicts, 'Configured seed snapshot overlaps source config or state directory')
@@ -1135,8 +1220,8 @@ def plan_collection(config, application_dir, state_dir, previous_end=None, max_c
         baseline_end = min(previous_end, baseline_end)
     catchup_days = 1 if target_end <= baseline_end else max(1, math.ceil((target_end - baseline_end) / DAY))
     _require(catchup_days <= max_catchup_days, 'Catch-up exceeds automated window; run manual collection first')
-    max_requests = _plan_max_requests(ctx['routes'], ctx['queries'], seed_obj['charts'], target_end,
-                                      warm_end=warm_end, catchup_days=catchup_days)
+    max_requests = _plan_max_requests(ctx['routes'], ctx['queries'], seed_obj, target_end,
+                                      warm_end=warm_end, baseline_end=baseline_end)
     timeout_s = max_requests * SOURCE_REQUEST_TIMEOUT + COLLECTION_OVERHEAD_SECONDS
     return {'snapshot_end': target_end, 'catchup_days': catchup_days, 'recommended_timeout_seconds': timeout_s}
 

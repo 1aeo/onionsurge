@@ -25,6 +25,7 @@ class PackagingChecks(unittest.TestCase):
         (root / 'style.css').write_text('body{color:green}')
         (root / 'app.js').write_text('void window.ONIONSURGE_DATA;')
         (root / 'data.js').write_text('window.ONIONSURGE_DATA={"value":"</script><script>alert(1)</script>"};')
+        (root / 'data.json').write_text('{"schema_version":7}\n')
         self.update_manifest(root)
 
     def update_manifest(self, root):
@@ -33,7 +34,7 @@ class PackagingChecks(unittest.TestCase):
         (root/'build-manifest.json').write_text(json.dumps({
             'format': previews.BUILD_FORMAT,
             'schema_version': 7,
-            'release_objects': ['data.json'],
+            'release_objects': ['data.json'] if 'data.json' in files else ['data.js'],
             'files': files,
         })+'\n')
 
@@ -554,3 +555,28 @@ class PackagingChecks(unittest.TestCase):
             (root / 'build-manifest.json').write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, 'aliases a regenerated preview'):
                 previews.package(root)
+
+    def test_manifest_rejects_tampered_schema_version_or_release_objects(self):
+        bad_cases = [
+            ('schema_version', 'evil', 'schema_version'),
+            ('schema_version', True, 'schema_version'),
+            ('schema_version', 0, 'schema_version'),
+            ('schema_version', -7, 'schema_version'),
+            ('release_objects', 'data.json', 'release_objects'),
+            ('release_objects', [123], 'release_objects'),
+            ('release_objects', [{'evil': 1}], 'release_objects'),
+            ('release_objects', ['../etc/passwd'], 'release_objects'),
+            ('release_objects', ['design-1.html'], 'release_objects'),
+            ('release_objects', ['data.json', 'data.json'], 'release_objects'),
+            ('release_objects', ['nonexistent.csv'], 'release_objects'),
+        ]
+        for field, value, pattern in bad_cases:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as name:
+                root = Path(name) / 'dist'
+                root.mkdir()
+                self.fixture(root)
+                manifest = json.loads((root / 'build-manifest.json').read_text())
+                manifest[field] = value
+                (root / 'build-manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, pattern):
+                    previews.package(root)

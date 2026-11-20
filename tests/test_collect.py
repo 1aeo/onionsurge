@@ -1609,6 +1609,106 @@ class CollectorTests(unittest.TestCase):
                 collector.plan_collection(dict(cfg, SOURCE_SSH_KNOWN_HOSTS_FILE=str(sym_kh)),
                                           ROOT, state_dir, end=seed_end, config_path=cfg_file)
 
+    def test_verifier_edge_cases_staggered_gaps_sidecars_wal_output_and_case_aliases(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, id_file, kh_file = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+
+            # 1. Staggered/interleaved relay_population.daily gaps across multi-series/shared-query charts.
+            staggered = copy.deepcopy(base_v4)
+            for c_idx, chart in enumerate(staggered['charts']):
+                for s_idx, series in enumerate(chart['series']):
+                    pop_daily = series.get('relay_population', {}).get('daily', [])
+                    if len(pop_daily) >= 6:
+                        offset = (c_idx + s_idx) % 2
+                        series['relay_population']['daily'] = [
+                            row for i, row in enumerate(pop_daily)
+                            if not (2 <= i < len(pop_daily) - 2 and i % 2 == offset)
+                        ]
+            stag_app = root / 'stag_app'
+            (stag_app / 'inputs').mkdir(parents=True)
+            (stag_app / 'inputs/snapshot.json').write_text(json.dumps(staggered))
+            end_stag = seed_end + HOUR
+            stag_plan = collector.plan_collection(cfg, stag_app, root / 'stag_state', end=end_stag, config_path=cfg_file)
+            stag_planned = (stag_plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
+            stag_src = SyntheticSource(queries, _snapshot_handlers(staggered, routes, rate_val=1.0))
+            stag_res = collector.collect(cfg, stag_app, root / 'stag_state', root / 'stag_out.json',
+                                         end=end_stag, source=stag_src, config_path=cfg_file)
+            self.assertLessEqual(stag_res['source_requests'], stag_planned)
+
+            # 2. Output cannot overwrite source.env, SSH keys, known_hosts, state_dir itself, or SQLite sidecars.
+            state_dir = root / 'state_out'
+            for bad_out in (
+                cfg_file,
+                id_file,
+                kh_file,
+                state_dir,
+                state_dir / 'observations.sqlite3-wal',
+                state_dir / 'observations.sqlite3-shm',
+                state_dir / 'observations.sqlite3-journal',
+            ):
+                src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+                with self.subTest(bad_out=str(bad_out)), self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                    collector.collect(cfg, ROOT, state_dir, bad_out, end=end_stag, source=src, config_path=cfg_file)
+
+            # 3. Read-only WAL inspection works under mode 0500 state_dir without creating -wal/-shm, and rejects bad sidecars.
+            wal_state = root / 'wal_state'
+            wal_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            collector.collect(cfg, ROOT, wal_state, root / 'wal_out.json', end=end_stag, source=wal_src, config_path=cfg_file)
+            db_path = wal_state / 'observations.sqlite3'
+            with closing(sqlite3.connect(db_path)) as db:
+                db.execute('PRAGMA journal_mode=WAL')
+                db.commit()
+            for sfx in ('-wal', '-shm'):
+                (wal_state / f'observations.sqlite3{sfx}').unlink(missing_ok=True)
+            wal_state.chmod(0o500)
+            try:
+                wal_plan = collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
+                self.assertEqual(wal_plan['catchup_days'], 1)
+                self.assertFalse((wal_state / 'observations.sqlite3-wal').exists())
+                self.assertFalse((wal_state / 'observations.sqlite3-shm').exists())
+            finally:
+                wal_state.chmod(0o700)
+
+            for suffix in ('-wal', '-shm', '-journal'):
+                sidecar = wal_state / f'observations.sqlite3{suffix}'
+                sidecar.symlink_to(root / 'missing-sidecar')
+                with self.subTest(symlink_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
+                    collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
+                with self.subTest(ckpt_symlink_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
+                    collector.record_checkpoint(cfg, ROOT, wal_state, end=end_stag, config_path=cfg_file)
+                sidecar.unlink()
+                sidecar.write_bytes(b'sidecar')
+                sidecar.chmod(0o644)
+                with self.subTest(mode_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
+                    collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
+                sidecar.unlink()
+
+            # Symlink checkpoint.json fails closed with CollectionError during --plan.
+            cp_file = wal_state / 'checkpoint.json'
+            cp_file.unlink()
+            cp_file.symlink_to(root / 'missing-cp.json')
+            with self.assertRaisesRegex(collector.CollectionError, 'checkpoint'):
+                collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
+
+            # 4. Existing/non-existent case aliases caught on case-insensitive filesystems (e.g. macOS APFS).
+            existing_dir = root / 'ExistingDir'
+            existing_dir.mkdir()
+            case_insensitive = (root / 'existingdir').exists()
+            self.assertEqual(collector._paths_overlap(root / 'ExistingDir/sub', root / 'existingdir/sub'), case_insensitive)
+            self.assertEqual(collector._paths_overlap(root / 'ExistingDir/Sub/child', root / 'existingdir/sub'), case_insensitive)
+            self.assertEqual(collector._paths_overlap(root / 'NonExistent/sub', root / 'nonexistent/sub'), case_insensitive)
+            if case_insensitive:
+                with self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                    collector.plan_collection(cfg, ROOT, root / 'StateCase/collector', end=seed_end,
+                                              config_path=cfg_file, forbid_overlap=[root / 'statecase/collector'])
+
 
 if __name__ == '__main__':
     unittest.main()
