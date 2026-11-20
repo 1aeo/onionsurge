@@ -1339,7 +1339,6 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                     data = Collector(source, cache, queries, routes, seed_obj).collect(target_end, ctx['seed_sha'])
                     validate_snapshot(data)
                     atomic_json(out, data)
-                    cache.record_completion(source_id, target_end)
                 except BaseException:
                     try:
                         cache.rollback()
@@ -1347,6 +1346,7 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                         pass
                     raise
                 try:
+                    cache.record_completion(source_id, target_end)
                     cache.commit()
                 except (sqlite3.Error, OSError):
                     try:

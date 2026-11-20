@@ -781,7 +781,7 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(before_completions, [(END - DAY,)])
 
             (app_dir / 'inputs/snapshot.json').write_text(committed_before)
-            for mode in ('validation', 'write', 'commit', 'checkpoint_write'):
+            for mode in ('validation', 'write', 'record_completion', 'commit', 'checkpoint_write'):
                 calls = {'n': 0}
                 def validate_output_fail(data, **kwargs):
                     calls['n'] += 1
@@ -798,13 +798,18 @@ class CollectorTests(unittest.TestCase):
                                 with self.assertRaisesRegex(OSError, 'disk full'):
                                     collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(out_path.read_text(), committed_before)
-                        elif mode == 'commit':
+                        elif mode in {'record_completion', 'commit'}:
                             stderr = io.StringIO()
                             real_cache_cls = collector.ObservationCache
-                            class FailingCommitCache(real_cache_cls):
-                                def commit(self):
-                                    raise sqlite3.OperationalError('simulated lock')
-                            with mock.patch.object(collector, 'ObservationCache', FailingCommitCache), redirect_stderr(stderr):
+                            if mode == 'record_completion':
+                                class FailingCache(real_cache_cls):
+                                    def record_completion(self, source_identity, observation_end):
+                                        raise sqlite3.OperationalError('simulated completion insert failure')
+                            else:
+                                class FailingCache(real_cache_cls):
+                                    def commit(self):
+                                        raise sqlite3.OperationalError('simulated lock')
+                            with mock.patch.object(collector, 'ObservationCache', FailingCache), redirect_stderr(stderr):
                                 summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(summary['snapshot_end'], END)
                             self.assertFalse(summary['cache_committed'])
