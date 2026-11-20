@@ -30,6 +30,7 @@ class SyntheticSource:
     def __init__(self, queries, handlers):
         self.queries, self.handlers = queries, handlers
         self.calls = []
+        self.catalogue_calls = 0
         self.transform = lambda response: response
 
     @property
@@ -37,6 +38,7 @@ class SyntheticSource:
         return len(self.calls)
 
     def catalogue(self):
+        self.catalogue_calls += 1
         return self.queries
 
     def query(self, key, begin, end, step):
@@ -310,7 +312,14 @@ class SourceConfigAndCliTests(unittest.TestCase):
                 'SOURCE_SSH_KNOWN_HOSTS_FILE="${HOME}/.ssh/onionsurge_known_hosts"',
             ]) + '\n')
             cfg.chmod(0o600)
-            summary = {'snapshot_end': END, 'charts': 4, 'series': 5, 'source_requests': 1, 'cache_committed': True}
+            summary = {
+                'snapshot_end': END,
+                'charts': 4,
+                'series': 5,
+                'source_requests': 1,
+                'cache_committed': True,
+                'checkpoint_updated': True,
+            }
             stdout = io.StringIO()
             with mock.patch.object(collector, 'collect', return_value=summary) as mocked, redirect_stdout(stdout):
                 collector.main([
@@ -756,6 +765,7 @@ class CollectorTests(unittest.TestCase):
             with mock.patch.object(collector, 'validate_snapshot'):
                 initial_summary = collector.collect({}, app_dir, state_dir, out_path, end=END - DAY, source=fixture.source)
             self.assertTrue(initial_summary['cache_committed'])
+            self.assertTrue(initial_summary['checkpoint_updated'])
             checkpoint_path = state_dir / 'checkpoint.json'
             self.assertTrue(checkpoint_path.is_file())
             self.assertEqual(stat.S_IMODE(checkpoint_path.lstat().st_mode), 0o600)
@@ -765,11 +775,13 @@ class CollectorTests(unittest.TestCase):
             with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
                 before_rows = db.execute('SELECT count(*) FROM observations').fetchone()[0]
                 before_end_rows = db.execute('SELECT count(*) FROM observations WHERE endpoint=?', (END,)).fetchone()[0]
+                before_completions = db.execute('SELECT observation_end FROM collection_completions').fetchall()
             self.assertGreater(before_rows, 0)
             self.assertEqual(before_end_rows, 0)
+            self.assertEqual(before_completions, [(END - DAY,)])
 
             (app_dir / 'inputs/snapshot.json').write_text(committed_before)
-            for mode in ('validation', 'write', 'commit'):
+            for mode in ('validation', 'write', 'commit', 'checkpoint_write'):
                 calls = {'n': 0}
                 def validate_output_fail(data, **kwargs):
                     calls['n'] += 1
@@ -796,9 +808,30 @@ class CollectorTests(unittest.TestCase):
                                 summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(summary['snapshot_end'], END)
                             self.assertFalse(summary['cache_committed'])
+                            self.assertFalse(summary['checkpoint_updated'])
                             self.assertEqual(json.loads(out_path.read_text())['end'], END)
                             self.assertIn('observation cache commit failed after snapshot publication', stderr.getvalue())
                             out_path.write_text(committed_before)
+                        elif mode == 'checkpoint_write':
+                            stderr = io.StringIO()
+                            real_atomic_json = collector.atomic_json
+                            def fail_checkpoint_only(path, value):
+                                if Path(path).name == 'checkpoint.json':
+                                    raise OSError('checkpoint disk full')
+                                return real_atomic_json(path, value)
+                            with mock.patch.object(collector, 'atomic_json', side_effect=fail_checkpoint_only), redirect_stderr(stderr):
+                                summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
+                            self.assertEqual(summary['snapshot_end'], END)
+                            self.assertTrue(summary['cache_committed'])
+                            self.assertFalse(summary['checkpoint_updated'])
+                            self.assertEqual(json.loads(out_path.read_text())['end'], END)
+                            self.assertIn('collector checkpoint update failed after snapshot publication', stderr.getvalue())
+                            self.assertEqual(checkpoint_path.read_bytes(), initial_cp)
+                            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                                completions = sorted(row[0] for row in db.execute(
+                                    'SELECT observation_end FROM collection_completions'))
+                            self.assertEqual(completions, [END - DAY, END])
+                            continue
                         else:
                             with self.assertRaisesRegex(ValueError, 'simulated output validation failure'):
                                 collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
@@ -807,7 +840,10 @@ class CollectorTests(unittest.TestCase):
                     with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
                         after_rows = db.execute('SELECT count(*) FROM observations').fetchone()[0]
                         after_end_rows = db.execute('SELECT count(*) FROM observations WHERE endpoint=?', (END,)).fetchone()[0]
+                        after_completions = db.execute('SELECT observation_end FROM collection_completions').fetchall()
                     self.assertEqual(after_rows, before_rows)
+                    self.assertEqual(after_end_rows, 0)
+                    self.assertEqual(after_completions, before_completions)
                     self.assertEqual(after_end_rows, 0)
 
     def test_chained_collection_preserves_binary_hash_counts(self):
@@ -1405,14 +1441,16 @@ class CollectorTests(unittest.TestCase):
             src = SyntheticSource(queries, handlers)
             summary = collector.collect(cfg, app_dir, missing_state, out1, end=end1, source=src, config_path=cfg_file)
             self.assertTrue(summary['cache_committed'])
-            self.assertLessEqual(summary['source_requests'], planned_reqs)
+            self.assertTrue(summary['checkpoint_updated'])
+            self.assertEqual(src.catalogue_calls, 1)
+            self.assertLessEqual(summary['source_requests'] + src.catalogue_calls, planned_reqs)
 
             # Warm plan 2 days ahead uses checkpoint observation_end (catchup_days == 2), not seed_end (3).
             end2 = seed_end + 2 * DAY + 3 * HOUR
             warm_plan = collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
             self.assertEqual(warm_plan['catchup_days'], 2)
 
-            # Changing source.env, known_hosts, seed, queries, or clearing DB rows invalidates warm_end -> cold (3d).
+            # Changing source.env, known_hosts, seed, queries, or routes invalidates warm_end -> cold (3d).
             cfg_orig = cfg_file.read_text()
             cfg_file.write_text(cfg_orig + '# rotated\n')
             self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
@@ -1434,16 +1472,32 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
             (app_dir / 'catalogue/queries.json').write_text(json.dumps(queries))
 
-            # previous_end clamps baseline_end backwards; previous_end > end fails; catchup_days > max_catchup_days fails.
+            r_alt = copy.deepcopy(routes)
+            r_alt['_note'] = r_alt['metadata.up']
+            (app_dir / 'catalogue/routes.json').write_text(json.dumps(r_alt))
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            (app_dir / 'catalogue/routes.json').write_text(json.dumps(routes))
+
+            # previous_end clamps baseline_end backwards; previous_end > end fails; distinguish previous_end vs base window limits.
             clamped = collector.plan_collection(cfg, app_dir, missing_state, previous_end=seed_end - DAY, end=end2, config_path=cfg_file)
             self.assertEqual(clamped['catchup_days'], 4)
             with self.assertRaisesRegex(collector.CollectionError, 'precedes'):
                 collector.plan_collection(cfg, app_dir, missing_state, previous_end=end2 + HOUR, end=end2, config_path=cfg_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'manual publication workflow'):
+                collector.plan_collection(cfg, app_dir, missing_state, previous_end=seed_end - DAY, max_catchup_days=2, end=end2, config_path=cfg_file)
             with self.assertRaisesRegex(collector.CollectionError, 'manual collection'):
                 collector.plan_collection(cfg, app_dir, missing_state, max_catchup_days=1, end=end2, config_path=cfg_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'manual collection'):
+                collector.plan_collection(cfg, app_dir, missing_state, previous_end=seed_end - 2 * DAY, max_catchup_days=1, end=end2, config_path=cfg_file)
 
-            # Empty DB (0 committed rows) disables warm_end cleanly.
+            # Missing completion row (despite non-empty observations) and empty DB (0 committed rows) both disable warm_end cleanly.
             with closing(sqlite3.connect(missing_state / 'observations.sqlite3')) as db:
+                comp_backup = db.execute('SELECT source_identity, observation_end FROM collection_completions').fetchall()
+                db.execute('DELETE FROM collection_completions')
+                db.commit()
+            self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
+            with closing(sqlite3.connect(missing_state / 'observations.sqlite3')) as db:
+                db.executemany('INSERT INTO collection_completions VALUES (?, ?)', comp_backup)
                 db.execute('DELETE FROM observations')
                 db.commit()
             self.assertEqual(collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)['catchup_days'], 3)
@@ -1462,7 +1516,8 @@ class CollectorTests(unittest.TestCase):
             short_res = collector.collect(cfg, v3_short_app, root / 'v3_s2', root / 'v3_short_out.json',
                                           end=end1, source=short_src, config_path=cfg_file)
             short_planned = (short_v3_plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
-            self.assertLessEqual(short_res['source_requests'], short_planned)
+            self.assertEqual(short_src.catalogue_calls, 1)
+            self.assertLessEqual(short_res['source_requests'] + short_src.catalogue_calls, short_planned)
 
             # Fail closed on non-private/symlink/corrupt state artifacts during --plan.
             cp_file = missing_state / 'checkpoint.json'
@@ -1480,7 +1535,10 @@ class CollectorTests(unittest.TestCase):
                 collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
             db_file.chmod(0o600)
             db_file.write_bytes(b'corrupt bytes not sqlite')
-            with self.assertRaises(collector.CollectionError):
+            with self.assertRaisesRegex(collector.CollectionError, 'Invalid observation cache database'):
+                collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
+            db_file.write_bytes(b'SQLite format 3')
+            with self.assertRaisesRegex(collector.CollectionError, 'Invalid observation cache database'):
                 collector.plan_collection(cfg, app_dir, missing_state, end=end2, config_path=cfg_file)
 
     def test_record_checkpoint_and_cli_mode_validation(self):
@@ -1520,17 +1578,46 @@ class CollectorTests(unittest.TestCase):
             with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
                 db.executemany('INSERT INTO observations VALUES (?,?,?,?,?)', all_rows or [row_backup])
                 db.commit()
+
+            # Non-matching endpoint or altered source identity must be rejected by --record-checkpoint even with populated observations.
+            with self.assertRaisesRegex(collector.CollectionError, 'completion record'):
+                collector.record_checkpoint(cfg, ROOT, state_dir, end1 + HOUR, config_path=cfg_file)
+            self.assertFalse(cp_path.exists())
+            alt_cfg = dict(cfg, SOURCE_SSH_HOST='other-host.internal')
+            with self.assertRaisesRegex(collector.CollectionError, 'completion record'):
+                collector.record_checkpoint(alt_cfg, ROOT, state_dir, end1)
+            self.assertFalse(cp_path.exists())
+
+            # CLI main() reads source.env bytes only once per invocation and passes config_bytes through.
+            real_read_regular = collector.read_regular_bytes
+            cfg_reads = []
+            def counting_read(path, *args, **kwargs):
+                if Path(path) == cfg_file:
+                    cfg_reads.append(path)
+                return real_read_regular(path, *args, **kwargs)
+
             stdout = io.StringIO()
-            with redirect_stdout(stdout):
+            with mock.patch.object(collector, 'read_regular_bytes', side_effect=counting_read), redirect_stdout(stdout):
                 collector.main([
                     '--config', str(cfg_file),
                     '--state-dir', str(state_dir),
                     '--end', str(end1),
                     '--record-checkpoint',
                 ])
+            self.assertEqual(len(cfg_reads), 1)
             self.assertEqual(json.loads(stdout.getvalue()), {'status': 'checkpoint_recorded', 'observation_end': end1})
             self.assertEqual(stat.S_IMODE(cp_path.lstat().st_mode), 0o600)
-            self.assertEqual(collector.plan_collection(cfg, ROOT, state_dir, end=end1 + HOUR, config_path=cfg_file)['catchup_days'], 1)
+            cfg_reads.clear()
+            stdout_plan = io.StringIO()
+            with mock.patch.object(collector, 'read_regular_bytes', side_effect=counting_read), redirect_stdout(stdout_plan):
+                collector.main([
+                    '--config', str(cfg_file),
+                    '--state-dir', str(state_dir),
+                    '--end', str(end1 + HOUR),
+                    '--plan',
+                ])
+            self.assertEqual(len(cfg_reads), 1)
+            self.assertEqual(json.loads(stdout_plan.getvalue())['catchup_days'], 1)
 
             # Mutually exclusive and required CLI argument combinations fail cleanly.
             bad_invocations = [
@@ -1640,7 +1727,8 @@ class CollectorTests(unittest.TestCase):
             stag_src = SyntheticSource(queries, _snapshot_handlers(staggered, routes, rate_val=1.0))
             stag_res = collector.collect(cfg, stag_app, root / 'stag_state', root / 'stag_out.json',
                                          end=end_stag, source=stag_src, config_path=cfg_file)
-            self.assertLessEqual(stag_res['source_requests'], stag_planned)
+            self.assertEqual(stag_src.catalogue_calls, 1)
+            self.assertLessEqual(stag_res['source_requests'] + stag_src.catalogue_calls, stag_planned)
 
             # 2. Output cannot overwrite source.env, SSH keys, known_hosts, state_dir itself, or SQLite sidecars.
             state_dir = root / 'state_out'
@@ -1657,22 +1745,52 @@ class CollectorTests(unittest.TestCase):
                 with self.subTest(bad_out=str(bad_out)), self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
                     collector.collect(cfg, ROOT, state_dir, bad_out, end=end_stag, source=src, config_path=cfg_file)
 
-            # 3. Read-only WAL inspection works under mode 0500 state_dir without creating -wal/-shm, and rejects bad sidecars.
+            # 3. Non-mutating locking inspection:
+            #    (a) Rollback-journal DB works as warm under mode 0500 state_dir via ?mode=ro without creating sidecars.
+            #    (b) WAL-mode DB without -shm (with or without -wal) never creates -shm during --plan, falls back cleanly to cold,
+            #        and rejects --record-checkpoint; symlink/bad-mode sidecars and symlink checkpoint still fail closed.
+            wal_end = seed_end + DAY + HOUR
+            rb_state = root / 'rb_state'
+            rb_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            collector.collect(cfg, ROOT, rb_state, root / 'rb_out.json', end=wal_end, source=rb_src, config_path=cfg_file)
+            rb_state.chmod(0o500)
+            try:
+                rb_plan = collector.plan_collection(cfg, ROOT, rb_state, end=wal_end + HOUR, config_path=cfg_file)
+                self.assertEqual(rb_plan['catchup_days'], 1)
+                for sfx in ('-wal', '-shm', '-journal'):
+                    self.assertFalse((rb_state / f'observations.sqlite3{sfx}').exists())
+            finally:
+                rb_state.chmod(0o700)
+
             wal_state = root / 'wal_state'
             wal_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
-            collector.collect(cfg, ROOT, wal_state, root / 'wal_out.json', end=end_stag, source=wal_src, config_path=cfg_file)
+            collector.collect(cfg, ROOT, wal_state, root / 'wal_out.json', end=wal_end, source=wal_src, config_path=cfg_file)
             db_path = wal_state / 'observations.sqlite3'
             with closing(sqlite3.connect(db_path)) as db:
                 db.execute('PRAGMA journal_mode=WAL')
                 db.commit()
-            for sfx in ('-wal', '-shm'):
-                (wal_state / f'observations.sqlite3{sfx}').unlink(missing_ok=True)
+            wal_file = wal_state / 'observations.sqlite3-wal'
+            shm_file = wal_state / 'observations.sqlite3-shm'
+            # WAL with -wal present and no -shm must fall back cleanly to cold (2d) without creating -shm.
+            shm_file.unlink(missing_ok=True)
+            if not wal_file.exists():
+                wal_file.write_bytes(b'\x00' * 32)
+                wal_file.chmod(0o600)
+            wal_only_plan = collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
+            self.assertEqual(wal_only_plan['catchup_days'], 2)
+            self.assertFalse(shm_file.exists())
+            with self.assertRaisesRegex(collector.CollectionError, 'shared-memory index'):
+                collector.record_checkpoint(cfg, ROOT, wal_state, end=wal_end, config_path=cfg_file)
+
+            # WAL without -wal or -shm under 0o500 also falls back to cold cleanly and creates no sidecars.
+            wal_file.unlink(missing_ok=True)
+            shm_file.unlink(missing_ok=True)
             wal_state.chmod(0o500)
             try:
-                wal_plan = collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
-                self.assertEqual(wal_plan['catchup_days'], 1)
-                self.assertFalse((wal_state / 'observations.sqlite3-wal').exists())
-                self.assertFalse((wal_state / 'observations.sqlite3-shm').exists())
+                wal_plan = collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
+                self.assertEqual(wal_plan['catchup_days'], 2)
+                self.assertFalse(wal_file.exists())
+                self.assertFalse(shm_file.exists())
             finally:
                 wal_state.chmod(0o700)
 
@@ -1680,14 +1798,14 @@ class CollectorTests(unittest.TestCase):
                 sidecar = wal_state / f'observations.sqlite3{suffix}'
                 sidecar.symlink_to(root / 'missing-sidecar')
                 with self.subTest(symlink_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
-                    collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
+                    collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
                 with self.subTest(ckpt_symlink_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
-                    collector.record_checkpoint(cfg, ROOT, wal_state, end=end_stag, config_path=cfg_file)
+                    collector.record_checkpoint(cfg, ROOT, wal_state, end=wal_end, config_path=cfg_file)
                 sidecar.unlink()
                 sidecar.write_bytes(b'sidecar')
                 sidecar.chmod(0o644)
                 with self.subTest(mode_sidecar=suffix), self.assertRaisesRegex(collector.CollectionError, 'sidecar'):
-                    collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
+                    collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
                 sidecar.unlink()
 
             # Symlink checkpoint.json fails closed with CollectionError during --plan.
@@ -1695,7 +1813,7 @@ class CollectorTests(unittest.TestCase):
             cp_file.unlink()
             cp_file.symlink_to(root / 'missing-cp.json')
             with self.assertRaisesRegex(collector.CollectionError, 'checkpoint'):
-                collector.plan_collection(cfg, ROOT, wal_state, end=end_stag + HOUR, config_path=cfg_file)
+                collector.plan_collection(cfg, ROOT, wal_state, end=wal_end + HOUR, config_path=cfg_file)
 
             # 4. Existing/non-existent case aliases caught on case-insensitive filesystems (e.g. macOS APFS).
             existing_dir = root / 'ExistingDir'

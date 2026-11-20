@@ -40,15 +40,25 @@ or `routes.json`.
 - `--plan` is strictly read-only on missing `--state-dir` (never creates it or opens SSH),
 fails closed on symlinked/non-private/corrupt state artifacts, computes a deterministic
 `source_identity_sha256` from `source.env` raw bytes, `SOURCE_SSH_KNOWN_HOSTS_FILE`, seed,
-and `catalogue/queries.json`, checks `<state_dir>/checkpoint.json` against committed rows in
-`observations.sqlite3`, enforces `--max-catchup-days`, and prints `{snapshot_end, catchup_days,
-recommended_timeout_seconds}` dynamically sized from `catalogue/routes.json`, protocol batch
-bounds, and any cold `v3` `sampled_hour` backfill span.
-- Normal collection prints `{snapshot_end, charts, series, source_requests, cache_committed}`,
-atomically updating `0600` `<state_dir>/checkpoint.json` only after both output publication and
-`cache.commit()` succeed (`cache_committed: false` leaves the checkpoint unchanged). `--record-checkpoint`
-verifies `observations.sqlite3` has at least one committed row under the collector lock and
-records `checkpoint.json` explicitly (for example after manual catch-up).
+`catalogue/queries.json`, and `catalogue/routes.json`, inspects `observations.sqlite3` in
+non-mutating read-only locking mode (never `immutable=1`, and skipping unindexed WAL
+caches that lack `-shm` without creating sidecars), checks `<state_dir>/checkpoint.json`
+against committed `observations` rows and an exact `(source_identity_sha256,
+observation_end)` entry in `collection_completions`, enforces `--max-catchup-days`
+(distinguishing cold/stale-cache gaps from stale `--previous-end` publication gaps), and
+prints `{snapshot_end, catchup_days, recommended_timeout_seconds}` dynamically sized from
+`catalogue/routes.json`, protocol batch bounds, and any cold `v3` `sampled_hour` backfill span.
+- Normal collection prints `{snapshot_end, charts, series, source_requests,
+cache_committed, checkpoint_updated}`. Output publication precedes a single SQLite
+transaction that commits both `observations` rows and the `(source_identity_sha256,
+observation_end)` completion proof in `collection_completions` (`cache_committed: true`),
+followed by atomically updating `0600` `<state_dir>/checkpoint.json` (`checkpoint_updated:
+true`; if `cache.commit()` fails, both flags are `false` and the checkpoint is unchanged,
+while if `checkpoint.json` update fails afterwards, `cache_committed: true` and
+`checkpoint_updated: false`). `--record-checkpoint` verifies `observations.sqlite3` holds
+committed observation rows and a matching `(source_identity_sha256, --end)` entry in
+`collection_completions` under the collector lock (requiring rollback mode or an active
+WAL `-shm` index) before recording `checkpoint.json` explicitly (for example after manual catch-up).
 The default endpoint is the latest completed UTC hour
 (`(int(time.time()) // 3600) * 3600`). `--end UNIX_SECONDS` selects another
 completed UTC-hour timestamp at or after the seed snapshot (`end % 3600 == 0`).

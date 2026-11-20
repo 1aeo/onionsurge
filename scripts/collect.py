@@ -100,7 +100,7 @@ def expand_path(value):
     return path
 
 
-def load_source_config(path, required=SSH_FIELDS, private=True):
+def load_source_config(path, required=SSH_FIELDS, private=True, return_bytes=False):
     """Load private assignment-only source SSH settings safely without symlinks."""
     resolved = expand_path(path)
     try:
@@ -110,7 +110,7 @@ def load_source_config(path, required=SSH_FIELDS, private=True):
     values = parse_env(raw.decode('utf-8'))
     missing = [key for key in required if not values.get(key)]
     _require(not missing, 'Missing configuration keys: ' + ', '.join(missing))
-    return values
+    return (values, raw) if return_bytes else values
 
 
 def parse_json(raw):
@@ -254,10 +254,20 @@ class ObservationCache:
             self.db.execute('CREATE TABLE IF NOT EXISTS observations '
                             '(source TEXT, query_sha TEXT, step INTEGER, endpoint INTEGER, payload TEXT, '
                             'PRIMARY KEY(source, query_sha, step, endpoint))')
+            self.db.execute('CREATE TABLE IF NOT EXISTS collection_completions '
+                            '(source_identity TEXT NOT NULL, observation_end INTEGER NOT NULL, '
+                            'PRIMARY KEY (source_identity, observation_end))')
             self.db.commit()
         except BaseException:
             self.db.close()
             raise
+
+    def record_completion(self, source_identity, observation_end):
+        """Record an in-transaction completion proof committed atomically with observation rows."""
+        self.db.execute(
+            'INSERT OR IGNORE INTO collection_completions (source_identity, observation_end) VALUES (?, ?)',
+            (source_identity, observation_end),
+        )
 
     def commit(self):
         self.db.commit()
@@ -871,9 +881,15 @@ def _assert_disjoint(protected_paths, forbidden_paths, message):
                 raise CollectionError(message)
 
 
-def _compute_source_identity(config_digest, known_hosts_digest, seed_sha, queries_sha):
+def _compute_source_identity(config_digest, known_hosts_digest, seed_sha, queries_sha, routes_sha):
     payload = json.dumps(
-        {'config': config_digest, 'known_hosts': known_hosts_digest, 'queries': queries_sha, 'seed': seed_sha},
+        {
+            'config': config_digest,
+            'known_hosts': known_hosts_digest,
+            'queries': queries_sha,
+            'routes': routes_sha,
+            'seed': seed_sha,
+        },
         allow_nan=False, sort_keys=True, separators=(',', ':'),
     ).encode('utf-8')
     return sha256_hex(payload)
@@ -887,16 +903,28 @@ def _require_private_dir(path, missing_message, invalid_message):
     _require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077), invalid_message)
 
 
-def _cache_has_rows(db_path, *, require_table=False):
+def _cache_has_completion(db_path, source_id, obs_end, *, require_match=False):
+    missing_msg = 'Observation cache must contain a committed completion record matching this configuration and endpoint'
     try:
-        info = db_path.lstat()
+        fd = os.open(db_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        _require(not require_table, 'Observation cache must contain committed rows before recording a checkpoint')
+        _require(not require_match, missing_msg)
         return False
     except OSError as error:
         raise CollectionError('Observation cache must be a private owned regular file') from error
-    _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077),
-             'Observation cache must be a private owned regular file')
+    try:
+        info = os.fstat(fd)
+        _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077),
+                 'Observation cache must be a private owned regular file')
+        with os.fdopen(fd, 'rb') as stream:
+            fd = None
+            header = stream.read(100) if info.st_size > 0 else b''
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     sidecars = {}
     for suffix in ('-wal', '-shm', '-journal'):
         sidecar = db_path.with_name(db_path.name + suffix)
@@ -911,15 +939,27 @@ def _cache_has_rows(db_path, *, require_table=False):
                      'Observation cache sidecar must be a private owned regular file')
             sidecars[suffix] = True
     if info.st_size == 0:
-        _require(not require_table, 'Observation cache must contain committed rows before recording a checkpoint')
+        _require(not require_match, missing_msg)
         return False
-    mode_query = 'mode=ro' if (sidecars['-wal'] or sidecars['-shm']) else 'mode=ro&immutable=1'
+    if len(header) < 20 or header[:16] != b'SQLite format 3\x00':
+        raise CollectionError('Invalid observation cache database')
+    # Never bypass locking with immutable=1; skip opening unindexed WAL caches that lack -shm so planning stays strictly non-mutating.
+    is_wal = header[18] == 2 or header[19] == 2
+    if is_wal and not sidecars['-shm']:
+        _require(not require_match,
+                 'Observation cache WAL requires an active shared-memory index or checkpointed journal')
+        return False
     try:
-        conn = sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?{mode_query}', uri=True)
+        conn = sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?mode=ro', uri=True)
         try:
-            return conn.execute('SELECT 1 FROM observations LIMIT 1').fetchone() is not None
+            has_obs = conn.execute('SELECT 1 FROM observations LIMIT 1').fetchone() is not None
+            has_comp = conn.execute(
+                'SELECT 1 FROM collection_completions WHERE source_identity=? AND observation_end=? LIMIT 1',
+                (source_id, obs_end),
+            ).fetchone() is not None
+            return has_obs and has_comp
         except sqlite3.OperationalError as error:
-            if not require_table and 'no such table' in str(error).lower():
+            if not require_match and 'no such table' in str(error).lower():
                 return False
             raise CollectionError('Invalid observation cache database') from error
         finally:
@@ -943,13 +983,23 @@ def _inspect_warm_checkpoint(state, source_identity_sha256, now_hour):
             raise CollectionError('Invalid collector checkpoint') from error
         cp = parse_json(cp_raw)
         _require(isinstance(cp, dict), 'Invalid collector checkpoint')
-    has_rows = _cache_has_rows(state / 'observations.sqlite3', require_table=False)
-    if not (cp is not None and has_rows and cp.get('source_identity_sha256') == source_identity_sha256):
-        return None
-    obs_end = cp.get('observation_end')
-    if isinstance(obs_end, bool) or not isinstance(obs_end, int) or obs_end <= 0 or obs_end % HOUR != 0 or obs_end > now_hour:
-        return None
-    return obs_end
+    obs_end = cp.get('observation_end') if cp is not None else None
+    valid_cp = (
+        cp is not None
+        and cp.get('source_identity_sha256') == source_identity_sha256
+        and not isinstance(obs_end, bool)
+        and isinstance(obs_end, int)
+        and obs_end > 0
+        and obs_end % HOUR == 0
+        and obs_end <= now_hour
+    )
+    has_completion = _cache_has_completion(
+        state / 'observations.sqlite3',
+        source_identity_sha256,
+        obs_end if valid_cp else -1,
+        require_match=False,
+    )
+    return obs_end if (valid_cp and has_completion) else None
 
 
 def _batch_capacity(step, *, population=False):
@@ -1109,14 +1159,14 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
 
 
 def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
-                     config_path=None, forbid_overlap=(), output=None, require_ssh=False):
+                     config_path=None, config_bytes=None, forbid_overlap=(), output=None, require_ssh=False):
     app = Path(ROOT if application_dir is None else application_dir).resolve()
     state = Path(state_dir).absolute()
-    cfg_path = None
-    if config_path is not None:
-        cfg_path = expand_path(config_path)
-        cfg_bytes = _read_bounded(cfg_path, MAX_CONFIG_BYTES, private=True)
-        config_digest = sha256_hex(cfg_bytes)
+    cfg_path = expand_path(config_path) if config_path is not None else None
+    if config_bytes is not None:
+        config_digest = sha256_hex(config_bytes)
+    elif cfg_path is not None:
+        config_digest = sha256_hex(_read_bounded(cfg_path, MAX_CONFIG_BYTES, private=True))
     else:
         config_digest = sha256_hex(
             json.dumps(dict(sorted(config.items())), allow_nan=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
@@ -1188,21 +1238,24 @@ def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
         'queries': queries,
         'queries_sha': sha256_hex(queries_bytes),
         'routes': routes,
+        'routes_sha': sha256_hex(routes_bytes),
     }
 
 
 def plan_collection(config, application_dir, state_dir, previous_end=None, max_catchup_days=31,
-                    end=None, seed=None, *, config_path=None, forbid_overlap=()):
+                    end=None, seed=None, *, config_path=None, config_bytes=None, forbid_overlap=()):
     _require(type(max_catchup_days) is int and max_catchup_days >= 1,
              'Maximum catch-up days must be a positive integer')
     ctx = _prepare_context(config, application_dir, state_dir, end=end, seed=seed,
-                           config_path=config_path, forbid_overlap=forbid_overlap, require_ssh=True)
+                           config_path=config_path, config_bytes=config_bytes,
+                           forbid_overlap=forbid_overlap, require_ssh=True)
     target_end = ctx['end']
     if previous_end is not None:
         _require(type(previous_end) is int and previous_end > 0 and target_end >= previous_end,
                  'Collection end precedes previous observation end')
     source_id = _compute_source_identity(
-        ctx['config_digest'], sha256_hex(ctx['known_hosts_bytes']), ctx['seed_sha'], ctx['queries_sha'])
+        ctx['config_digest'], sha256_hex(ctx['known_hosts_bytes']),
+        ctx['seed_sha'], ctx['queries_sha'], ctx['routes_sha'])
     warm_end = _inspect_warm_checkpoint(ctx['state'], source_id, ctx['now_hour'])
 
     seed_obj = ctx['seed']
@@ -1215,11 +1268,17 @@ def plan_collection(config, application_dir, state_dir, previous_end=None, max_c
                 if hist_rows:
                     seed_earliest_end = min(seed_earliest_end, int(hist_rows[-1][0]))
 
-    baseline_end = warm_end if warm_end is not None else seed_earliest_end
-    if previous_end is not None:
-        baseline_end = min(previous_end, baseline_end)
+    base_end = warm_end if warm_end is not None else seed_earliest_end
+    base_catchup_days = 1 if target_end <= base_end else max(1, math.ceil((target_end - base_end) / DAY))
+    baseline_end = min(previous_end, base_end) if previous_end is not None else base_end
     catchup_days = 1 if target_end <= baseline_end else max(1, math.ceil((target_end - baseline_end) / DAY))
-    _require(catchup_days <= max_catchup_days, 'Catch-up exceeds automated window; run manual collection first')
+    if catchup_days > max_catchup_days:
+        if previous_end is not None and base_catchup_days <= max_catchup_days:
+            raise CollectionError(
+                'Last published observation precedes automated catch-up window; '
+                'complete the manual publication workflow before retrying'
+            )
+        raise CollectionError('Catch-up exceeds automated window; run manual collection first')
     max_requests = _plan_max_requests(ctx['routes'], ctx['queries'], seed_obj, target_end,
                                       warm_end=warm_end, baseline_end=baseline_end)
     timeout_s = max_requests * SOURCE_REQUEST_TIMEOUT + COLLECTION_OVERHEAD_SECONDS
@@ -1227,20 +1286,24 @@ def plan_collection(config, application_dir, state_dir, previous_end=None, max_c
 
 
 def record_checkpoint(config, application_dir, state_dir, end, seed=None, *,
-                      config_path=None, forbid_overlap=()):
+                      config_path=None, config_bytes=None, forbid_overlap=()):
     _require(type(end) is int, 'Checkpoint end must be an integer UTC hour')
     ctx = _prepare_context(config, application_dir, state_dir, end=end, seed=seed,
-                           config_path=config_path, forbid_overlap=forbid_overlap, require_ssh=True)
+                           config_path=config_path, config_bytes=config_bytes,
+                           forbid_overlap=forbid_overlap, require_ssh=True)
     state = ctx['state']
     _require_private_dir(state, 'Collector state directory must exist before recording a checkpoint',
                          'Collector state directory must be private owned')
     source_id = _compute_source_identity(
-        ctx['config_digest'], sha256_hex(ctx['known_hosts_bytes']), ctx['seed_sha'], ctx['queries_sha'])
+        ctx['config_digest'], sha256_hex(ctx['known_hosts_bytes']),
+        ctx['seed_sha'], ctx['queries_sha'], ctx['routes_sha'])
     previous_umask = os.umask(0o077)
     try:
         with state_lock(state):
-            _require(_cache_has_rows(state / 'observations.sqlite3', require_table=True),
-                     'Observation cache must contain committed rows before recording a checkpoint')
+            _require(
+                _cache_has_completion(state / 'observations.sqlite3', source_id, ctx['end'], require_match=True),
+                'Observation cache must contain a committed completion record matching this configuration and endpoint',
+            )
             atomic_json(state / 'checkpoint.json',
                         {'source_identity_sha256': source_id, 'observation_end': ctx['end']})
     finally:
@@ -1249,10 +1312,10 @@ def record_checkpoint(config, application_dir, state_dir, end, seed=None, *,
 
 
 def collect(config, application_dir, state_dir, output, end=None, source=None, seed=None, *,
-            config_path=None, forbid_overlap=()):
+            config_path=None, config_bytes=None, forbid_overlap=()):
     ctx = _prepare_context(config, application_dir, state_dir, end=end, seed=seed,
-                           config_path=config_path, forbid_overlap=forbid_overlap,
-                           output=output, require_ssh=False)
+                           config_path=config_path, config_bytes=config_bytes,
+                           forbid_overlap=forbid_overlap, output=output, require_ssh=False)
     state, target_end = ctx['state'], ctx['end']
     out = Path(output).absolute()
     queries, routes, seed_obj = ctx['queries'], ctx['routes'], ctx['seed']
@@ -1262,9 +1325,11 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
         kh_digest = sha256_hex(_read_bounded(kh_path, MAX_KNOWN_HOSTS_BYTES))
     else:
         kh_digest = getattr(source, 'identity', '')
-    source_id = _compute_source_identity(ctx['config_digest'], kh_digest, ctx['seed_sha'], ctx['queries_sha'])
+    source_id = _compute_source_identity(
+        ctx['config_digest'], kh_digest, ctx['seed_sha'], ctx['queries_sha'], ctx['routes_sha'])
     _require(source.catalogue() == queries, 'Source query catalogue differs from the reviewed release')
     cache_committed = False
+    checkpoint_updated = False
     previous_umask = os.umask(0o077)
     try:
         with state_lock(state):
@@ -1274,6 +1339,7 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                     data = Collector(source, cache, queries, routes, seed_obj).collect(target_end, ctx['seed_sha'])
                     validate_snapshot(data)
                     atomic_json(out, data)
+                    cache.record_completion(source_id, target_end)
                 except BaseException:
                     try:
                         cache.rollback()
@@ -1289,20 +1355,22 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                         pass
                     sys.stderr.write('Collection warning: observation cache commit failed after snapshot publication.\n')
                 else:
+                    cache_committed = True
                     try:
                         atomic_json(state / 'checkpoint.json',
                                     {'source_identity_sha256': source_id, 'observation_end': target_end})
                     except OSError:
                         sys.stderr.write('Collection warning: collector checkpoint update failed after snapshot publication.\n')
                     else:
-                        cache_committed = True
+                        checkpoint_updated = True
             finally:
                 cache.close()
     finally:
         os.umask(previous_umask)
     return {'snapshot_end': target_end, 'charts': len(data['charts']),
             'series': sum(len(c['series']) for c in data['charts']),
-            'source_requests': source.requests, 'cache_committed': cache_committed}
+            'source_requests': source.requests, 'cache_committed': cache_committed,
+            'checkpoint_updated': checkpoint_updated}
 
 
 def main(argv=None):
@@ -1335,19 +1403,21 @@ def main(argv=None):
                        'Collection failed; previous snapshot retained.\n')
     try:
         config_path = expand_path(args.config)
-        config = load_source_config(config_path, required=SSH_FIELDS, private=True)
+        config, config_bytes = load_source_config(config_path, required=SSH_FIELDS, private=True, return_bytes=True)
         app_dir = ROOT if args.application_dir == ROOT else expand_path(args.application_dir)
         state_dir = expand_path(args.state_dir)
         forbidden = [expand_path(p) for p in args.forbid_overlap]
         if args.plan:
             result = plan_collection(config, app_dir, state_dir, args.previous_end, max_catchup_days,
-                                     args.end, seed=args.seed, config_path=config_path, forbid_overlap=forbidden)
+                                     args.end, seed=args.seed, config_path=config_path,
+                                     config_bytes=config_bytes, forbid_overlap=forbidden)
         elif args.record_checkpoint:
             result = record_checkpoint(config, app_dir, state_dir, args.end, seed=args.seed,
-                                       config_path=config_path, forbid_overlap=forbidden)
+                                       config_path=config_path, config_bytes=config_bytes,
+                                       forbid_overlap=forbidden)
         else:
             result = collect(config, app_dir, state_dir, expand_path(args.output), args.end, seed=args.seed,
-                             config_path=config_path, forbid_overlap=forbidden)
+                             config_path=config_path, config_bytes=config_bytes, forbid_overlap=forbidden)
         print(json.dumps(result))
     except (CollectionError, access.AccessError, OSError, ValueError, KeyError, TypeError, sqlite3.Error):
         parser.exit(1, failure_message)
