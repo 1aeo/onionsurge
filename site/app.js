@@ -603,8 +603,8 @@ function createObservatory(data,browser,initialRelease=null){
  let families=new Map(D.families.map(f=>[f.id,f]));
  const chart=id=>charts.get(id),family=id=>families.get(id);
  let {view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN);
- const hasExplicitHeroRange=search=>{const reqHero=new URLSearchParams(search).get('hero_range');return reqHero==='all'||reqHero==='7d'||reqHero==='24h';};
- let heroRangeExplicit=hasExplicitHeroRange(location.search);
+ const parseRequestedHeroRange=search=>{const reqHero=new URLSearchParams(search).get('hero_range');return reqHero==='24h'||reqHero==='7d'||reqHero==='all'?reqHero:null;};
+ let requestedHeroRange=parseRequestedHeroRange(location.search);
  let plotCache=new WeakMap(),heroCache=new Map(),urlCache=null,lastHeaderH=null,touchPlot=null;
  const plotMeta=new WeakMap(),copyTimers=new WeakMap(),copyRequests=new WeakMap();
 const chartCache=c=>{let cache=plotCache.get(c);if(!cache){cache=new Map();plotCache.set(c,cache);}return cache;};
@@ -612,6 +612,7 @@ const shown=c=>{const cc=chartCache(c);let out=cc.get('shown');if(!out){out=c.se
 const primary=c=>{const cc=chartCache(c);let def=cc.get('primary');if(!def){def=c.series.find(s=>s.key===c.primary_series)||c.series[0];cc.set('primary',def);}return (view==='explorer'&&c.id===chartId&&seriesKey&&shown(c).find(s=>s.key===seriesKey))||def;};
 const isHourlyRelease=()=>hasHourPayload(D);
 const defaultHeroRange=()=>isHourlyRelease()?'24h':'7d';
+const resolveHeroRange=()=>requestedHeroRange==='24h'&&!isHourlyRelease()?'7d':(requestedHeroRange||defaultHeroRange());
 const currentValue=(s,c,period='day')=>{
  const current=s.current?.[period],value=current?.value;
  return current?.valid===false||!isFiniteNumber(value)||value<0||!isFiniteNumber(value*displayScale(c))?null:value;
@@ -703,7 +704,7 @@ function updateFreshness(status={}){
 }
 function replaceRelease(nextData,nextRelease){
  const appEl=$('#app');
- const before={D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,heroRangeExplicit,plotCache,heroCache,html:appEl.innerHTML};
+ const before={D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,requestedHeroRange,plotCache,heroCache,html:appEl.innerHTML};
  const active=document.activeElement,hadAppFocus=!!appEl.contains?.(active);
  const focus=hadAppFocus?FOCUS_ATTRS.filter(name=>active.hasAttribute(name)).map(name=>[name,active.getAttribute(name)]):[];
  const matchInApp=node=>(!appEl.contains||appEl.contains(node))&&focus.every(([key,value])=>node.getAttribute(key)===value);
@@ -727,15 +728,14 @@ function replaceRelease(nextData,nextRelease){
    const aliased=Object.hasOwn(timeRanges.legacy_aliases,range)?timeRanges.legacy_aliases[range]:null;
    range=aliased&&periodMap.has(aliased)?aliased:timeRanges.default_range;
   }
-  if(!heroRangeExplicit)heroRange=defaultHeroRange();
-  else if(heroRange==='24h'&&!hasHourPayload(D))heroRange='7d';
+  heroRange=resolveHeroRange();
   charts=new Map(D.charts.map(c=>[c.id,c]));families=new Map(D.families.map(f=>[f.id,f]));
   if(!charts.has(chartId)){chartId=(families.get(familyId)||D.families[0]).primary;seriesKey=null;bandEnabled=false;}
   familyId=chart(chartId).family_id;
   if(seriesKey&&!shown(chart(chartId)).some(series=>series.key===seriesKey))seriesKey=null;
   render();restorePosition();
  }catch(error){
-  ({D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,heroRangeExplicit,plotCache,heroCache}=before);
+  ({D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,requestedHeroRange,plotCache,heroCache}=before);
   try{render();}catch{appEl.innerHTML=before.html;}
   restorePosition();throw error;
  }
@@ -1288,7 +1288,7 @@ document.addEventListener('click',async e=>{
  const t=targetEl(e);if(!t)return;
  const hit=s=>t.closest(s),anchor=hit('a[href]');
  if(anchor&&(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||e.button!==0))return;
- const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d';heroRangeExplicit=true;if(next!==heroRange){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
+ const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d';requestedHeroRange=next;if(next!==heroRange){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
  const heroScaleToggle=hit('[data-hero-scale]');if(heroScaleToggle){const next=heroScaleToggle.dataset.heroScale==='symlog'?'symlog':'linear';if(next!==heroScale){heroScale=next;redrawControl(`[data-hero-scale="${heroScale}"]`);}return;}
  if(hit('[data-hero-hsdir]')){heroHsdir=!heroHsdir;redrawControl('[data-hero-hsdir]');return;}
  const allToggle=hit('[data-all-range]');if(allToggle){const nextRange=allToggle.dataset.allRange;if(periodMap.has(nextRange)){range=nextRange;redrawControl(`[data-all-range="${range}"]`);}return;}
@@ -1367,7 +1367,7 @@ for(const type of ['pointerout','focusout'])document.addEventListener(type,onPlo
 let resizeTimer;window.addEventListener('resize',()=>{updateHeaderOffset();clearTimeout(resizeTimer);resizeTimer=setTimeout(renderPlots,80);});
 window.addEventListener('popstate',()=>{
  ({view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN));
- heroRangeExplicit=hasExplicitHeroRange(location.search);
+ requestedHeroRange=parseRequestedHeroRange(location.search);
  render();closeNavigation();scrollToFragment();focusDestination(view==='methods'&&location.hash==='#reference'?'#reference':'[data-view-heading]');
 });
 }

@@ -136,10 +136,7 @@ class HistoricalAverageChecks(unittest.TestCase):
         self.assertEqual(partial_avg['seven_days']['days'], 6)
         self.assertEqual(partial_avg['seven_days']['expected_days'], 7)
 
-        strict = load_time_ranges()
-        for period in strict['periods']:
-            if period['window']['unit'] != 'all_time':
-                period['minimum_coverage'] = 0.9
+        strict = strict_ranges()
         below_avg, _ = historical_averages_and_windows(rows[:6], end, time_ranges=strict)
         self.assertEqual(below_avg['seven_days']['status'], 'insufficient_data')
         self.assertIsNone(below_avg['seven_days']['value'])

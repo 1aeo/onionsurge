@@ -77,6 +77,6 @@ def strict_ranges():
     from time_ranges import load_time_ranges
     cfg = load_time_ranges()
     for period in cfg['periods']:
-        if period['window']['unit'] != 'all_time':
+        if period['window']['unit'] not in {'all_time', 'hours'}:
             period['minimum_coverage'] = 0.9
     return cfg

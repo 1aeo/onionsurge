@@ -85,9 +85,11 @@ def _validate_period(period, seen_ids, seen_summary_keys, seen_suffixes):
                  f'Invalid time-range {field}')
 
     coverage = period['minimum_coverage']
-    msg = 'All-time period minimum_coverage must be 0' if unit == 'all_time' else 'Time-range minimum_coverage must be in [0, 1]'
+    zero_only = unit in {'all_time', 'hours'}
+    msg = ('All-time and hours period minimum_coverage must be 0'
+           if zero_only else 'Time-range minimum_coverage must be in [0, 1]')
     _require(finite_number(coverage) and not (isinstance(coverage, float) and math.copysign(1.0, coverage) < 0), msg)
-    _require(coverage == 0 if unit == 'all_time' else 0 <= coverage <= 1, msg)
+    _require(coverage == 0 if zero_only else 0 <= coverage <= 1, msg)
 
     min_comp = period['minimum_comparison_windows']
     _require(type(min_comp) is int and 1 <= min_comp <= 10000,

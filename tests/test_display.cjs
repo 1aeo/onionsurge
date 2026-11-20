@@ -2792,7 +2792,22 @@ copyCtrl.app.start();
   exp7Upgrade.app.replaceRelease(v7NonMidnight,v7Rel);
   assert.equal(exp7Upgrade.app.getState().heroRange,'all','user-clicked heroRange remains explicit across v6->v7 upgrade');
 
-  // validateTimeRanges rejects malformed hours definitions.
+  // Explicit hero_range=24h on schema-6 fallback renders 7d, preserves request across failed swap, and upgrades to 24h when schema-7 arrives.
+  const req24Ctrl=application('?view=overview&hero_range=24h',v6Data,'1',v6Rel);
+  req24Ctrl.app.start();
+  assert.equal(req24Ctrl.app.getState().heroRange,'7d','explicit hero_range=24h renders as 7d on schema-6 fallback');
+  assert.throws(()=>req24Ctrl.app.replaceRelease({},v6Rel),/Missing chart data/);
+  assert.equal(req24Ctrl.app.getState().heroRange,'7d');
+  req24Ctrl.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(req24Ctrl.app.getState().heroRange,'24h','explicit hero_range=24h upgrades to 24h on schema-7 payload');
+  assert.throws(()=>req24Ctrl.app.replaceRelease({},v7Rel),/Missing chart data/);
+  assert.equal(req24Ctrl.app.getState().heroRange,'24h','failed swap restores heroRange');
+  req24Ctrl.app.replaceRelease(v6Data,v6Rel);
+  assert.equal(req24Ctrl.app.getState().heroRange,'7d');
+  req24Ctrl.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(req24Ctrl.app.getState().heroRange,'24h','requestedHeroRange 24h survives rollback->recovery');
+
+  // validateTimeRanges rejects malformed hours definitions (including 24h minimum_coverage=0.5 parity with Python).
   for(const badHours of [
    tr=>{tr.periods[0].window.count=12;},
    tr=>{tr.periods[0].window.comparison_lag_days=1;},
@@ -2806,6 +2821,12 @@ copyCtrl.app.start();
    badHours(bad);
    assert.throws(()=>ui.validateTimeRanges(bad),/time_ranges|minimum_coverage/);
   }
+  const badHourCov=structuredClone(v7NonMidnight.time_ranges);
+  badHourCov.periods[0].minimum_coverage=0.5;
+  assert.throws(()=>ui.validateTimeRanges(badHourCov),/Invalid time_ranges hours minimum_coverage/);
+  const validHourCov=structuredClone(v7NonMidnight.time_ranges);
+  validHourCov.periods[0].minimum_coverage=0;
+  assert.equal(ui.validateTimeRanges(validHourCov),validHourCov,'validateTimeRanges accepts 24h with minimum_coverage=0');
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

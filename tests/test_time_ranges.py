@@ -53,13 +53,18 @@ class TimeRangeConfigTests(unittest.TestCase):
             ['24h', '7d', '1mo', '3mo', '6mo', '12mo', 'all-time'],
         )
         self.assertTrue(all(p['minimum_coverage'] == 0 for p in cfg['periods']))
+        for zero_cov in (0, 0.0):
+            allowed = self.fixture()
+            allowed['periods'][0]['minimum_coverage'] = zero_cov
+            validated = validate_time_ranges(allowed)
+            self.assertEqual(validated['periods'][0]['minimum_coverage'], zero_cov)
         for bounded_cov in (0, 0.0, 0.9, 1):
             allowed = self.fixture()
-            allowed['periods'][0]['minimum_coverage'] = bounded_cov
             allowed['periods'][1]['minimum_coverage'] = bounded_cov
+            allowed['periods'][2]['minimum_coverage'] = bounded_cov
             validated = validate_time_ranges(allowed)
-            self.assertEqual(validated['periods'][0]['minimum_coverage'], bounded_cov)
             self.assertEqual(validated['periods'][1]['minimum_coverage'], bounded_cov)
+            self.assertEqual(validated['periods'][2]['minimum_coverage'], bounded_cov)
 
     def test_validation_rejects_sub_24h_and_malformed_ids_and_suffixes(self):
         bad_tokens = [
@@ -103,6 +108,15 @@ class TimeRangeConfigTests(unittest.TestCase):
         cfg = custom_three_period_config()
         cfg['legacy_aliases'] = {'24h': '14d'}
         self.assertEqual(validate_time_ranges(cfg)['legacy_aliases'], {'24h': '14d'})
+
+        # Hours period enforces minimum_coverage == 0 cleanly (aligned with site/app.js)
+        cfg = self.fixture()
+        self.assertEqual(cfg['periods'][0]['window']['unit'], 'hours')
+        self.assertEqual(cfg['periods'][0]['minimum_coverage'], 0)
+        validate_time_ranges(cfg)
+        cfg['periods'][0]['minimum_coverage'] = 0.5
+        with self.assertRaisesRegex(ValueError, 'All-time and hours period minimum_coverage must be 0'):
+            validate_time_ranges(cfg)
 
     def test_validation_enforces_schema_uniqueness_bounds_and_slots(self):
         mutations = [
@@ -151,6 +165,8 @@ class TimeRangeConfigTests(unittest.TestCase):
             lambda c: c['periods'][1].update(minimum_coverage=float('nan')),
             lambda c: c['periods'][-1].update(minimum_coverage=0.5),
             lambda c: c['periods'][-1].update(minimum_coverage=-0.0),
+            lambda c: c['periods'][0].update(minimum_coverage=0.5),
+            lambda c: c['periods'][0].update(minimum_coverage=-0.0),
             lambda c: c['periods'][1].update(minimum_comparison_windows=0),
             lambda c: c['periods'][1].update(minimum_comparison_windows=10001),
             lambda c: c['periods'][1].update(minimum_comparison_windows=True),
