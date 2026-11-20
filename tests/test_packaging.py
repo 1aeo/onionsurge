@@ -30,7 +30,12 @@ class PackagingChecks(unittest.TestCase):
     def update_manifest(self, root):
         files = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
                  for p in root.rglob('*') if p.is_file() and p.name != 'build-manifest.json'}
-        (root/'build-manifest.json').write_text(json.dumps({'format': previews.BUILD_FORMAT, 'files': files})+'\n')
+        (root/'build-manifest.json').write_text(json.dumps({
+            'format': previews.BUILD_FORMAT,
+            'schema_version': 7,
+            'release_objects': ['data.json'],
+            'files': files,
+        })+'\n')
 
     def test_live_preview_is_rejected_before_a_new_reservation(self):
         for manifest_mode in [False, True]:
@@ -274,6 +279,8 @@ class PackagingChecks(unittest.TestCase):
             previews.package(root)
             self.assertNotEqual((root/'design-1.html').read_bytes(), old_preview)
             latest = json.loads((root/'build-manifest.json').read_bytes())
+            self.assertEqual(latest['schema_version'], 7)
+            self.assertEqual(latest['release_objects'], ['data.json'])
             for asset, expected in latest['files'].items():
                 self.assertEqual(hashlib.sha256((root/asset).read_bytes()).hexdigest(), expected)
             for asset in ['index.html', 'style.css', 'data.js', 'app.js', 'exports/example-1mo.csv']:

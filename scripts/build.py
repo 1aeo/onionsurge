@@ -229,9 +229,16 @@ def write_outputs(data, reference_json, stage, *, live=False):
                     for t in islice(endpoints, idx, None)
                     for series_key, mapping in series_rows
                 )
-    manifest = {'format': BUILD_FORMAT, 'mode': 'live' if live else 'offline', 'snapshot_end': data_end,
+    release_objects = sorted([
+        'data.json',
+        data['reference_document'],
+        *(f'exports/{chart["id"]}-{suffix}.csv' for chart in data['charts'] for suffix, _, _ in period_exports),
+    ])
+    manifest = {'format': BUILD_FORMAT, 'mode': 'live' if live else 'offline', 'schema_version': data['schema_version'],
+                'snapshot_end': data_end,
                 'input_sha256': data['provenance']['aggregate_input_sha256'],
                 'query_contract_sha256': data['provenance']['query_contract_sha256'],
+                'release_objects': release_objects,
                 'files': {str(path.relative_to(stage)): file_sha256(path) for path in sorted(stage.rglob('*')) if path.is_file()}}
     (stage / 'build-manifest.json').write_text(json_text(manifest, pretty=True), encoding='utf-8')
 

@@ -50,12 +50,22 @@ class BuildTests(unittest.TestCase):
             self.assertLess((output / 'data.json').stat().st_size, (self.output / 'data.json').stat().st_size)
             manifest = json.loads((output / 'build-manifest.json').read_text())
             self.assertEqual(manifest['mode'], 'live')
+            self.assertEqual(manifest['schema_version'], 7)
             expected_contract_sha = hashlib.sha256((ROOT / 'catalogue/contract.json').read_bytes()).hexdigest()
             self.assertEqual(manifest['query_contract_sha256'], expected_contract_sha)
+            expected_release_objects = sorted([
+                'data.json',
+                self.data['reference_document'],
+                *(f"exports/{c['id']}-{p['export_suffix']}.csv"
+                  for c in self.data['charts'] for p in self.data['time_ranges']['periods']),
+            ])
+            self.assertEqual(manifest['release_objects'], expected_release_objects)
             for name, expected in manifest['files'].items():
                 self.assertEqual(hashlib.sha256((output / name).read_bytes()).hexdigest(), expected)
             offline_manifest = json.loads((self.output / 'build-manifest.json').read_text())
             self.assertEqual(offline_manifest['mode'], 'offline')
+            self.assertEqual(offline_manifest['schema_version'], 7)
+            self.assertEqual(offline_manifest['release_objects'], expected_release_objects)
             self.assertEqual(offline_manifest['query_contract_sha256'], expected_contract_sha)
 
     def test_source_measurements_and_queries_preserved(self):

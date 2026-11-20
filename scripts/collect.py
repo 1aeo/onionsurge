@@ -23,7 +23,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 import query_protocol as access
 from coarsening import COARSENING_DESCRIPTION, coarsen_cohort_mapping, coarsen_count, coarsen_population_row, coarsen_value
-from io_helpers import atomic_text, file_lock, parse_json as io_parse_json, read_regular_bytes, sha256_hex
+from io_helpers import atomic_text, file_lock, filesystem_contains, parse_json as io_parse_json, read_regular_bytes, sha256_hex
 from population_statistics import METHOD as POPULATION_METHOD
 from query_gateway import VIRTUAL_QUERIES
 from validation import RUNTIME_SOURCE_FIELDS as PROOF_LABELS, validate_snapshot
@@ -34,7 +34,26 @@ SSH_FIELDS = ('SOURCE_SSH_HOST', 'SOURCE_SSH_USER', 'SOURCE_SSH_PORT',
 ALIASES = {'circuit_rejections': 'circuit_rejected', 'introduction_rejections': 'introduce2_rejected',
            'exit_stream_rejections': 'stream_rejected'}
 SCALARS = {'protocol_closes', 'directory_waiting', 'open_circuits'}
+COHORT_ANCHORS = (
+    ('native', 'circuit_rejections', 'circuit_rejections'),
+    ('custom', 'hsdir_fetches', 'success'),
+    ('directory_defense', 'directory_rejections', 'begindir_rejected'),
+)
+COHORT_NAMES = tuple(cohort for cohort, _, _ in COHORT_ANCHORS)
+METADATA_KEYS = ('flags', 'targets', 'up')
+DIRCACHE_OPERATIONS = (
+    ('configured_nonexit_zero', 'combined_zero_nonexit'),
+    ('observed_controlport_zero', 'observed_zero'),
+    ('file_config_fallback_zero', 'file_fallback_zero'),
+    ('file0_observed1_conflicts_excluded', 'file0_observed1_conflicts'),
+)
 POPULATION_BATCH_POINTS = 3
+POPULATION_CONTEXT_DAYS = 32
+SAMPLED_HOUR_BACKFILL_MAX_DAYS = 560
+SOURCE_REQUEST_TIMEOUT = 55
+COLLECTION_OVERHEAD_SECONDS = 60
+MAX_CONFIG_BYTES = 65536
+MAX_KNOWN_HOSTS_BYTES = 65536
 MAX_SEED_BYTES = 64 * 1024 * 1024
 _ENV_LINE_RE = re.compile(r'(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=(.*)')
 _HOME_VAR_RE = re.compile(r'\$\{HOME\}|\$HOME(?![A-Za-z0-9_])')
@@ -85,7 +104,7 @@ def load_source_config(path, required=SSH_FIELDS, private=True):
     """Load private assignment-only source SSH settings safely without symlinks."""
     resolved = expand_path(path)
     try:
-        raw = read_regular_bytes(resolved, 65536, private=private)
+        raw = read_regular_bytes(resolved, MAX_CONFIG_BYTES, private=private)
     except ValueError as error:
         raise CollectionError(str(error)) from error
     values = parse_env(raw.decode('utf-8'))
@@ -131,24 +150,42 @@ def state_lock(directory):
         raise CollectionError(str(error)) from error
 
 
+def _validate_ssh_port(value):
+    if isinstance(value, bool):
+        raise CollectionError('Invalid source port')
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as error:
+        raise CollectionError('Invalid source port') from error
+    if not 1 <= port <= 65535:
+        raise CollectionError('Invalid source port')
+    return port
+
+
+def _validate_ssh_files(config):
+    port = _validate_ssh_port(config.get('SOURCE_SSH_PORT'))
+    host, user = config.get('SOURCE_SSH_HOST'), config.get('SOURCE_SSH_USER')
+    _require(isinstance(host, str) and bool(host.strip()) and isinstance(user, str) and bool(user.strip()),
+             'Missing source SSH target settings')
+    identity_raw = config.get('SOURCE_SSH_IDENTITY_FILE')
+    known_hosts_raw = config.get('SOURCE_SSH_KNOWN_HOSTS_FILE')
+    _require(bool(identity_raw) and bool(known_hosts_raw), 'Missing source SSH file paths')
+    identity_path = expand_path(identity_raw)
+    known_hosts_path = expand_path(known_hosts_raw)
+    try:
+        with access.regular_read(identity_path):
+            pass
+        known_hosts_bytes = read_regular_bytes(known_hosts_path, MAX_KNOWN_HOSTS_BYTES)
+        identity = identity_path.resolve(strict=True)
+        known_hosts = known_hosts_path.resolve(strict=True)
+    except (access.AccessError, OSError, ValueError) as error:
+        raise CollectionError('Source SSH file must be a readable regular file') from error
+    return port, identity_path, known_hosts_path, identity, known_hosts, known_hosts_bytes
+
+
 class SSHSource:
     def __init__(self, config):
-        try:
-            port = int(config['SOURCE_SSH_PORT'])
-        except (TypeError, ValueError) as error:
-            raise CollectionError('Invalid source port') from error
-        if not 1 <= port <= 65535:
-            raise CollectionError('Invalid source port')
-        identity_path = expand_path(config['SOURCE_SSH_IDENTITY_FILE'])
-        known_hosts_path = expand_path(config['SOURCE_SSH_KNOWN_HOSTS_FILE'])
-        try:
-            with access.regular_read(identity_path):
-                pass
-            known_hosts_bytes = read_regular_bytes(known_hosts_path, 65536)
-            identity = identity_path.resolve(strict=True)
-            known_hosts = known_hosts_path.resolve(strict=True)
-        except (access.AccessError, OSError, ValueError) as error:
-            raise CollectionError('Source SSH file must be a readable regular file') from error
+        port, _, _, identity, known_hosts, known_hosts_bytes = _validate_ssh_files(config)
         self.arguments = ['ssh', '-F', '/dev/null', '-T', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
                           '-o', 'UpdateHostKeys=no', '-o', 'ForwardAgent=no', '-o', 'ClearAllForwardings=yes',
                           '-o', 'IdentitiesOnly=yes', '-o', 'IdentityAgent=none', '-o', 'PermitLocalCommand=no',
@@ -166,7 +203,8 @@ class SSHSource:
     def command(self, command):
         self.requests += 1
         try:
-            result = subprocess.run([*self.arguments, command], capture_output=True, timeout=55, check=False)
+            result = subprocess.run([*self.arguments, command], capture_output=True,
+                                    timeout=SOURCE_REQUEST_TIMEOUT, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
             raise CollectionError('Source SSH request failed') from error
         if result.returncode or len(result.stdout) > access.MAX_RESPONSE:
@@ -568,9 +606,7 @@ class Collector:
         data.setdefault('history_methods', {})['coarsening'] = COARSENING_DESCRIPTION
         charts_by_id = {c['id']: c for c in data['charts']}
         raw_totals = {}
-        for cohort, chart_id, key in [('native', 'circuit_rejections', 'circuit_rejections'),
-                                     ('custom', 'hsdir_fetches', 'success'),
-                                     ('directory_defense', 'directory_rejections', 'begindir_rejected')]:
+        for cohort, chart_id, key in COHORT_ANCHORS:
             chart = charts_by_id.get(chart_id)
             _require(chart is not None, f'Missing cohort anchor chart: {chart_id}')
             series = next((s for s in chart['series'] if s['key'] == key), None)
@@ -580,7 +616,7 @@ class Collector:
         cohort_totals = {cohort: coarsen_count(total) for cohort, total in raw_totals.items()}
         data.update(fleet=cohort_totals['native'], custom=cohort_totals['custom'], defense=cohort_totals['directory_defense'])
         current_times = list(range(end - DAY + HOUR, end + 1, HOUR))
-        context_times = list(range(end - 32 * DAY, end + 1, HOUR))
+        context_times = list(range(end - POPULATION_CONTEXT_DAYS * DAY, end + 1, HOUR))
         target_day = (end // DAY) * DAY
         target_sh = (end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
         for chart in data['charts']:
@@ -641,7 +677,8 @@ class Collector:
                         chart_c=chart_c, enforce_chart_floor=True,
                     )
                     if not sh_rows:
-                        raw_first = max(int(rows[0][0]) - DAY + SAMPLED_HOUR_STEP, target_sh - 560 * DAY)
+                        raw_first = max(int(rows[0][0]) - DAY + SAMPLED_HOUR_STEP,
+                                        target_sh - SAMPLED_HOUR_BACKFILL_MAX_DAYS * DAY)
                         first_sh = ((raw_first + SAMPLED_HOUR_STEP - 1) // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
                         sh_times = list(range(first_sh, target_sh + 1, SAMPLED_HOUR_STEP))
                     else:
@@ -709,7 +746,7 @@ class Collector:
                     chart, series, end, fetched_raw_n, fetched_hr_map, fetched_cur24_raw_n)
         data['versions'] = self.versions(end, raw_totals, cohort_totals)
         data['snapshot_flags'] = {}
-        for key in ['flags', 'targets', 'up']:
+        for key in METADATA_KEYS:
             rows = [{'metric': row['metric'], 'value': [row['values'][0][0], str(coarsen_count(number(row['values'][0][1], True)))]}
                     for row in self.endpoint('metadata.' + key, end)['data']['result']]
             data['snapshot_flags'][key] = {'query': self.queries[self.routes['metadata.' + key]],
@@ -722,8 +759,7 @@ class Collector:
         data['flags'] = flags
         seed_dir = data.get('dircache_cohort', {})
         directory = {key: seed_dir[key] for key in ('method', 'source') if key in seed_dir}
-        for field, operation in [('configured_nonexit_zero', 'combined_zero_nonexit'), ('observed_controlport_zero', 'observed_zero'),
-                                 ('file_config_fallback_zero', 'file_fallback_zero'), ('file0_observed1_conflicts_excluded', 'file0_observed1_conflicts')]:
+        for field, operation in DIRCACHE_OPERATIONS:
             if (val := self.scalar('dircache.' + operation, end)) is not None:
                 directory[field] = coarsen_count(val)
         data['dircache_cohort'] = directory
@@ -742,43 +778,417 @@ def resolve_seed_path(config, app, seed=None):
     return app / 'inputs/snapshot.json', False
 
 
-def collect(config, application_dir, state_dir, output, end=None, source=None, seed=None):
+def _read_bounded(path, max_bytes, *, private=False):
+    try:
+        return read_regular_bytes(path, max_bytes, private=private)
+    except ValueError as error:
+        raise CollectionError(str(error)) from error
+
+
+def _resolve_overlap_variants(path):
+    expanded = expand_path(path)
+    try:
+        full_resolved = expanded.resolve()
+        parent_resolved = expanded.parent.resolve() / expanded.name
+    except OSError as error:
+        raise CollectionError('Invalid path in overlap check') from error
+    return (full_resolved,) if parent_resolved == full_resolved else (full_resolved, parent_resolved)
+
+
+def _paths_overlap(left, right):
+    left_variants = _resolve_overlap_variants(left)
+    right_variants = _resolve_overlap_variants(right)
+    return any(
+        filesystem_contains(a, b) or filesystem_contains(b, a)
+        for a in left_variants
+        for b in right_variants
+    )
+
+
+def _assert_disjoint(protected_paths, forbidden_paths, message):
+    for candidate in protected_paths:
+        for forbidden in forbidden_paths:
+            if _paths_overlap(candidate, forbidden):
+                raise CollectionError(message)
+
+
+def _compute_source_identity(config_digest, known_hosts_digest, seed_sha, queries_sha):
+    payload = json.dumps(
+        {'config': config_digest, 'known_hosts': known_hosts_digest, 'queries': queries_sha, 'seed': seed_sha},
+        allow_nan=False, sort_keys=True, separators=(',', ':'),
+    ).encode('utf-8')
+    return sha256_hex(payload)
+
+
+def _require_private_dir(path, missing_message, invalid_message):
+    try:
+        info = path.lstat()
+    except FileNotFoundError as error:
+        raise CollectionError(missing_message) from error
+    _require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077), invalid_message)
+
+
+def _cache_has_rows(db_path, *, require_table=False):
+    try:
+        info = db_path.lstat()
+    except FileNotFoundError:
+        _require(not require_table, 'Observation cache must contain committed rows before recording a checkpoint')
+        return False
+    except OSError as error:
+        raise CollectionError('Observation cache must be a private owned regular file') from error
+    _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077),
+             'Observation cache must be a private owned regular file')
+    if info.st_size == 0:
+        _require(not require_table, 'Observation cache must contain committed rows before recording a checkpoint')
+        return False
+    try:
+        conn = sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?mode=ro', uri=True)
+        try:
+            return conn.execute('SELECT 1 FROM observations LIMIT 1').fetchone() is not None
+        except sqlite3.OperationalError as error:
+            if not require_table and 'no such table' in str(error).lower():
+                return False
+            raise CollectionError('Invalid observation cache database') from error
+        finally:
+            conn.close()
+    except sqlite3.Error as error:
+        raise CollectionError('Invalid observation cache database') from error
+
+
+def _inspect_warm_checkpoint(state, source_identity_sha256, now_hour):
+    """Read state checkpoint and cache DB without mutating or creating state_dir."""
+    if not os.path.lexists(state):
+        return None
+    _require_private_dir(state, 'Collector state directory is missing',
+                         'Collector state directory must be private owned')
+    checkpoint_path = state / 'checkpoint.json'
+    cp = None
+    if os.path.lexists(checkpoint_path):
+        cp_raw = _read_bounded(checkpoint_path, MAX_CONFIG_BYTES, private=True)
+        cp = parse_json(cp_raw)
+        _require(isinstance(cp, dict), 'Invalid collector checkpoint')
+    has_rows = _cache_has_rows(state / 'observations.sqlite3', require_table=False)
+    if not (cp is not None and has_rows and cp.get('source_identity_sha256') == source_identity_sha256):
+        return None
+    obs_end = cp.get('observation_end')
+    if isinstance(obs_end, bool) or not isinstance(obs_end, int) or obs_end <= 0 or obs_end % HOUR != 0 or obs_end > now_hour:
+        return None
+    return obs_end
+
+
+def _batch_capacity(step, *, population=False):
+    max_pts = POPULATION_BATCH_POINTS if population else access.MAX_POINTS
+    return max(1, min(max_pts, 1 + (access.MAX_RANGE // step)))
+
+
+def _batch_count(point_count, step, *, population=False):
+    if point_count <= 0:
+        return 0
+    return math.ceil(point_count / _batch_capacity(step, population=population))
+
+
+def _contiguous_run_batches(times, step, *, population=False):
+    ordered = sorted(set(times))
+    if not ordered:
+        return 0
+    cap = _batch_capacity(step, population=population)
+    batches = 0
+    run_len = 1
+    prev = ordered[0]
+    for t in ordered[1:]:
+        if t == prev + step:
+            run_len += 1
+        else:
+            batches += math.ceil(run_len / cap)
+            run_len = 1
+        prev = t
+    return batches + math.ceil(run_len / cap)
+
+
+def _plan_max_requests(routes, queries, charts, end, *, warm_end, catchup_days):
+    """Return exact worst-case sequential gateway request count for collect()."""
+    requests = 1  # Initial catalogue handshake (`queries`).
+    virtual_hits = {routes['version.attestation_proof_metadata']: 2}
+    for cohort in COHORT_NAMES:
+        virtual_hits[routes[f'cohort.{cohort}_attested']] = 1
+
+    hour_end_cached = set()
+    hour_end_covered = set()
+
+    def record_hour_end(query_id):
+        if query_id in VIRTUAL_QUERIES:
+            return
+        hour_end_cached.add(query_id)
+
+    for q_id, count in virtual_hits.items():
+        if q_id in VIRTUAL_QUERIES:
+            requests += count
+        else:
+            record_hour_end(q_id)
+    for cohort in COHORT_NAMES:
+        record_hour_end(routes[f'cohort.{cohort}_verified_binary'])
+    for k in METADATA_KEYS:
+        record_hour_end(routes[f'metadata.{k}'])
+    for _, op in DIRCACHE_OPERATIONS:
+        record_hour_end(routes[f'dircache.{op}'])
+
+    chart_ids = {c['id'] for c in charts}
+    anchor_avail = {routes[f'{cid}.current_hour.available'] for _, cid, _ in COHORT_ANCHORS if cid in chart_ids}
+    context_points = (POPULATION_CONTEXT_DAYS * DAY) // HOUR + 1
+    hour_points = DAY // HOUR
+
+    for q_id in {routes[f'{c["id"]}.current_hour.eligible'] for c in charts}:
+        requests += _batch_count(context_points, HOUR)
+        hour_end_covered.add(q_id)
+    for q_id in {routes[f'{c["id"]}.current_hour.available'] for c in charts}:
+        if q_id in anchor_avail:
+            requests += 1 + _batch_count(hour_points - 1, HOUR)
+        else:
+            requests += _batch_count(hour_points, HOUR)
+        hour_end_covered.add(q_id)
+    for q_id in {routes[f'{c["id"]}.current_hour.value'] for c in charts}:
+        requests += _batch_count(hour_points, HOUR)
+        hour_end_covered.add(q_id)
+
+    for c in charts:
+        record_hour_end(routes[f'{c["id"]}.relay_population.hour'])
+
+    daily_charts = [c for c in charts if any(s.get('history', {}).get('daily') for s in c['series'])]
+    if daily_charts:
+        for c in daily_charts:
+            for stat_name in ('eligible', 'available', 'value'):
+                record_hour_end(routes[f'{c["id"]}.current24.{stat_name}'])
+            record_hour_end(routes[f'{c["id"]}.relay_population.day'])
+    else:
+        for c in charts:
+            record_hour_end(routes[f'{c["id"]}.relay_population.day'])
+
+    requests += len(hour_end_cached - hour_end_covered)
+
+    if daily_charts:
+        daily_step_queries = {
+            routes[f'{c["id"]}.daily.{stat_name}']
+            for c in daily_charts for stat_name in ('eligible', 'available', 'value')
+        }
+        requests += len(daily_step_queries) * _batch_count(catchup_days, DAY)
+
+        target_sh = (end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+        sh_earliest_by_q = {}
+        for c in daily_charts:
+            missing_sh = [int(s['history']['daily'][0][0]) for s in c['series']
+                          if s.get('history', {}).get('daily') and not s['history'].get('sampled_hour')]
+            if missing_sh and warm_end is None:
+                earliest_start = min(missing_sh)
+                for stat_name in ('eligible', 'available', 'value'):
+                    q_id = routes[f'{c["id"]}.sampled_hour.{stat_name}']
+                    prev = sh_earliest_by_q.get(q_id)
+                    sh_earliest_by_q[q_id] = earliest_start if prev is None else min(prev, earliest_start)
+        sh_queries = {
+            routes[f'{c["id"]}.sampled_hour.{stat_name}']
+            for c in daily_charts for stat_name in ('eligible', 'available', 'value')
+        }
+        for q_id in sh_queries:
+            if q_id in sh_earliest_by_q:
+                raw_first = max(sh_earliest_by_q[q_id] - DAY + SAMPLED_HOUR_STEP,
+                                target_sh - SAMPLED_HOUR_BACKFILL_MAX_DAYS * DAY)
+                first_sh = ((raw_first + SAMPLED_HOUR_STEP - 1) // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+                sh_pts = max(0, ((target_sh - first_sh) // SAMPLED_HOUR_STEP) + 1)
+            else:
+                sh_pts = catchup_days * (DAY // SAMPLED_HOUR_STEP)
+            requests += _batch_count(sh_pts, SAMPLED_HOUR_STEP)
+
+        pop_day_queries = {routes[f'{c["id"]}.relay_population.day'] for c in daily_charts}
+        requests += len(pop_day_queries) * _batch_count(catchup_days, DAY, population=True)
+
+        if warm_end is None:
+            missing_pop_by_q = {}
+            missing_elig_by_q = {}
+            for c in daily_charts:
+                pop_q = routes[f'{c["id"]}.relay_population.day']
+                elig_q = routes[f'{c["id"]}.daily.eligible']
+                for s in c['series']:
+                    daily_rows = s.get('history', {}).get('daily', [])
+                    if not daily_rows:
+                        continue
+                    seed_end_daily = int(daily_rows[-1][0])
+                    qualified = {int(r[0]): r[2] for r in daily_rows if r[4] and int(r[0]) <= seed_end_daily}
+                    retained = s.get('relay_population', {})
+                    if (retained.get('method') == POPULATION_METHOD
+                            and retained.get('queries', {}).get('day') == queries.get(pop_q)):
+                        present = {int(r[0]) for r in retained.get('daily', [])
+                                   if int(r[0]) in qualified and r[1] == qualified[int(r[0])]}
+                    else:
+                        present = set()
+                    gap_dates = qualified.keys() - present
+                    if gap_dates:
+                        missing_pop_by_q.setdefault(pop_q, set()).update(gap_dates)
+                        missing_elig_by_q.setdefault(elig_q, set()).update(gap_dates)
+            for q_id, dates in missing_pop_by_q.items():
+                requests += _contiguous_run_batches(dates, DAY, population=True)
+            for q_id, dates in missing_elig_by_q.items():
+                requests += _contiguous_run_batches(dates, DAY, population=False)
+
+    return requests
+
+
+def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
+                     config_path=None, forbid_overlap=(), output=None, require_ssh=False):
     app = Path(ROOT if application_dir is None else application_dir).resolve()
-    state, output = Path(state_dir).absolute(), Path(output).absolute()
+    state = Path(state_dir).absolute()
+    cfg_path = None
+    if config_path is not None:
+        cfg_path = expand_path(config_path)
+        cfg_bytes = _read_bounded(cfg_path, MAX_CONFIG_BYTES, private=True)
+        config_digest = sha256_hex(cfg_bytes)
+    else:
+        config_digest = sha256_hex(
+            json.dumps(dict(sorted(config.items())), allow_nan=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        )
     seed_path, private_seed = resolve_seed_path(config, app, seed)
     catalogue_dir = (app / 'catalogue') if (app / 'catalogue/queries.json').is_file() else (ROOT / 'catalogue')
     queries_path, routes_path = catalogue_dir / 'queries.json', catalogue_dir / 'routes.json'
-    _require(output.resolve() not in {seed_path.resolve(), seed_path.absolute(),
-                                      (state / 'observations.sqlite3').resolve(),
-                                      (state / 'collect.lock').resolve(), queries_path.resolve(), routes_path.resolve()},
-             'Collector output overlaps its source, catalogue, or cache')
+    if output is not None:
+        out = Path(output).absolute()
+        _require(out.resolve() not in {seed_path.resolve(), seed_path.absolute(),
+                                        (state / 'observations.sqlite3').resolve(),
+                                        (state / 'checkpoint.json').resolve(),
+                                        (state / 'collect.lock').resolve(),
+                                        queries_path.resolve(), routes_path.resolve()},
+                 'Collector output overlaps its source, catalogue, or cache')
+    known_hosts_bytes = None
+    if require_ssh:
+        _, identity_path, known_hosts_path, _, _, known_hosts_bytes = _validate_ssh_files(config)
+    else:
+        if config.get('SOURCE_SSH_PORT') is not None and str(config['SOURCE_SSH_PORT']).strip():
+            _validate_ssh_port(config['SOURCE_SSH_PORT'])
+        identity_path = expand_path(config['SOURCE_SSH_IDENTITY_FILE']) if config.get('SOURCE_SSH_IDENTITY_FILE') else None
+        known_hosts_path = expand_path(config['SOURCE_SSH_KNOWN_HOSTS_FILE']) if config.get('SOURCE_SSH_KNOWN_HOSTS_FILE') else None
+        if identity_path is not None and os.path.lexists(identity_path):
+            try:
+                with access.regular_read(identity_path):
+                    pass
+            except (access.AccessError, OSError, ValueError) as error:
+                raise CollectionError('Source SSH file must be a readable regular file') from error
+        if known_hosts_path is not None and os.path.lexists(known_hosts_path):
+            known_hosts_bytes = _read_bounded(known_hosts_path, MAX_KNOWN_HOSTS_BYTES)
+    if private_seed:
+        seed_conflicts = [state] + ([cfg_path] if cfg_path is not None else [])
+        _assert_disjoint([seed_path], seed_conflicts, 'Configured seed snapshot overlaps source config or state directory')
+    if forbid_overlap:
+        protected = [p for p in (cfg_path, identity_path, known_hosts_path, state,
+                                 seed_path if private_seed else None) if p is not None]
+        _assert_disjoint(protected, forbid_overlap, 'Collector configuration or state overlaps forbidden directory')
+
     now_hour = (int(time.time()) // HOUR) * HOUR
     end = now_hour if end is None else end
     _require(type(end) is int and end % HOUR == 0 and end <= now_hour,
              'Collection end must be a completed UTC hour at or after the seed')
-    if private_seed:
-        try:
-            seed_bytes = read_regular_bytes(seed_path, MAX_SEED_BYTES, private=True)
-        except ValueError as error:
-            raise CollectionError(str(error)) from error
-    else:
-        seed_bytes = seed_path.read_bytes()
-    seed = parse_json(seed_bytes)
-    validate_snapshot(seed, allow_v3_seed=True)
-    _require(seed['end'] <= end,
+    seed_bytes = _read_bounded(seed_path, MAX_SEED_BYTES, private=private_seed)
+    seed_obj = parse_json(seed_bytes)
+    validate_snapshot(seed_obj, allow_v3_seed=True)
+    _require(seed_obj['end'] <= end,
              'Collection end must be a completed UTC hour at or after the seed')
-    queries, routes = read_json(queries_path), read_json(routes_path)
+    queries_bytes = _read_bounded(queries_path, MAX_SEED_BYTES)
+    routes_bytes = _read_bounded(routes_path, MAX_SEED_BYTES)
+    queries, routes = parse_json(queries_bytes), parse_json(routes_bytes)
+    return {
+        'state': state,
+        'end': end,
+        'now_hour': now_hour,
+        'config_digest': config_digest,
+        'known_hosts_path': known_hosts_path,
+        'known_hosts_bytes': known_hosts_bytes,
+        'seed': seed_obj,
+        'seed_sha': sha256_hex(seed_bytes),
+        'queries': queries,
+        'queries_sha': sha256_hex(queries_bytes),
+        'routes': routes,
+    }
+
+
+def plan_collection(config, application_dir, state_dir, previous_end=None, max_catchup_days=31,
+                    end=None, seed=None, *, config_path=None, forbid_overlap=()):
+    _require(type(max_catchup_days) is int and max_catchup_days >= 1,
+             'Maximum catch-up days must be a positive integer')
+    ctx = _prepare_context(config, application_dir, state_dir, end=end, seed=seed,
+                           config_path=config_path, forbid_overlap=forbid_overlap, require_ssh=True)
+    target_end = ctx['end']
+    if previous_end is not None:
+        _require(type(previous_end) is int and previous_end > 0 and target_end >= previous_end,
+                 'Collection end precedes previous observation end')
+    source_id = _compute_source_identity(
+        ctx['config_digest'], sha256_hex(ctx['known_hosts_bytes']), ctx['seed_sha'], ctx['queries_sha'])
+    warm_end = _inspect_warm_checkpoint(ctx['state'], source_id, ctx['now_hour'])
+
+    seed_obj = ctx['seed']
+    seed_earliest_end = int(seed_obj['end'])
+    for chart in seed_obj['charts']:
+        for series in chart['series']:
+            history = series.get('history', {})
+            for field in ('daily', 'sampled_hour'):
+                hist_rows = history.get(field)
+                if hist_rows:
+                    seed_earliest_end = min(seed_earliest_end, int(hist_rows[-1][0]))
+
+    baseline_end = warm_end if warm_end is not None else seed_earliest_end
+    if previous_end is not None:
+        baseline_end = min(previous_end, baseline_end)
+    catchup_days = 1 if target_end <= baseline_end else max(1, math.ceil((target_end - baseline_end) / DAY))
+    _require(catchup_days <= max_catchup_days, 'Catch-up exceeds automated window; run manual collection first')
+    max_requests = _plan_max_requests(ctx['routes'], ctx['queries'], seed_obj['charts'], target_end,
+                                      warm_end=warm_end, catchup_days=catchup_days)
+    timeout_s = max_requests * SOURCE_REQUEST_TIMEOUT + COLLECTION_OVERHEAD_SECONDS
+    return {'snapshot_end': target_end, 'catchup_days': catchup_days, 'recommended_timeout_seconds': timeout_s}
+
+
+def record_checkpoint(config, application_dir, state_dir, end, seed=None, *,
+                      config_path=None, forbid_overlap=()):
+    _require(type(end) is int, 'Checkpoint end must be an integer UTC hour')
+    ctx = _prepare_context(config, application_dir, state_dir, end=end, seed=seed,
+                           config_path=config_path, forbid_overlap=forbid_overlap, require_ssh=True)
+    state = ctx['state']
+    _require_private_dir(state, 'Collector state directory must exist before recording a checkpoint',
+                         'Collector state directory must be private owned')
+    source_id = _compute_source_identity(
+        ctx['config_digest'], sha256_hex(ctx['known_hosts_bytes']), ctx['seed_sha'], ctx['queries_sha'])
+    previous_umask = os.umask(0o077)
+    try:
+        with state_lock(state):
+            _require(_cache_has_rows(state / 'observations.sqlite3', require_table=True),
+                     'Observation cache must contain committed rows before recording a checkpoint')
+            atomic_json(state / 'checkpoint.json',
+                        {'source_identity_sha256': source_id, 'observation_end': ctx['end']})
+    finally:
+        os.umask(previous_umask)
+    return {'status': 'checkpoint_recorded', 'observation_end': ctx['end']}
+
+
+def collect(config, application_dir, state_dir, output, end=None, source=None, seed=None, *,
+            config_path=None, forbid_overlap=()):
+    ctx = _prepare_context(config, application_dir, state_dir, end=end, seed=seed,
+                           config_path=config_path, forbid_overlap=forbid_overlap,
+                           output=output, require_ssh=False)
+    state, target_end = ctx['state'], ctx['end']
+    out = Path(output).absolute()
+    queries, routes, seed_obj = ctx['queries'], ctx['routes'], ctx['seed']
     source = source or SSHSource(config)
+    kh_path = ctx['known_hosts_path']
+    if kh_path is not None and os.path.lexists(kh_path):
+        kh_digest = sha256_hex(_read_bounded(kh_path, MAX_KNOWN_HOSTS_BYTES))
+    else:
+        kh_digest = getattr(source, 'identity', '')
+    source_id = _compute_source_identity(ctx['config_digest'], kh_digest, ctx['seed_sha'], ctx['queries_sha'])
     _require(source.catalogue() == queries, 'Source query catalogue differs from the reviewed release')
+    cache_committed = False
     previous_umask = os.umask(0o077)
     try:
         with state_lock(state):
             cache = ObservationCache(state / 'observations.sqlite3', source, queries)
             try:
                 try:
-                    data = Collector(source, cache, queries, routes, seed).collect(end, sha256_hex(seed_bytes))
+                    data = Collector(source, cache, queries, routes, seed_obj).collect(target_end, ctx['seed_sha'])
                     validate_snapshot(data)
-                    atomic_json(output, data)
+                    atomic_json(out, data)
                 except BaseException:
                     try:
                         cache.rollback()
@@ -793,12 +1203,21 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                     except (sqlite3.Error, OSError):
                         pass
                     sys.stderr.write('Collection warning: observation cache commit failed after snapshot publication.\n')
+                else:
+                    try:
+                        atomic_json(state / 'checkpoint.json',
+                                    {'source_identity_sha256': source_id, 'observation_end': target_end})
+                    except OSError:
+                        sys.stderr.write('Collection warning: collector checkpoint update failed after snapshot publication.\n')
+                    else:
+                        cache_committed = True
             finally:
                 cache.close()
     finally:
         os.umask(previous_umask)
-    return {'snapshot_end': end, 'charts': len(data['charts']), 'series': sum(len(c['series']) for c in data['charts']),
-            'source_requests': source.requests}
+    return {'snapshot_end': target_end, 'charts': len(data['charts']),
+            'series': sum(len(c['series']) for c in data['charts']),
+            'source_requests': source.requests, 'cache_committed': cache_committed}
 
 
 def main(argv=None):
@@ -806,17 +1225,47 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--application-dir', type=Path, default=ROOT)
     parser.add_argument('--state-dir', type=Path, required=True)
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--seed', type=Path)
     parser.add_argument('--end', type=int)
+    parser.add_argument('--plan', action='store_true')
+    parser.add_argument('--record-checkpoint', action='store_true')
+    parser.add_argument('--previous-end', type=int)
+    parser.add_argument('--max-catchup-days', type=int)
+    parser.add_argument('--forbid-overlap', action='append', type=Path, default=[])
     args = parser.parse_args(argv)
+    if args.plan and args.record_checkpoint:
+        parser.error('Cannot combine --plan and --record-checkpoint')
+    if (args.plan or args.record_checkpoint) and args.output is not None:
+        parser.error('--output cannot be used with --plan or --record-checkpoint')
+    if not args.plan and not args.record_checkpoint and args.output is None:
+        parser.error('--output is required unless using --plan or --record-checkpoint')
+    if args.record_checkpoint and args.end is None:
+        parser.error('--end is required with --record-checkpoint')
+    if not args.plan and (args.previous_end is not None or args.max_catchup_days is not None):
+        parser.error('--previous-end and --max-catchup-days require --plan')
+    max_catchup_days = 31 if args.max_catchup_days is None else args.max_catchup_days
+    failure_message = ('Collection plan failed.\n' if args.plan else
+                       'Checkpoint recording failed.\n' if args.record_checkpoint else
+                       'Collection failed; previous snapshot retained.\n')
     try:
-        config = load_source_config(args.config, required=SSH_FIELDS, private=True)
+        config_path = expand_path(args.config)
+        config = load_source_config(config_path, required=SSH_FIELDS, private=True)
         app_dir = ROOT if args.application_dir == ROOT else expand_path(args.application_dir)
-        print(json.dumps(collect(config, app_dir, expand_path(args.state_dir), expand_path(args.output),
-                                 args.end, seed=args.seed)))
+        state_dir = expand_path(args.state_dir)
+        forbidden = [expand_path(p) for p in args.forbid_overlap]
+        if args.plan:
+            result = plan_collection(config, app_dir, state_dir, args.previous_end, max_catchup_days,
+                                     args.end, seed=args.seed, config_path=config_path, forbid_overlap=forbidden)
+        elif args.record_checkpoint:
+            result = record_checkpoint(config, app_dir, state_dir, args.end, seed=args.seed,
+                                       config_path=config_path, forbid_overlap=forbidden)
+        else:
+            result = collect(config, app_dir, state_dir, expand_path(args.output), args.end, seed=args.seed,
+                             config_path=config_path, forbid_overlap=forbidden)
+        print(json.dumps(result))
     except (CollectionError, access.AccessError, OSError, ValueError, KeyError, TypeError, sqlite3.Error):
-        parser.exit(1, 'Collection failed; previous snapshot retained.\n')
+        parser.exit(1, failure_message)
 
 
 if __name__ == '__main__':

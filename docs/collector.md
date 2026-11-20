@@ -16,17 +16,39 @@ python3 scripts/collect.py \
   --output "$HOME/.local/state/onionsurge/snapshot.json"
 ```
 
-`--application-dir` is optional and defaults to the checkout containing `scripts/collect.py`.
+Two companion subcommands support orchestrated hourly runners without exposing `source.env`, SSH keys, `observations.sqlite3`, or seed snapshots outside the collector:
+
+```sh
+python3 scripts/collect.py --plan --config ... --state-dir ... [--previous-end T] [--max-catchup-days 31] [--forbid-overlap PATH ...]
+python3 scripts/collect.py --record-checkpoint --config ... --state-dir ... --end T [--forbid-overlap PATH ...]
+```
+
+- `--application-dir` is optional and defaults to the checkout containing `scripts/collect.py`.
 When `catalogue/queries.json` exists under `--application-dir`, that directory is
 selected for both `catalogue/queries.json` and `catalogue/routes.json` (the collector
 does not fall back to its own checkout's `routes.json`, so an alternate override must
 provide both files); otherwise both catalogue files come from the collector's own checkout.
-`--seed PATH` or optional `SOURCE_SEED_SNAPSHOT` in `source.env` selects a private
+- `--seed PATH` or optional `SOURCE_SEED_SNAPSHOT` in `source.env` selects a private
 `0600` non-symlink regular file as the retained-history seed instead of
 `inputs/snapshot.json` (so production telemetry stays private while example fixtures
-remain synthetic). Output paths overlapping the active seed snapshot (`--seed`,
-`SOURCE_SEED_SNAPSHOT`, or `inputs/snapshot.json`), `observations.sqlite3`, `collect.lock`,
-`queries.json`, or `routes.json` are rejected.
+remain synthetic). Repeatable `--forbid-overlap PATH` rejects any path overlap (including
+symlinks and non-existent descendants) across `source.env`, `SOURCE_SSH_IDENTITY_FILE`,
+`SOURCE_SSH_KNOWN_HOSTS_FILE`, `--state-dir`, and any configured private seed; private
+seeds must also be disjoint from `source.env` and `--state-dir`, and `--output` cannot
+overlap the seed, `observations.sqlite3`, `checkpoint.json`, `collect.lock`, `queries.json`,
+or `routes.json`.
+- `--plan` is strictly read-only on missing `--state-dir` (never creates it or opens SSH),
+fails closed on symlinked/non-private/corrupt state artifacts, computes a deterministic
+`source_identity_sha256` from `source.env` raw bytes, `SOURCE_SSH_KNOWN_HOSTS_FILE`, seed,
+and `catalogue/queries.json`, checks `<state_dir>/checkpoint.json` against committed rows in
+`observations.sqlite3`, enforces `--max-catchup-days`, and prints `{snapshot_end, catchup_days,
+recommended_timeout_seconds}` dynamically sized from `catalogue/routes.json`, protocol batch
+bounds, and any cold `v3` `sampled_hour` backfill span.
+- Normal collection prints `{snapshot_end, charts, series, source_requests, cache_committed}`,
+atomically updating `0600` `<state_dir>/checkpoint.json` only after both output publication and
+`cache.commit()` succeed (`cache_committed: false` leaves the checkpoint unchanged). `--record-checkpoint`
+verifies `observations.sqlite3` has at least one committed row under the collector lock and
+records `checkpoint.json` explicitly (for example after manual catch-up).
 The default endpoint is the latest completed UTC hour
 (`(int(time.time()) // 3600) * 3600`). `--end UNIX_SECONDS` selects another
 completed UTC-hour timestamp at or after the seed snapshot (`end % 3600 == 0`).
