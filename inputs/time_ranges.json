@@ -1,8 +1,7 @@
 {
   "version": 1,
-  "default_range": "1mo",
+  "default_range": "24h",
   "legacy_aliases": {
-    "24h": "1mo",
     "30d": "1mo",
     "1m": "1mo",
     "3m": "3mo",
@@ -10,13 +9,28 @@
     "12m": "12mo"
   },
   "card_slots": {
-    "fallback_dynamic": "1mo",
+    "fallback_dynamic": "6mo",
     "fixed": [
-      "6mo",
+      "24h",
       "all"
     ]
   },
   "periods": [
+    {
+      "id": "24h",
+      "summary_key": "twenty_four_hours",
+      "export_suffix": "24h",
+      "label": "24 hours",
+      "average_label": "Last 24 hours",
+      "plot_label": "24-hour snapshot",
+      "window": {
+        "unit": "hours",
+        "count": 24,
+        "comparison_lag_days": 0
+      },
+      "minimum_coverage": 0,
+      "minimum_comparison_windows": 30
+    },
     {
       "id": "7d",
       "summary_key": "seven_days",

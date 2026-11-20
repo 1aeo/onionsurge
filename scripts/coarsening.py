@@ -4,12 +4,14 @@ from fractions import Fraction
 from functools import lru_cache
 import math
 
-from windows import DAY, MAX_SAFE_INT, MINIMUM_POPULATION_COVERAGE, non_negative, require, timestamp
+from windows import DAY, HOUR, MAX_SAFE_INT, MINIMUM_POPULATION_COVERAGE, non_negative, require, timestamp
 
 SENSITIVE_CHARTS = frozenset({'hsdir_fetches', 'hsdir_uploads', 'introduction_rejections'})
-VALID_KINDS = frozenset({'counter_daily_rate', 'gauge_daily_mean'})
+_COUNTER_KINDS = frozenset({'counter_hour_rate', 'counter_daily_rate'})
+_GAUGE_KINDS = frozenset({'gauge_hour_mean', 'gauge_daily_mean'})
+VALID_KINDS = _COUNTER_KINDS | _GAUGE_KINDS
 SENSITIVE_BIN = Decimal('0.001')
-_D_ONE, _D_EIGHT, _D_HUNDRED, _D_DAY = Decimal(1), Decimal(8), Decimal(100), Decimal(DAY)
+_D_ONE, _D_EIGHT, _D_HUNDRED = Decimal(1), Decimal(8), Decimal(100)
 _D_RATE_CAP, _D_OPEN_CAP, _D_GAUGE_FLOOR, _D_GAUGE_STEP = Decimal('1e10'), Decimal('1e4'), Decimal('0.05'), Decimal('0.1')
 COARSENING_DESCRIPTION = (
     'Deterministic dir-spec coarsening at snapshot boundaries: standalone public relay, flag, '
@@ -17,13 +19,13 @@ COARSENING_DESCRIPTION = (
     'nearest multiple of 8 (preserving classified <= total and role <= non_middle), while '
     'partitioned build, cohort and middle_only/non-middle role breakdowns distribute multiples '
     'of 8 by largest remainder so parts sum to the coarsened total (individual parts may '
-    'differ from nearest-multiple rounding). open_circuits daily means are rounded to the '
+    'differ from nearest-multiple rounding). open_circuits means are rounded to the '
     'nearest 100 circuits, then to 3 significant digits; hsdir_fetches, hsdir_uploads, '
-    'introduction_rejections, and directory_requests hs_get/hs_post are binned to 0.001/s, '
-    'then rounded to 3 significant digits; other counter series suppress <8 events/day, bin '
-    'to 8-event increments, and round rates to 3 significant digits; and non-sensitive gauge '
-    'means (directory_waiting) floor <0.05 to 0, quantize [0.05, 1) to 0.1, and round >=1 '
-    'to 3 significant digits.'
+    'introduction_rejections, and directory_requests hs_get/hs_post suppress <8 events/window '
+    'and bin to 0.001/s, then round to 3 significant digits; other counter series suppress <8 '
+    'events/window, bin to 8-event increments, and round rates to 3 significant digits; and '
+    'non-sensitive gauge means (directory_waiting) floor <0.05 to 0, quantize [0.05, 1) to 0.1, '
+    'and round >=1 to 3 significant digits.'
 )
 
 
@@ -87,16 +89,22 @@ def is_sensitive_series(chart_id, series_key):
     return chart_id in SENSITIVE_CHARTS or (chart_id == 'directory_requests' and series_key in {'hs_get', 'hs_post'})
 
 
-def coarsen_value(chart_id, series_key, kind, value):
-    """Quantize daily fleet rates and gauge means according to the public coarsening policy."""
+def _check_rate_params(chart_id, series_key, kind, window_seconds):
     require(isinstance(chart_id, str) and isinstance(series_key, str), 'Chart and series keys must be strings')
     require(isinstance(kind, str) and kind in VALID_KINDS, 'Unsupported measurement kind')
+    require(type(window_seconds) is int and window_seconds > 0, 'Invalid coarsening window')
+
+
+def coarsen_value(chart_id, series_key, kind, value, *, window_seconds=DAY):
+    """Quantize hourly or daily fleet rates and gauge means according to public coarsening policy."""
+    _check_rate_params(chart_id, series_key, kind, window_seconds)
     if value is None:
         return None
     require(non_negative(value), 'Invalid measurement value for coarsening')
     if value == 0:
         return 0.0
     d = Decimal(str(value))
+    d_window = Decimal(window_seconds)
     if chart_id == 'open_circuits':
         q100 = _round_bin(d, _D_HUNDRED)
         if q100 <= 0:
@@ -104,16 +112,23 @@ def coarsen_value(chart_id, series_key, kind, value):
         q100_sig = _round_bin(Decimal(str(sigfigs3(q100))), _D_HUNDRED)
         return float(q100_sig) if q100_sig > 0 else 0.0
     if is_sensitive_series(chart_id, series_key):
+        if d * d_window < _D_EIGHT - Decimal('1e-12'):
+            return 0.0
         binned = _round_bin(d, SENSITIVE_BIN)
-        return 0.0 if binned <= 0 else sigfigs3(binned)
-    if kind == 'counter_daily_rate':
-        events = d * _D_DAY
+        if binned <= 0 or binned * d_window < _D_EIGHT - Decimal('1e-12'):
+            return 0.0
+        return sigfigs3(binned)
+    if kind in _COUNTER_KINDS:
+        k1_rate = sigfigs3(_D_EIGHT / d_window)
+        events = d * d_window
+        if float(d) == k1_rate or (_D_EIGHT - Decimal('1e-12') <= events < _D_EIGHT):
+            return k1_rate
         if events < _D_EIGHT:
             return 0.0
         if events >= _D_RATE_CAP:
             return sigfigs3(d)
         events_int = int(events.to_integral_value(rounding=ROUND_HALF_EVEN))
-        return sigfigs3(Decimal(((events_int + 4) // 8) * 8) / _D_DAY)
+        return sigfigs3(Decimal(((events_int + 4) // 8) * 8) / d_window)
     if d < _D_GAUGE_FLOOR:
         return 0.0
     if d < _D_ONE:
@@ -122,8 +137,9 @@ def coarsen_value(chart_id, series_key, kind, value):
 
 
 @lru_cache(maxsize=4096)
-def _is_coarsened_float(chart_id, series_key, kind, float_value):
+def _is_coarsened_float(chart_id, series_key, kind, float_value, window_seconds=DAY):
     d = Decimal(str(float_value))
+    d_window = Decimal(window_seconds)
     if not has_at_most_3_sigfigs(d):
         return False
     if chart_id == 'open_circuits':
@@ -131,35 +147,36 @@ def _is_coarsened_float(chart_id, series_key, kind, float_value):
             return True
         return d == d.to_integral_value() and int(d) % 100 == 0
     if is_sensitive_series(chart_id, series_key):
-        if d < SENSITIVE_BIN:
+        if d < SENSITIVE_BIN or d * d_window < _D_EIGHT:
             return False
         if d >= _D_ONE:
             return True
         steps = d / SENSITIVE_BIN
         return steps == steps.to_integral_value()
-    if kind == 'counter_daily_rate':
-        events = d * _D_DAY
+    if kind in _COUNTER_KINDS:
+        events = d * d_window
         if events >= _D_RATE_CAP:
             return True
         k0 = int((events / _D_EIGHT).to_integral_value(rounding=ROUND_HALF_EVEN))
         return any(
-            k >= 1 and 8 * k < 10**10 and sigfigs3(Decimal(8 * k) / _D_DAY) == float_value
+            k >= 1 and 8 * k < 10**10 and sigfigs3(Decimal(8 * k) / d_window) == float_value
             for k in (k0, k0 - 1, k0 + 1, k0 - 2, k0 + 2)
         )
-    return d >= _D_GAUGE_STEP
+    if d < _D_ONE:
+        return d >= _D_GAUGE_STEP and d == d.quantize(_D_GAUGE_STEP, rounding=ROUND_HALF_EVEN)
+    return True
 
 
-def is_coarsened_value(chart_id, series_key, kind, value):
-    """Validate that a supplied daily rate or gauge mean satisfies public coarsening bounds."""
-    require(isinstance(chart_id, str) and isinstance(series_key, str), 'Chart and series keys must be strings')
-    require(isinstance(kind, str) and kind in VALID_KINDS, 'Unsupported measurement kind')
+def is_coarsened_value(chart_id, series_key, kind, value, *, window_seconds=DAY):
+    """Validate that a supplied hourly/daily rate or gauge mean satisfies public coarsening bounds."""
+    _check_rate_params(chart_id, series_key, kind, window_seconds)
     if value is None:
         return True
     if not non_negative(value):
         return False
     if value == 0:
         return True
-    return _is_coarsened_float(chart_id, series_key, kind, float(value))
+    return _is_coarsened_float(chart_id, series_key, kind, float(value), window_seconds)
 
 
 def coarsen_cohort_mapping(raw_map, target):
@@ -223,13 +240,71 @@ def _cov(n_c, exp_c):
     return (n_c / exp_c) if (n_c is not None and n_c > 0) else None
 
 
-def _coarsen_point(chart_id, series_key, kind, raw_val, raw_valid, n_c, cov_c):
+def _coarsen_point(chart_id, series_key, kind, raw_val, raw_valid, n_c, cov_c, *, window_seconds=DAY):
     if n_c in (None, 0) or not raw_valid or raw_val is None:
         return None, False
-    v_c = coarsen_value(chart_id, series_key, kind, raw_val)
+    v_c = coarsen_value(chart_id, series_key, kind, raw_val, window_seconds=window_seconds)
     if v_c is None or cov_c is None or not (MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0):
         return None, False
     return v_c, True
+
+
+def _coarsen_history_rows(rows, chart_id, series_key, kind, min_exp, snapshot_end, *, window_seconds):
+    coarsened, pop_totals = [], {}
+    last_exp_c = min_exp
+    for row in rows:
+        require(timestamp(row[0]), 'Invalid observation timestamp')
+        t = int(row[0])
+        v_raw, n_raw, cov_raw, raw_valid = row[1], row[2], row[3], bool(row[4])
+        require(cov_raw is None or non_negative(cov_raw), 'Invalid observation coverage')
+        if n_raw is None:
+            n_c, exp_c = None, min_exp
+        else:
+            n_c = coarsen_count(n_raw)
+            if n_raw > 0 and cov_raw and cov_raw > 0:
+                ratio = n_raw / cov_raw
+                require(math.isfinite(ratio), 'Invalid observation coverage ratio')
+                raw_exp = round(ratio)
+            else:
+                raw_exp = max(8, int(n_raw))
+            exp_c = max(8, n_c, coarsen_count(raw_exp))
+        cov_c = _cov(n_c, exp_c)
+        v_c, valid_c = _coarsen_point(chart_id, series_key, kind, v_raw, raw_valid, n_c, cov_c,
+                                      window_seconds=window_seconds)
+        coarsened.append([t, v_c, n_c, cov_c, valid_c])
+        pop_totals[t] = n_c
+        if t == snapshot_end:
+            last_exp_c = exp_c
+    return coarsened, pop_totals, last_exp_c
+
+
+def _coarsen_current_period(cur, *, chart_id, series_key, kind, min_exp, window_seconds,
+                            last_row=None, last_exp_c=None, enforce_chart_floor=True):
+    cur_n_c = coarsen_count(cur.get('relays'))
+    default_exp = min_exp if (enforce_chart_floor or last_exp_c is None) else last_exp_c
+    expected_raw = default_exp if 'expected_relays' not in cur else cur['expected_relays']
+    require(expected_raw is not None, 'Invalid current expected_relays')
+    floor = min_exp if enforce_chart_floor else 8
+    cur_exp_c = max(floor, coarsen_count(expected_raw), 0 if cur_n_c is None else cur_n_c)
+    if last_row is not None:
+        cur_n_c = last_row[2]
+        cur_exp_c = max(cur_exp_c, last_exp_c, 0 if cur_n_c is None else cur_n_c)
+        cur_cov_c = _cov(cur_n_c, cur_exp_c)
+        cur_valid_c = bool(last_row[4] and cur.get('valid', True) and last_row[1] is not None
+                           and cur_n_c is not None and cur_n_c >= 8
+                           and cur_cov_c is not None and MINIMUM_POPULATION_COVERAGE <= cur_cov_c <= 1.0)
+        cur_v_c = last_row[1] if cur_valid_c else None
+        last_row[1], last_row[3], last_row[4] = cur_v_c, cur_cov_c, cur_valid_c
+    else:
+        cur_cov_c = _cov(cur_n_c, cur_exp_c)
+        cur_v_c, cur_valid_c = _coarsen_point(
+            chart_id, series_key, kind, cur.get('value'), cur.get('valid', True), cur_n_c, cur_cov_c,
+            window_seconds=window_seconds,
+        )
+    return {
+        'value': cur_v_c, 'relays': cur_n_c, 'expected_relays': cur_exp_c,
+        'coverage': cur_cov_c, 'valid': cur_valid_c,
+    }, cur_n_c
 
 
 def coarsen_snapshot(data):
@@ -314,58 +389,68 @@ def coarsen_snapshot(data):
         kind, chart_id = chart['kind'], chart['id']
         for series in chart['series']:
             series_key = series['key']
-            coarsened_daily, pop_totals = [], {}
-            last_exp_c = min_exp
-            for row in series['history']['daily']:
-                require(timestamp(row[0]), 'Invalid observation timestamp')
-                t = int(row[0])
-                v_raw, n_raw, cov_raw, raw_valid = row[1], row[2], row[3], bool(row[4])
-                require(cov_raw is None or non_negative(cov_raw), 'Invalid observation coverage')
-                if n_raw is None:
-                    n_c, exp_c = None, min_exp
-                else:
-                    n_c = coarsen_count(n_raw)
-                    if n_raw > 0 and cov_raw and cov_raw > 0:
-                        ratio = n_raw / cov_raw
-                        require(math.isfinite(ratio), 'Invalid observation coverage ratio')
-                        raw_exp = round(ratio)
-                    else:
-                        raw_exp = max(8, int(n_raw))
-                    exp_c = max(8, n_c, coarsen_count(raw_exp))
-                cov_c = _cov(n_c, exp_c)
-                v_c, valid_c = _coarsen_point(chart_id, series_key, kind, v_raw, raw_valid, n_c, cov_c)
-                coarsened_daily.append([t, v_c, n_c, cov_c, valid_c])
-                pop_totals[t] = n_c
-                if t == snapshot_end:
-                    last_exp_c = exp_c
+            coarsened_daily, pop_totals, last_exp_c = _coarsen_history_rows(
+                series['history']['daily'], chart_id, series_key, kind, min_exp, snapshot_end, window_seconds=DAY)
             series['history']['daily'] = coarsened_daily
+            if 'sampled_hour' in series['history']:
+                coarsened_sh, _, _ = _coarsen_history_rows(
+                    series['history']['sampled_hour'], chart_id, series_key, kind, min_exp, snapshot_end,
+                    window_seconds=HOUR)
+                series['history']['sampled_hour'] = coarsened_sh
 
-            cur = series['current']['day']
-            cur_n_c = coarsen_count(cur.get('relays'))
-            expected_raw = chart_c if 'expected_relays' not in cur else cur['expected_relays']
-            require(expected_raw is not None, 'Invalid current expected_relays')
-            cur_exp_c = max(min_exp, coarsen_count(expected_raw), 0 if cur_n_c is None else cur_n_c)
+            last_hour_row = None
+            last_hour_exp = None
+            if 'values' in series:
+                require('hourly_relays' in series and 'hourly_expected_relays' in series,
+                        'Hourly arrays must accompany series values')
+                c_values, c_relays, c_expected = [], [], []
+                for v_pt, n_pt, e_pt in zip(series['values'], series['hourly_relays'],
+                                            series['hourly_expected_relays'], strict=True):
+                    require(timestamp(v_pt[0]) and v_pt[0] == n_pt[0] and v_pt[0] == e_pt[0],
+                            'Hourly population grid mismatch')
+                    t = int(v_pt[0])
+                    n_c = coarsen_count(n_pt[1])
+                    require(timestamp(e_pt[1]), 'Invalid hourly expected population')
+                    exp_c = max(8, 0 if n_c is None else n_c, coarsen_count(e_pt[1]))
+                    cov_c = _cov(n_c, exp_c)
+                    v_c, valid_c = _coarsen_point(chart_id, series_key, kind, v_pt[1], True, n_c, cov_c,
+                                                  window_seconds=HOUR)
+                    c_values.append([t, v_c if valid_c else None])
+                    c_relays.append([t, n_c])
+                    c_expected.append([t, exp_c])
+                series['values'], series['hourly_relays'], series['hourly_expected_relays'] = (
+                    c_values, c_relays, c_expected)
+                if c_expected:
+                    last_hour_exp = c_expected[-1][1]
+                if c_values and c_values[-1][0] == snapshot_end:
+                    last_cov = _cov(c_relays[-1][1], last_hour_exp)
+                    last_valid = bool(c_values[-1][1] is not None and c_relays[-1][1] is not None
+                                      and c_relays[-1][1] >= 8 and last_cov is not None
+                                      and MINIMUM_POPULATION_COVERAGE <= last_cov <= 1.0)
+                    last_hour_row = [snapshot_end, c_values[-1][1], c_relays[-1][1], last_cov, last_valid]
+
             last_daily = coarsened_daily[-1] if (coarsened_daily and coarsened_daily[-1][0] == snapshot_end) else None
-            if last_daily is not None:
-                cur_n_c = last_daily[2]
-                cur_exp_c = max(cur_exp_c, last_exp_c, 0 if cur_n_c is None else cur_n_c)
-                cur_cov_c = _cov(cur_n_c, cur_exp_c)
-                cur_valid_c = bool(last_daily[4] and cur.get('valid', True) and last_daily[1] is not None
-                                   and cur_n_c is not None and cur_n_c >= 8
-                                   and cur_cov_c is not None and MINIMUM_POPULATION_COVERAGE <= cur_cov_c <= 1.0)
-                cur_v_c = last_daily[1] if cur_valid_c else None
-                last_daily[1], last_daily[3], last_daily[4] = cur_v_c, cur_cov_c, cur_valid_c
-            else:
-                cur_cov_c = _cov(cur_n_c, cur_exp_c)
-                cur_v_c, cur_valid_c = _coarsen_point(
-                    chart_id, series_key, kind, cur.get('value'), cur.get('valid', True), cur_n_c, cur_cov_c
+            series['current']['day'], cur_n_c = _coarsen_current_period(
+                series['current']['day'], chart_id=chart_id, series_key=series_key, kind=kind,
+                min_exp=min_exp, window_seconds=DAY,
+                last_row=last_daily, last_exp_c=last_exp_c, enforce_chart_floor=True,
+            )
+            if 'hour' in series['current']:
+                series['current']['hour'], cur_hour_n_c = _coarsen_current_period(
+                    series['current']['hour'], chart_id=chart_id, series_key=series_key, kind=kind,
+                    min_exp=min_exp, window_seconds=HOUR,
+                    last_row=last_hour_row, last_exp_c=last_hour_exp, enforce_chart_floor=False,
                 )
-            series['current']['day'] = {
-                'value': cur_v_c, 'relays': cur_n_c, 'expected_relays': cur_exp_c,
-                'coverage': cur_cov_c, 'valid': cur_valid_c,
-            }
+                if last_hour_row is not None and series['values']:
+                    series['values'][-1][1] = series['current']['hour']['value']
+                    series['hourly_expected_relays'][-1][1] = series['current']['hour']['expected_relays']
+            else:
+                cur_hour_n_c = None
+
             if 'relay_population' in series:
                 pop = series['relay_population']
+                if 'hour' in pop:
+                    pop['hour'] = None if cur_hour_n_c is None else coarsen_population_row(pop.get('hour'), cur_hour_n_c)
                 pop['day'] = None if cur_n_c is None else coarsen_population_row(pop.get('day'), cur_n_c)
                 pop['daily'] = [
                     crow for prow in pop.get('daily', [])

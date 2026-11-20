@@ -79,6 +79,8 @@ def historical_averages_and_windows(rows, snapshot_end, time_ranges=None, *, dai
     summaries = {}
     windows = {}
     for period, period_start, _ in period_bounds:
+        if period['window']['unit'] == 'hours':
+            continue
         key = period['summary_key']
         if period['window']['unit'] == 'all_time':
             points = list(daily)

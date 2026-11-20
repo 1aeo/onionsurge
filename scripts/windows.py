@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 import math
 import re
 
+HOUR = 3600
+SAMPLED_HOUR_STEP = 6 * HOUR
 DAY = 86400
 MINIMUM_POPULATION_COVERAGE = 0.9
 MAX_SAFE_INT = 2**53 - 1
@@ -64,6 +66,20 @@ def population(value):
 
 def usable_measurement(value, relays):
     return non_negative(value) and population(relays)
+
+
+def hourly_observations(series):
+    """Use the collector's per-hour reference population, never today's cohort."""
+    result = []
+    for (t, value), (nt, n), (et, expected) in zip(
+            series['values'], series['hourly_relays'], series['hourly_expected_relays'], strict=True):
+        if t != nt or t != et or not population(expected):
+            raise ValueError('Hourly population grid mismatch')
+        coverage = n / expected if n else None
+        valid = (usable_measurement(value, n) and coverage is not None
+                 and MINIMUM_POPULATION_COVERAGE <= coverage <= 1)
+        result.append([t, value, n, coverage, valid])
+    return result
 
 
 def calendar_window(snapshot_end, months, lag_days=0):

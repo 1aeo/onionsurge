@@ -14,7 +14,7 @@ import query_protocol as access
 import query_gateway as gateway
 
 END = 1799971200
-BEGIN = END - gateway.DAY
+BEGIN = END - gateway.HOUR
 
 
 def attestations():
@@ -27,10 +27,10 @@ def attestations():
         },
         'records': [
             {'source': 'PRIVATE_SOURCE_A', 'unit': 'PRIVATE_UNIT_A', 'pid': 101,
-             'start_time_seconds': END - 2 * gateway.DAY, 'metrics_instance': 'PRIVATE_TARGET_A',
+             'start_time_seconds': END - 2 * gateway.HOUR, 'metrics_instance': 'PRIVATE_TARGET_A',
              'public_group': 'daemon_group_a', 'version': '0.4.9.17'},
             {'source': 'PRIVATE_SOURCE_B', 'unit': 'PRIVATE_UNIT_B', 'pid': 102,
-             'start_time_seconds': END - 3 * gateway.DAY, 'metrics_instance': 'PRIVATE_TARGET_B',
+             'start_time_seconds': END - 3 * gateway.HOUR, 'metrics_instance': 'PRIVATE_TARGET_B',
              'public_group': 'daemon_group_b', 'version': '0.4.9.14'},
         ],
     }
@@ -38,7 +38,7 @@ def attestations():
 
 def fixture_fetch(document):
     def fetch(query, begin, end, port):
-        points = list(range(begin, end + 1, gateway.DAY))
+        points = list(range(begin, end + 1, gateway.HOUR))
         rows = []
         for record in document['records']:
             if query in document['selectors'].values():
@@ -78,17 +78,18 @@ class QueryGatewayTests(unittest.TestCase):
         queries = dict(gateway.VIRTUAL_QUERIES, test='sum(up)')
         self.assertEqual(gateway.parse('queries', queries, END + 60), ('queries',))
         for command in ['snapshot-index', 'snapshot 20261118T040000Z-aabbccdd manifest.json',
-                        'cat /private/file', 'sh', 'prom sum(up) 0 86400 86400',
-                        f'prom test {BEGIN} {END} 86400; id',
-                        f'prom test {BEGIN} {END} 3600',
+                        'cat /private/file', 'sh', 'prom sum(up) 0 3600 3600',
+                        f'prom test {BEGIN} {END} 3600; id',
+                        f'prom test {BEGIN} {END} 86400',
                         f'prom test {BEGIN + 3600} {END + 3600} 86400',
-                        f'prom attested_native_runtime {BEGIN} {END} 3600',
-                        f'prom attested_native_runtime {BEGIN - 86400} {END} 86400']:
+                        f'prom attested_native_runtime {END - 86400} {END} 86400',
+                        f'prom attested_native_runtime {BEGIN - 3600} {END} 3600']:
             with self.subTest(command=command), self.assertRaises(ValueError):
                 gateway.parse(command, queries, END + 60)
         with self.assertRaises(access.AccessError):
             access.validate_catalogue({'bad_hop': 'sum by(previous_hop)(up)'})
-        self.assertEqual(gateway.parse(f'prom attested_native_runtime {BEGIN} {END} 86400', queries, END + 60)[1], 'attested_native_runtime')
+        self.assertEqual(gateway.parse(f'prom attested_native_runtime {BEGIN} {END} 3600', queries, END + 60)[1], 'attested_native_runtime')
+        self.assertEqual(gateway.parse(f'prom test {BEGIN} {END} 3600', queries, END + 60)[1], 'test')
         self.assertEqual(gateway.parse(f'prom test {END - 7 * 86400} {END} 86400', queries, END + 60)[1], 'test')
 
     def test_public_catalogue_never_loads_or_returns_private_attestations(self):
@@ -107,9 +108,9 @@ class QueryGatewayTests(unittest.TestCase):
             config, state = self.config(folder)
             expected = {'status': 'success', 'data': {'resultType': 'matrix', 'result': []}}
             with mock.patch.object(access, 'query_prometheus', return_value=expected) as query:
-                self.assertEqual(gateway.serve(config, state, f'prom test {BEGIN} {END} 86400', END + 60), expected)
-                query.assert_called_once_with('sum(up)', BEGIN, END, 86400, 9090)
-            self.assertEqual(gateway.serve(config, state, f'prom attested_native_runtime {BEGIN} {END} 86400', END + 60), expected)
+                self.assertEqual(gateway.serve(config, state, f'prom test {BEGIN} {END} 3600', END + 60), expected)
+                query.assert_called_once_with('sum(up)', BEGIN, END, 3600, 9090)
+            self.assertEqual(gateway.serve(config, state, f'prom attested_native_runtime {BEGIN} {END} 3600', END + 60), expected)
 
     def test_managed_overlap_expression_matches_the_verified_catalogue(self):
         queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
@@ -120,7 +121,7 @@ class QueryGatewayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             config, state = self.config(folder, evidence=True)
             with mock.patch.object(gateway, 'private_query', side_effect=fixture_fetch(attestations())):
-                result = gateway.serve(config, state, f'prom attested_native_runtime {BEGIN} {END} 86400', END + 60)
+                result = gateway.serve(config, state, f'prom attested_native_runtime {BEGIN} {END} 3600', END + 60)
             self.assertEqual(len(result['data']['result']), 2)
             self.assertNotIn('PRIVATE_', json.dumps(result))
 

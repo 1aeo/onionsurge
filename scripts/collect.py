@@ -27,7 +27,7 @@ from io_helpers import atomic_text, file_lock, parse_json as io_parse_json, read
 from population_statistics import METHOD as POPULATION_METHOD
 from query_gateway import VIRTUAL_QUERIES
 from validation import RUNTIME_SOURCE_FIELDS as PROOF_LABELS, validate_snapshot
-from windows import DAY, MINIMUM_POPULATION_COVERAGE, finite_number, is_sha256, nonblank, require
+from windows import DAY, HOUR, MINIMUM_POPULATION_COVERAGE, SAMPLED_HOUR_STEP, finite_number, is_sha256, nonblank, require
 
 SSH_FIELDS = ('SOURCE_SSH_HOST', 'SOURCE_SSH_USER', 'SOURCE_SSH_PORT',
               'SOURCE_SSH_IDENTITY_FILE', 'SOURCE_SSH_KNOWN_HOSTS_FILE')
@@ -245,10 +245,10 @@ class ObservationCache:
         if key in VIRTUAL_QUERIES:
             # Approved/revoked private evidence is mutable even at the same
             # measurement endpoint. Never persist its conclusions as telemetry.
-            if step != DAY or len(times) != 1:
+            if step != HOUR or len(times) != 1:
                 raise CollectionError('Attestation requests require one current endpoint')
             t = times[0]
-            response = access.aggregate_response(self.source.query(key, t - DAY, t, DAY), t - DAY, t, DAY)
+            response = access.aggregate_response(self.source.query(key, t - HOUR, t, HOUR), t - HOUR, t, HOUR)
             rows = [{'metric': row['metric'], 'values': [point for point in row['values'] if point[0] == t]}
                     for row in response['data']['result'] if any(point[0] == t for point in row['values'])]
             return {t: {'status': 'success', 'data': {'resultType': 'matrix', 'result': rows}}}
@@ -381,7 +381,7 @@ class Collector:
         return self.cache.points(self.routes[name], step, times)
 
     def endpoint(self, name, end):
-        return self.operation(name, DAY, [end])[end]
+        return self.operation(name, HOUR, [end])[end]
 
     def scalar(self, name, end):
         return selected(self.endpoint(name, end), {}, count=True)
@@ -390,26 +390,55 @@ class Collector:
         return {t: selected(p, series_labels(chart, series), count=statistic != 'value')
                 for t, p in self.operation(f'{chart["id"]}.{period}.{statistic}', step, times).items()}
 
-    def relay_population(self, chart, series, end, fetched_raw_n):
+    def _fill_history_rows(self, chart, series, period, step, window_seconds, times, rows, *,
+                           chart_c=0, enforce_chart_floor=False):
+        if not times:
+            return {}, None
+        n = self.values(chart, series, period, 'eligible', step, times)
+        a = self.values(chart, series, period, 'available', step, times)
+        v = self.values(chart, series, period, 'value', step, times)
+        history_n = {int(row[0]): row[2] for row in rows if row[2] is not None}
+        history_n.update({t: val for t, val in n.items() if val is not None})
+        e = populations(times, history_n, a)
+        last_exp_c = None
+        kind = chart['kind']
+        for t in times:
+            n_raw, e_raw, v_raw = n[t], e[t], v[t]
+            n_c = None if n_raw is None else coarsen_count(n_raw)
+            floor = chart_c if (enforce_chart_floor and t == chart['end']) else 0
+            exp_c = max(8, floor, 0 if n_c is None else n_c, coarsen_count(e_raw))
+            cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
+            if n_c in (None, 0):
+                v_c, valid_c = None, False
+            else:
+                v_c = coarsen_value(chart['id'], series['key'], kind, v_raw, window_seconds=window_seconds)
+                valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
+                               and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
+            if t == chart['end'] and not valid_c:
+                v_c = None
+            rows.append([t, v_c, n_c, cov_c, valid_c])
+            if t == chart['end']:
+                last_exp_c = exp_c
+        return n, last_exp_c
+
+    def relay_population(self, chart, series, end, fetched_raw_n, fetched_hour_raw_n, fetched_cur24_raw_n):
         prefix = f'{chart["id"]}.relay_population.'
         metric_type = next(iter(series_labels(chart, series).values()), 'scalar')
         result = {'method': POPULATION_METHOD,
-                  'queries': {'day': self.queries[self.routes[prefix + 'day']]},
-                  'day': None, 'daily': []}
+                  'queries': {period: self.queries[self.routes[prefix + period]] for period in ('hour', 'day')},
+                  'hour': None, 'day': None, 'daily': []}
         expected_c = {int(row[0]): row[2] for row in series['history']['daily'] if row[4]}
         retained = series.get('relay_population', {})
         rows = {}
-        retained_ok = (retained.get('method') == result['method'] and retained.get('queries') == result['queries'])
-        if retained_ok:
+        retained_day_ok = (retained.get('method') == result['method']
+                           and retained.get('queries', {}).get('day') == result['queries']['day'])
+        retained_hour_ok = (retained.get('method') == result['method']
+                            and retained.get('queries') == result['queries'])
+        if retained_day_ok:
             # Reuse immutable already-coarsened daily rows from the validated seed without re-coarsening.
             rows = {row[0]: row[:] for row in retained.get('daily', [])
                     if row[0] in expected_c and row[1] == expected_c[row[0]]}
         targets = {t: expected_c[t] for t in sorted(expected_c.keys() - rows.keys())}
-        cur_n_c = series['current']['day'].get('relays')
-        reuse_seed_day = (not fetched_raw_n and end == self.seed['end'] and retained_ok
-                          and retained.get('day') is not None and retained['day'][1] == cur_n_c)
-        if cur_n_c is not None and end not in rows and not reuse_seed_day:
-            targets[end] = cur_n_c
         if targets:
             raw_n = dict(fetched_raw_n)
             missing_n = [t for t in targets if t not in raw_n]
@@ -421,15 +450,43 @@ class Collector:
                     continue
                 crow = coarsen_population_row(population_row(payload, metric_type, t, n_raw), target_n)
                 if crow is not None:
-                    if t in expected_c:
-                        rows[t] = crow
-                    elif t == end and cur_n_c is not None:
-                        result['day'] = crow
-        if cur_n_c is not None:
+                    rows[t] = crow
+
+        cur_day_n_c = series['current']['day'].get('relays')
+        if cur_day_n_c is not None:
+            reuse_seed_day = (not fetched_raw_n and not fetched_cur24_raw_n and end == self.seed['end']
+                              and end % DAY == 0 and retained_day_ok
+                              and retained.get('day') is not None and retained['day'][1] == cur_day_n_c)
             if end in rows:
                 result['day'] = rows[end][:]
             elif reuse_seed_day:
                 result['day'] = retained['day'][:]
+            else:
+                n_raw = fetched_cur24_raw_n.get(end, fetched_raw_n.get(end))
+                if n_raw is None:
+                    n_raw = self.values(chart, series, 'current24', 'eligible', HOUR, [end]).get(end)
+                if n_raw is not None and coarsen_count(n_raw) == cur_day_n_c:
+                    crow = coarsen_population_row(population_row(self.endpoint(prefix + 'day', end),
+                                                                 metric_type, end, n_raw), cur_day_n_c)
+                    if crow is not None:
+                        result['day'] = crow
+
+        cur_hour_n_c = series['current']['hour'].get('relays')
+        if cur_hour_n_c is not None:
+            reuse_seed_hour = (not fetched_hour_raw_n and end == self.seed['end'] and retained_hour_ok
+                               and retained.get('hour') is not None and retained['hour'][1] == cur_hour_n_c)
+            if reuse_seed_hour:
+                result['hour'] = retained['hour'][:]
+            else:
+                n_raw = fetched_hour_raw_n.get(end)
+                if n_raw is None:
+                    n_raw = self.values(chart, series, 'current_hour', 'eligible', HOUR, [end]).get(end)
+                if n_raw is not None and coarsen_count(n_raw) == cur_hour_n_c:
+                    crow = coarsen_population_row(population_row(self.endpoint(prefix + 'hour', end),
+                                                                 metric_type, end, n_raw), cur_hour_n_c)
+                    if crow is not None:
+                        result['hour'] = crow
+
         result['daily'] = [rows[t] for t in sorted(rows)]
         return result
 
@@ -473,7 +530,7 @@ class Collector:
                 attested_keys.add(key)
                 descriptions[key] = {'build_id': build_id, 'version': version, 'base_version': version,
                     'verification': 'Daemon version observed at ' + ', '.join(iso(t) for t in sorted(set(observed[build_id])))
-                                    + '; process epochs matched the measured 24-hour UTC day. No live binary hash claimed.'}
+                                    + '; process epochs matched the measured hour. No live binary hash claimed.'}
             known = sum(counts.values())
             _require(known <= total, 'Runtime cohort exceeds its observed population')
             raw_cohorts[cohort] = dict(counts, runtime_unverified=total - known)
@@ -501,13 +558,13 @@ class Collector:
             result['binary_hash_counts'] = copy.deepcopy(self.seed['versions']['binary_hash_counts'])
         if proof_times:
             result['runtime_resolution'] = {'observed_at': iso(min(proof_times)), 'resolved_relays': attested_c,
-                'matched_process_epochs': attested_c, 'snapshot_start': end - DAY, 'snapshot_end': end, 'source_sha256': source_hashes}
+                'matched_process_epochs': attested_c, 'snapshot_start': end - HOUR, 'snapshot_end': end, 'source_sha256': source_hashes}
         return result
 
     def collect(self, end, seed_sha):
         data = copy.deepcopy(self.seed)
-        data.update(input_schema_version=3, start=end - DAY, end=end, window_seconds=DAY, minimum_samples=360,
-                    generated_at=iso(time.time()))
+        data.update(input_schema_version=4, start=end - DAY, end=end, window_seconds=HOUR,
+                    minimum_samples=24, expected_samples=30, generated_at=iso(time.time()))
         data.setdefault('history_methods', {})['coarsening'] = COARSENING_DESCRIPTION
         charts_by_id = {c['id']: c for c in data['charts']}
         raw_totals = {}
@@ -518,84 +575,138 @@ class Collector:
             _require(chart is not None, f'Missing cohort anchor chart: {chart_id}')
             series = next((s for s in chart['series'] if s['key'] == key), None)
             _require(series is not None, f'Missing cohort anchor series: {chart_id}.{key}')
-            total = self.values(chart, series, 'daily', 'available', DAY, [end])[end]
+            total = self.values(chart, series, 'current_hour', 'available', HOUR, [end])[end]
             raw_totals[cohort] = total if total is not None else 0
         cohort_totals = {cohort: coarsen_count(total) for cohort, total in raw_totals.items()}
         data.update(fleet=cohort_totals['native'], custom=cohort_totals['custom'], defense=cohort_totals['directory_defense'])
+        current_times = list(range(end - DAY + HOUR, end + 1, HOUR))
+        context_times = list(range(end - 32 * DAY, end + 1, HOUR))
+        target_day = (end // DAY) * DAY
+        target_sh = (end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
         for chart in data['charts']:
             seed_chart_relays = chart['relays']
             chart_c = cohort_totals[chart['cohort_key']]
-            chart.update(start=data['start'], end=end, relays=chart_c)
-            if chart['id'] == 'directory_requests':
-                chart['query'] = self.queries[self.routes['directory_requests.daily.value']]
-                chart['quality_query'] = self.queries[self.routes['directory_requests.daily.eligible']]
+            kind = {'counter_daily_rate': 'counter_hour_rate', 'gauge_daily_mean': 'gauge_hour_mean'}.get(
+                chart.get('kind'), chart.get('kind'))
+            chart.update(start=data['start'], end=end, relays=chart_c, kind=kind)
+            chart['query'] = self.queries[self.routes[f'{chart["id"]}.current_hour.value']]
+            chart['quality_query'] = self.queries[self.routes[f'{chart["id"]}.current_hour.eligible']]
+            chart['history_queries'] = {
+                period: {stat_name: self.queries[self.routes[f'{chart["id"]}.{period}.{stat_name}']]
+                         for stat_name in ('value', 'eligible', 'available')}
+                for period in ('daily', 'sampled_hour', 'current24')
+            }
             for series in chart['series']:
                 rows = series['history']['daily']
-                fetched_raw_n = {}
-                if rows:
-                    times = list(range(int(rows[-1][0]) + DAY, end + 1, DAY))
-                    if times:
-                        n = self.values(chart, series, 'daily', 'eligible', DAY, times)
-                        a = self.values(chart, series, 'daily', 'available', DAY, times)
-                        v = self.values(chart, series, 'daily', 'value', DAY, times)
-                        fetched_raw_n = n
-                        history_n = {int(row[0]): row[2] for row in rows}
-                        history_n.update({t: val for t, val in n.items() if val is not None})
-                        e = populations(times, history_n, a)
-                        last_exp_c = None
-                        for t in times:
-                            n_raw, e_raw, v_raw = n[t], e[t], v[t]
-                            n_c = None if n_raw is None else coarsen_count(n_raw)
-                            exp_c = max(8, chart_c if t == end else 0, 0 if n_c is None else n_c, coarsen_count(e_raw))
-                            cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
-                            if n_c in (None, 0):
-                                v_c, valid_c = None, False
-                            else:
-                                v_c = coarsen_value(chart['id'], series['key'], chart.get('kind', 'counter_daily_rate'), v_raw)
-                                valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
-                                               and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
-                            if t == end and not valid_c:
-                                v_c = None
-                            rows.append([t, v_c, n_c, cov_c, valid_c])
-                            if t == end:
-                                last_exp_c = exp_c
-                        last_row = rows[-1]
-                        series['current'] = {'day': {
-                            'value': last_row[1] if last_row[4] else None, 'relays': last_row[2],
-                            'expected_relays': last_exp_c, 'coverage': last_row[3], 'valid': last_row[4],
-                        }}
+                sh_rows = series['history'].setdefault('sampled_hour', [])
+
+                hourly_n = self.values(chart, series, 'current_hour', 'eligible', HOUR, context_times)
+                hourly_a = self.values(chart, series, 'current_hour', 'available', HOUR, current_times)
+                hourly_v = self.values(chart, series, 'current_hour', 'value', HOUR, current_times)
+                retained_n = {int(row[0]): row[2] for row in sh_rows if row[2] is not None}
+                retained_n.update({int(t): n_val for t, n_val in series.get('hourly_relays', []) if n_val is not None})
+                retained_n.update({t: val for t, val in hourly_n.items() if val is not None})
+                expected_hr = populations(current_times, retained_n, hourly_a)
+                values_rows, hr_rows, hexp_rows = [], [], []
+                hour_current = None
+                for t in current_times:
+                    n_raw, e_raw, v_raw = hourly_n[t], expected_hr[t], hourly_v[t]
+                    n_c = None if n_raw is None else coarsen_count(n_raw)
+                    exp_c = max(8, 0 if n_c is None else n_c, coarsen_count(e_raw))
+                    cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
+                    if n_c in (None, 0):
+                        v_c, valid_c = None, False
                     else:
-                        cur = series['current']['day']
-                        had_exp = 'expected_relays' in cur
-                        cur_exp = cur['expected_relays'] if had_exp else max(8, seed_chart_relays)
-                        if chart_c > cur_exp:
-                            cur_n = cur.get('relays')
-                            cur_val = cur.get('value')
-                            new_exp = max(8, chart_c, 0 if cur_n is None else cur_n)
-                            cov = (cur_n / new_exp) if (cur_n is not None and cur_n > 0) else None
-                            cur_valid = cur.get('valid')
-                            if cur_valid is None:
-                                if rows[-1][0] == end:
-                                    cur_valid = bool(rows[-1][4])
-                                else:
-                                    cur_valid = bool(cur_val is not None and cur_n is not None and cur_n >= 8)
-                            new_valid = bool(cur_valid and cur_val is not None and cur_n is not None
-                                             and cur_n >= 8 and cov is not None
-                                             and MINIMUM_POPULATION_COVERAGE <= cov <= 1.0)
-                            new_val = cur_val if new_valid else None
-                            series['current']['day'] = {
-                                'value': new_val, 'relays': cur_n, 'expected_relays': new_exp,
-                                'coverage': cov, 'valid': new_valid,
+                        v_c = coarsen_value(chart['id'], series['key'], kind, v_raw, window_seconds=HOUR)
+                        valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
+                                       and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
+                    values_rows.append([t, v_c if valid_c else None])
+                    hr_rows.append([t, n_c])
+                    hexp_rows.append([t, exp_c])
+                    if t == end:
+                        hour_current = {
+                            'value': v_c if valid_c else None, 'relays': n_c,
+                            'expected_relays': exp_c, 'coverage': cov_c, 'valid': valid_c,
+                        }
+                series['values'] = values_rows
+                series['hourly_relays'] = hr_rows
+                series['hourly_expected_relays'] = hexp_rows
+
+                fetched_raw_n = {}
+                last_exp_c = None
+                if rows:
+                    daily_times = list(range(int(rows[-1][0]) + DAY, target_day + 1, DAY))
+                    fetched_raw_n, last_exp_c = self._fill_history_rows(
+                        chart, series, 'daily', DAY, DAY, daily_times, rows,
+                        chart_c=chart_c, enforce_chart_floor=True,
+                    )
+                    if not sh_rows:
+                        raw_first = max(int(rows[0][0]) - DAY + SAMPLED_HOUR_STEP, target_sh - 560 * DAY)
+                        first_sh = ((raw_first + SAMPLED_HOUR_STEP - 1) // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+                        sh_times = list(range(first_sh, target_sh + 1, SAMPLED_HOUR_STEP))
+                    else:
+                        sh_times = list(range(int(sh_rows[-1][0]) + SAMPLED_HOUR_STEP, target_sh + 1, SAMPLED_HOUR_STEP))
+                    self._fill_history_rows(chart, series, 'sampled_hour', SAMPLED_HOUR_STEP, HOUR, sh_times, sh_rows)
+
+                fetched_cur24_raw_n = {}
+                if rows:
+                    if end % DAY == 0 and rows[-1][0] == end:
+                        if fetched_raw_n:
+                            last_row = rows[-1]
+                            day_current = {
+                                'value': last_row[1] if last_row[4] else None, 'relays': last_row[2],
+                                'expected_relays': last_exp_c, 'coverage': last_row[3], 'valid': last_row[4],
                             }
-                            if rows[-1][0] == end:
+                        else:
+                            cur = series['current']['day']
+                            had_exp = 'expected_relays' in cur
+                            cur_exp = cur['expected_relays'] if had_exp else max(8, seed_chart_relays)
+                            if chart_c > cur_exp:
+                                cur_n, cur_val = cur.get('relays'), cur.get('value')
+                                new_exp = max(8, chart_c, 0 if cur_n is None else cur_n)
+                                cov = (cur_n / new_exp) if (cur_n is not None and cur_n > 0) else None
+                                cur_valid = cur.get('valid')
+                                if cur_valid is None:
+                                    cur_valid = bool(rows[-1][4])
+                                new_valid = bool(cur_valid and cur_val is not None and cur_n is not None
+                                                 and cur_n >= 8 and cov is not None
+                                                 and MINIMUM_POPULATION_COVERAGE <= cov <= 1.0)
+                                new_val = cur_val if new_valid else None
+                                day_current = {'value': new_val, 'relays': cur_n, 'expected_relays': new_exp,
+                                               'coverage': cov, 'valid': new_valid}
                                 rows[-1] = [end, new_val, cur_n, cov, new_valid]
-                        elif not had_exp and max(8, chart_c) != cur_exp:
-                            cur['expected_relays'] = cur_exp
+                            else:
+                                day_current = dict(cur)
+                                if not had_exp and max(8, chart_c) != cur_exp:
+                                    day_current['expected_relays'] = cur_exp
+                    else:
+                        n24 = self.values(chart, series, 'current24', 'eligible', HOUR, [end])
+                        a24 = self.values(chart, series, 'current24', 'available', HOUR, [end])
+                        v24 = self.values(chart, series, 'current24', 'value', HOUR, [end])
+                        fetched_cur24_raw_n = {end: n24[end]} if n24[end] is not None else {}
+                        history_n = {int(row[0]): row[2] for row in rows if row[2] is not None}
+                        if n24[end] is not None:
+                            history_n[end] = n24[end]
+                        e24 = populations([end], history_n, {end: a24[end]})[end]
+                        n_c = None if n24[end] is None else coarsen_count(n24[end])
+                        exp_c = max(8, chart_c, 0 if n_c is None else n_c, coarsen_count(e24))
+                        cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
+                        if n_c in (None, 0):
+                            v_c, valid_c = None, False
+                        else:
+                            v_c = coarsen_value(chart['id'], series['key'], kind, v24[end], window_seconds=DAY)
+                            valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
+                                           and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
+                        day_current = {'value': v_c if valid_c else None, 'relays': n_c,
+                                       'expected_relays': exp_c, 'coverage': cov_c, 'valid': valid_c}
                 else:
-                    series['current'] = {'day': {
-                        'value': None, 'relays': None, 'expected_relays': max(8, chart_c), 'coverage': None, 'valid': False,
-                    }}
-                series['relay_population'] = self.relay_population(chart, series, end, fetched_raw_n)
+                    day_current = {'value': None, 'relays': None,
+                                   'expected_relays': max(8, chart_c, hexp_rows[-1][1]),
+                                   'coverage': None, 'valid': False}
+                series['current'] = {'hour': hour_current, 'day': day_current}
+                fetched_hr_map = {t: val for t, val in hourly_n.items() if t == end and val is not None}
+                series['relay_population'] = self.relay_population(
+                    chart, series, end, fetched_raw_n, fetched_hr_map, fetched_cur24_raw_n)
         data['versions'] = self.versions(end, raw_totals, cohort_totals)
         data['snapshot_flags'] = {}
         for key in ['flags', 'targets', 'up']:
@@ -617,7 +728,7 @@ class Collector:
                 directory[field] = coarsen_count(val)
         data['dircache_cohort'] = directory
         data['sources']['current_observation_end'] = end
-        data['input_provenance'] = {'description': 'Daily 00:00 UTC fixed-query aggregates with dir-spec coarsening; retained histories seeded from the configured measurement bundle.',
+        data['input_provenance'] = {'description': 'Hourly UTC fixed-query aggregates with dir-spec coarsening; retained histories seeded from the configured measurement bundle.',
                                     'snapshot_end': end, 'source_public_data_sha256': seed_sha}
         return data
 
@@ -641,10 +752,10 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                                       (state / 'observations.sqlite3').resolve(),
                                       (state / 'collect.lock').resolve(), queries_path.resolve(), routes_path.resolve()},
              'Collector output overlaps its source, catalogue, or cache')
-    now_day = (int(time.time()) // DAY) * DAY
-    end = now_day if end is None else end
-    _require(type(end) is int and end % DAY == 0 and end <= now_day,
-             'Collection end must be a completed 00:00 UTC day at or after the seed')
+    now_hour = (int(time.time()) // HOUR) * HOUR
+    end = now_hour if end is None else end
+    _require(type(end) is int and end % HOUR == 0 and end <= now_hour,
+             'Collection end must be a completed UTC hour at or after the seed')
     if private_seed:
         try:
             seed_bytes = read_regular_bytes(seed_path, MAX_SEED_BYTES, private=True)
@@ -653,9 +764,9 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
     else:
         seed_bytes = seed_path.read_bytes()
     seed = parse_json(seed_bytes)
-    validate_snapshot(seed)
+    validate_snapshot(seed, allow_v3_seed=True)
     _require(seed['end'] <= end,
-             'Collection end must be a completed 00:00 UTC day at or after the seed')
+             'Collection end must be a completed UTC hour at or after the seed')
     queries, routes = read_json(queries_path), read_json(routes_path)
     source = source or SSHSource(config)
     _require(source.catalogue() == queries, 'Source query catalogue differs from the reviewed release')

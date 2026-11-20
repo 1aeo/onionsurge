@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 
 from io_helpers import read_json
-from windows import (DAY, RESERVED_JSON_KEYS, calendar_window, finite_number,
+from windows import (DAY, HOUR, RESERVED_JSON_KEYS, calendar_window, finite_number,
                      require as _require, utc_day_end as _day_end)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,8 +43,11 @@ def _validate_window(window):
     unit = window['unit']
     count = window['count']
     lag = window['comparison_lag_days']
-    _require(unit in {'days', 'months', 'all_time'}, 'Unsupported time-range window unit')
-    if unit in _WINDOW_BOUNDS:
+    _require(unit in {'hours', 'days', 'months', 'all_time'}, 'Unsupported time-range window unit')
+    if unit == 'hours':
+        _require(type(count) is int and count == 24, 'Hours window count must be 24')
+        _require(type(lag) is int and lag == 0, 'Hours window comparison_lag_days must be 0')
+    elif unit in _WINDOW_BOUNDS:
         name, lo, hi = _WINDOW_BOUNDS[unit]
         _require(type(count) is int and lo <= count <= hi, f'{name} window count must be an integer between {lo} and {hi}')
         _require(type(lag) is int and lag in {0, 1}, f'{name} window comparison_lag_days must be 0 or 1')
@@ -58,30 +61,35 @@ def _validate_window(window):
 def _validate_period(period, seen_ids, seen_summary_keys, seen_suffixes):
     _require(isinstance(period, dict) and set(period) == PERIOD_KEYS,
              'Time-range period does not match required schema')
+    unit, _, _ = _validate_window(period['window'])
     period_id = period['id']
-    _check_unique(period_id, isinstance(period_id, str) and PERIOD_ID_RE.fullmatch(period_id)
-                  and period_id not in RESERVED_JSON_KEYS, seen_ids, 'period ID')
+    valid_id = (period_id == '24h' if unit == 'hours'
+                else isinstance(period_id, str) and bool(PERIOD_ID_RE.fullmatch(period_id))
+                and period_id not in RESERVED_JSON_KEYS)
+    _check_unique(period_id, valid_id, seen_ids, 'period ID')
 
     summary_key = period['summary_key']
     _check_unique(summary_key, isinstance(summary_key, str) and SUMMARY_KEY_RE.fullmatch(summary_key)
-                  and summary_key != 'day' and summary_key not in RESERVED_JSON_KEYS
+                  and summary_key not in {'hour', 'day'} and summary_key not in RESERVED_JSON_KEYS
                   and summary_key not in FORBIDDEN_HOURLY_KEYS, seen_summary_keys, 'summary_key')
 
     suffix = period['export_suffix']
-    _check_unique(suffix, isinstance(suffix, str) and len(suffix) <= 32 and EXPORT_SUFFIX_RE.fullmatch(suffix)
-                  and suffix not in RESERVED_JSON_KEYS, seen_suffixes, 'export_suffix')
+    valid_suffix = (suffix == '24h' if unit == 'hours'
+                    else isinstance(suffix, str) and len(suffix) <= 32
+                    and bool(EXPORT_SUFFIX_RE.fullmatch(suffix)) and suffix not in RESERVED_JSON_KEYS)
+    _check_unique(suffix, valid_suffix, seen_suffixes, 'export_suffix')
 
     for field in ('label', 'average_label', 'plot_label'):
         value = period[field]
         _require(isinstance(value, str) and bool(NON_BLANK_RE.search(value)) and len(value) <= 80,
                  f'Invalid time-range {field}')
 
-    unit, _, _ = _validate_window(period['window'])
-
     coverage = period['minimum_coverage']
-    msg = 'All-time period minimum_coverage must be 0' if unit == 'all_time' else 'Time-range minimum_coverage must be in [0, 1]'
+    zero_only = unit in {'all_time', 'hours'}
+    msg = ('All-time and hours period minimum_coverage must be 0'
+           if zero_only else 'Time-range minimum_coverage must be in [0, 1]')
     _require(finite_number(coverage) and not (isinstance(coverage, float) and math.copysign(1.0, coverage) < 0), msg)
-    _require(coverage == 0 if unit == 'all_time' else 0 <= coverage <= 1, msg)
+    _require(coverage == 0 if zero_only else 0 <= coverage <= 1, msg)
 
     min_comp = period['minimum_comparison_windows']
     _require(type(min_comp) is int and 1 <= min_comp <= 10000,
@@ -103,10 +111,13 @@ def validate_time_ranges(config):
     seen_ids = set()
     seen_summary_keys = set()
     seen_suffixes = set()
+    hours_count = 0
     all_time_count = 0
     for period in periods:
-        if _validate_period(period, seen_ids, seen_summary_keys, seen_suffixes) == 'all_time':
-            all_time_count += 1
+        unit = _validate_period(period, seen_ids, seen_summary_keys, seen_suffixes)
+        hours_count += unit == 'hours'
+        all_time_count += unit == 'all_time'
+    _require(hours_count <= 1, 'Time-range config may declare at most one hours period')
     _require(all_time_count == 1, 'Time-range config must declare exactly one all_time period')
 
     default_range = config['default_range']
@@ -134,6 +145,8 @@ def validate_time_ranges(config):
     fallback = card_slots['fallback_dynamic']
     _require(isinstance(fallback, str) and fallback in seen_ids and fallback not in fixed,
              'Time-range card_slots.fallback_dynamic must be a period ID outside fixed')
+    _require(not hours_count or '24h' in fixed,
+             "Time-range card_slots.fixed must include '24h' when an hours period is declared")
 
     return copy.deepcopy(config)
 
@@ -152,7 +165,9 @@ def _window_context(snapshot_end, period_def):
     return day_end, unit, count, lag
 
 
-def _unit_start(day_end, unit, count, lag=0):
+def _unit_start(snapshot_end, day_end, unit, count, lag=0):
+    if unit == 'hours':
+        return int(snapshot_end) - count * HOUR
     if unit == 'days':
         return day_end - (count + lag) * DAY
     if unit == 'months':
@@ -166,16 +181,22 @@ def resolve_period_bounds(snapshot_end, config):
     result = []
     for period in config['periods']:
         w = period['window']
-        period_start = _unit_start(day_end, w['unit'], w['count'])
-        comp_start = period_start if w['comparison_lag_days'] == 0 else _unit_start(day_end, w['unit'], w['count'], w['comparison_lag_days'])
+        period_start = _unit_start(snapshot_end, day_end, w['unit'], w['count'])
+        if w['unit'] == 'hours':
+            comp_start = None
+        elif w['comparison_lag_days'] == 0:
+            comp_start = period_start
+        else:
+            comp_start = _unit_start(snapshot_end, day_end, w['unit'], w['count'], w['comparison_lag_days'])
         result.append((period, period_start, comp_start))
     return day_end, day_end - DAY, result
 
 
 def period_window_bounds(snapshot_end, period_def):
-    """Return (period_start, day_end) UTC timestamps for a configured period."""
+    """Return (period_start, end) UTC timestamps for a configured period."""
     day_end, unit, count, _ = _window_context(snapshot_end, period_def)
-    return _unit_start(day_end, unit, count), day_end
+    end = int(snapshot_end) if unit == 'hours' else day_end
+    return _unit_start(snapshot_end, day_end, unit, count), end
 
 
 def comparison_window_bounds(snapshot_end, period_def):
@@ -186,4 +207,5 @@ def comparison_window_bounds(snapshot_end, period_def):
     anchors calendar subtraction at ``day_end - lag`` days with month-end clamping.
     """
     day_end, unit, count, lag = _window_context(snapshot_end, period_def)
-    return _unit_start(day_end, unit, count, lag), day_end - DAY
+    _require(unit != 'hours', 'Hours periods do not define daily comparison windows')
+    return _unit_start(snapshot_end, day_end, unit, count, lag), day_end - DAY

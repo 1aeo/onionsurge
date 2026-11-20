@@ -161,11 +161,15 @@ class InputValidationTests(unittest.TestCase):
             data['snapshot_flags'][probe]['response']['data']['result'][0]['value'][0] = float(data['end'])
         validate_snapshot(data)
         for probe in ['flags', 'targets', 'up']:
-            for delta in [.125, 1, DAY]:
+            for delta in [.125, 1, 1800, 3600]:
                 data = self.fixture()
                 data['snapshot_flags'][probe]['response']['data']['result'][0]['value'][0] += delta
                 with self.subTest(probe=probe, delta=delta), self.assertRaises(ValueError):
                     validate_snapshot(data)
+        data = self.fixture()
+        for probe in ['flags', 'targets', 'up']:
+            data['snapshot_flags'][probe]['response']['data']['result'][0]['value'][0] -= 3600
+        validate_snapshot(data)
         for value in [-.125, float('nan'), float('inf'), float('-inf'), True, False, None, '1.125']:
             data = self.fixture()
             data['snapshot_flags']['up']['response']['data']['result'][0]['value'][0] = value
@@ -227,7 +231,9 @@ class InputValidationTests(unittest.TestCase):
 
     def test_queries_require_content_without_rewriting_supplied_text(self):
         paths = [['charts', 0, 'query'], ['charts', 0, 'quality_query']]
-        paths += [['charts', 0, 'history_queries', 'daily', field] for field in ('value', 'eligible', 'available')]
+        paths += [['charts', 0, 'history_queries', p, field]
+                  for p in ('daily', 'sampled_hour', 'current24')
+                  for field in ('value', 'eligible', 'available')]
         paths += [['snapshot_flags', probe, 'query'] for probe in ('flags', 'targets', 'up')]
         for path in paths:
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, '[Qq]uery'):
@@ -243,10 +249,25 @@ class InputValidationTests(unittest.TestCase):
         validate_snapshot(data)
         self.assertTrue(all(node[key] == value for node, key, value in preserved))
 
-    def test_chart_queries_require_daily_1d_range_and_reject_subday_selectors(self):
-        daily_paths = [
+    def test_chart_queries_enforce_hourly_and_daily_ranges(self):
+        hourly_paths = [
             ['charts', 0, 'query'], ['charts', 0, 'quality_query'],
-            ['charts', 0, 'history_queries', 'daily', 'value'], ['charts', 0, 'history_queries', 'daily', 'eligible'],
+            ['charts', 0, 'history_queries', 'sampled_hour', 'value'],
+            ['charts', 0, 'history_queries', 'sampled_hour', 'eligible'],
+        ]
+        bad_hourly = [
+            'sum(rate(tor_relay_dos_total[1d]))',
+            'sum(rate(tor_relay_dos_total[1h])) + sum(rate(tor_relay_dos_total[1d]))',
+            'sum(tor_relay_dos_total)', 'sum(tor_relay_dos_total) # [1h]', '# [1h]',
+        ]
+        for path in hourly_paths:
+            for query in bad_hourly:
+                with self.subTest(path=path, query=query), self.assertRaisesRegex(ValueError, r'1h|period contract'):
+                    validate_snapshot(set_path(self.fixture(), path, query))
+        daily_paths = [
+            ['charts', 0, 'history_queries', period, field]
+            for period in ('daily', 'current24')
+            for field in ('value', 'eligible')
         ]
         bad_daily = [
             'sum(rate(tor_relay_dos_total[1h]))',
@@ -255,7 +276,7 @@ class InputValidationTests(unittest.TestCase):
         ]
         for path in daily_paths:
             for query in bad_daily:
-                with self.subTest(path=path, query=query), self.assertRaisesRegex(ValueError, r'\[1d\]'):
+                with self.subTest(path=path, query=query), self.assertRaisesRegex(ValueError, 'period contract'):
                     validate_snapshot(set_path(self.fixture(), path, query))
         for bad_available in [
             'count(count_over_time(tor_relay_dos_total[1h]))',
@@ -264,12 +285,12 @@ class InputValidationTests(unittest.TestCase):
         ]:
             data = self.fixture()
             data['charts'][0]['history_queries']['daily']['available'] = bad_available
-            with self.subTest(available=bad_available), self.assertRaisesRegex(ValueError, 'instant selector'):
+            with self.subTest(available=bad_available), self.assertRaisesRegex(ValueError, 'period contract'):
                 validate_snapshot(data)
         for query, available in [
-            ('sum(rate(tor_relay_dos_total{note="[1h]"}[1d]))', 'count(tor_relay_dos_total{note="[1h]"})'),
-            ('sum(rate(tor_relay_dos_total[1d])) # previously [1h]', 'count(tor_relay_dos_total) # [1h]'),
-            ('sum(rate(tor_relay_dos_total{note="[1h]#notcomment"}[1d]))', 'count(tor_relay_dos_total{note="[1h]#notcomment"})'),
+            ('sum(rate(tor_relay_dos_total{note="[1d]"}[1h]))', 'count(tor_relay_dos_total{note="[1d]"})'),
+            ('sum(rate(tor_relay_dos_total[1h])) # previously [1d]', 'count(tor_relay_dos_total) # [1d]'),
+            ('sum(rate(tor_relay_dos_total{note="[1d]#notcomment"}[1h]))', 'count(tor_relay_dos_total{note="[1d]#notcomment"})'),
         ]:
             data = self.fixture()
             data['charts'][0]['query'] = query
@@ -408,7 +429,7 @@ class InputValidationTests(unittest.TestCase):
         auxiliary.pop('relay_population', None)
         auxiliary.pop('history')
         validate_snapshot(data)
-        self.assertEqual(auxiliary['history'], {'daily': []})
+        self.assertEqual(auxiliary['history'], {'daily': [], 'sampled_hour': []})
         data = self.fixture(); data['charts'][0]['series'][0].pop('history')
         data['charts'][0]['series'][0].pop('relay_population', None)
         with self.assertRaisesRegex(ValueError, 'missing historical'):
@@ -422,6 +443,42 @@ class InputValidationTests(unittest.TestCase):
                 validate_snapshot(data)
         data = self.fixture(); del data['charts'][0]['series'][0]['current']['day']['expected_relays']
         validate_snapshot(data)
+
+    def test_omitted_current_hour_expected_relays_uses_hourly_array_not_cohort(self):
+        from build import prepare
+        data = self.fixture(share_rows=False)
+        chart = data['charts'][0]
+        series = chart['series'][0]
+        series.pop('relay_population', None)
+        subcohort = 160
+        self.assertGreater(chart['relays'], subcohort)
+        series['hourly_expected_relays'][-1][1] = subcohort
+        series['hourly_relays'][-1][1] = subcohort
+        series['current']['hour'].pop('expected_relays', None)
+        series['current']['hour'].update(relays=subcohort, coverage=1.0, valid=True)
+        validate_snapshot(data)
+
+        coarsened = coarsen_snapshot(clone_snapshot(data, share_rows=False))
+        coarsened_hour = coarsened['charts'][0]['series'][0]['current']['hour']
+        self.assertEqual(coarsened_hour['expected_relays'], subcohort)
+        self.assertTrue(coarsened_hour['valid'])
+        validate_snapshot(coarsened)
+
+        with tempfile.TemporaryDirectory() as folder:
+            built, _ = prepare(clone_snapshot(data, share_rows=False), 'a' * 64, Path(folder) / 'cache')
+        built_hour = built['charts'][0]['series'][0]['current']['hour']
+        self.assertEqual(built_hour['expected_relays'], subcohort)
+        self.assertTrue(built_hour['valid'])
+
+        bad_hour = self.fixture(share_rows=False)
+        bad_hour['charts'][0]['series'][0]['current']['hour']['expected_relays'] = 0
+        with self.assertRaisesRegex(ValueError, 'denominator'):
+            validate_snapshot(bad_hour)
+
+        bad_day = self.fixture(share_rows=False)
+        bad_day['charts'][0]['series'][0]['current']['day']['expected_relays'] = subcohort
+        with self.assertRaisesRegex(ValueError, 'denominator'):
+            validate_snapshot(bad_day)
 
     def test_metric_lists_and_prototype_keys_are_validated(self):
         for value in [None, 'tor_relay_dos_total', [1], [], {'name': 'tor_relay_dos_total'}]:
@@ -601,36 +658,78 @@ class InputValidationTests(unittest.TestCase):
             (['versions', 'verified_runtime', 0, 'source_url'], 'javascript:alert(1)', 'source URL'),
             (['versions', 'binary_hash_counts', 0, 'metric', 'sha256'], 'bad', 'binary hash'),
             (['versions', 'runtime_resolution', 'resolved_relays'], 7, 'runtime resolution'),
-            (['versions', 'runtime_resolution', 'snapshot_end'], SOURCE['end'] + 3600, 'runtime resolution'),
+            (['versions', 'runtime_resolution', 'snapshot_end'], SOURCE['end'] + 3600, 'resolution window'),
         ]
         for path, value, pattern in cases:
             with self.subTest(path=path), self.assertRaisesRegex(ValueError, pattern):
                 validate_snapshot(set_path(self.fixture(), path, value))
 
-    def test_sub_24h_windows_non_midnight_and_hourly_fields_rejected(self):
+    def test_v4_hourly_contract_and_v3_seed_admission(self):
+        # Schema v3 is rejected by default, admitted only with allow_v3_seed=True.
+        v3 = self.fixture()
+        v3.update(input_schema_version=3, window_seconds=DAY, minimum_samples=360, expected_samples=720)
+        for chart in v3['charts']:
+            chart['kind'] = 'gauge_daily_mean' if chart['kind'] == 'gauge_hour_mean' else 'counter_daily_rate'
+            chart['query'] = chart['history_queries']['daily']['value']
+            chart['quality_query'] = chart['history_queries']['daily']['eligible']
+            chart['history_queries'] = {'daily': chart['history_queries']['daily']}
+            for series in chart['series']:
+                for legacy in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    series.pop(legacy, None)
+                series['history'].pop('sampled_hour', None)
+                series['current'] = {'day': series['current']['day']}
+                if 'relay_population' in series:
+                    series['relay_population'].pop('hour', None)
+                    series['relay_population']['queries'] = {'day': series['relay_population']['queries']['day']}
+        if 'runtime_resolution' in v3['versions']:
+            v3['versions']['runtime_resolution']['snapshot_start'] = v3['start']
+        with self.assertRaisesRegex(ValueError, 'schema version'):
+            validate_snapshot(v3)
+        validate_snapshot(v3, allow_v3_seed=True)
+
         data = self.fixture()
-        data['window_seconds'] = 3600
-        with self.assertRaisesRegex(ValueError, 'daily measurement contract'):
+        data['window_seconds'] = 86400
+        with self.assertRaisesRegex(ValueError, 'hourly measurement contract'):
             validate_snapshot(data)
         data = self.fixture()
-        data['start'] += 3600
-        data['end'] += 3600
-        with self.assertRaisesRegex(ValueError, 'UTC-midnight'):
+        data['start'] += 1800
+        data['end'] += 1800
+        with self.assertRaisesRegex(ValueError, 'UTC-aligned'):
             validate_snapshot(data)
         for field in ('values', 'hourly_relays', 'hourly_expected_relays'):
             data = self.fixture()
             data['charts'][0]['series'][0][field] = []
             with self.subTest(field=field), self.assertRaises(ValueError):
                 validate_snapshot(data)
-        for field in ('hour', 'current24'):
-            data = self.fixture()
-            data['charts'][0]['series'][0]['current'][field] = {'value': 0, 'relays': 8, 'coverage': 1, 'valid': True}
-            with self.subTest(current=field), self.assertRaises(ValueError):
-                validate_snapshot(data)
+        data = self.fixture()
+        data['charts'][0]['series'][0]['current']['current24'] = {'value': 0, 'relays': 8, 'coverage': 1, 'valid': True}
+        with self.assertRaises(ValueError):
+            validate_snapshot(data)
         data = self.fixture()
         data['charts'][0]['series'][0]['history']['sampled_hour'] = []
         with self.assertRaises(ValueError):
             validate_snapshot(data)
+
+        # Intra-day UTC-hour boundary (% 3600 == 0, % 86400 != 0) validates when consistent.
+        hourly = self.fixture()
+        hourly['start'] += 3600
+        hourly['end'] += 3600
+        hourly['input_provenance']['snapshot_end'] = hourly['end']
+        hourly['sources']['current_observation_end'] = hourly['end']
+        hourly['versions']['as_of'] = hourly['end']
+        if 'runtime_resolution' in hourly['versions']:
+            hourly['versions']['runtime_resolution'].update(snapshot_start=hourly['end'] - 3600, snapshot_end=hourly['end'])
+        for chart in hourly['charts']:
+            chart['start'], chart['end'] = hourly['start'], hourly['end']
+            for series in chart['series']:
+                for arr in (series['values'], series['hourly_relays'], series['hourly_expected_relays']):
+                    for pt in arr:
+                        pt[0] += 3600
+                if 'relay_population' in series:
+                    for p_key in ('hour', 'day'):
+                        if series['relay_population'].get(p_key) is not None:
+                            series['relay_population'][p_key][0] = hourly['end']
+        validate_snapshot(hourly)
 
     def test_coarsening_rules_and_rejection_of_uncoarsened_inputs(self):
         self.assertEqual([coarsen_count(x) for x in (0, 1, 7, 8, 11, 12, 13)], [0, 0, 0, 8, 8, 16, 16])
@@ -642,6 +741,37 @@ class InputValidationTests(unittest.TestCase):
         self.assertEqual(coarsen_value('transport_rejections', 'conn_rejected', 'counter_daily_rate', 773.92), 774.0)
         self.assertEqual(coarsen_value('transport_rejections', 'conn_rejected', 'counter_daily_rate', 5 / DAY), 0.0)
         self.assertAlmostEqual(sigfigs3(Decimal('0.012345')), 0.0123)
+        # Hourly coarsening idempotency and alignment with is_coarsened_value (HOUR=3600 and DAY=86400)
+        hour = windows.HOUR
+        self.assertEqual(coarsen_value('transport_rejections', 'conn_rejected', 'counter_hour_rate', 8 / hour, window_seconds=hour), 0.00222)
+        self.assertEqual(coarsen_value('transport_rejections', 'conn_rejected', 'counter_hour_rate', 0.00222, window_seconds=hour), 0.00222)
+        self.assertTrue(is_coarsened_value('transport_rejections', 'conn_rejected', 'counter_hour_rate', 0.00222, window_seconds=hour))
+        self.assertEqual(coarsen_value('transport_rejections', 'conn_rejected', 'counter_hour_rate', 0.001, window_seconds=hour), 0.0)
+        self.assertFalse(is_coarsened_value('transport_rejections', 'conn_rejected', 'counter_hour_rate', 0.001, window_seconds=hour))
+        for sensitive_chart, series_key in (('hsdir_fetches', 'success'), ('hsdir_uploads', 'success'),
+                                            ('introduction_rejections', 'introduction_rejections'),
+                                            ('directory_requests', 'hs_get'), ('directory_requests', 'hs_post')):
+            self.assertEqual(coarsen_value(sensitive_chart, series_key, 'counter_hour_rate', 0.001, window_seconds=hour), 0.0)
+            self.assertEqual(coarsen_value(sensitive_chart, series_key, 'counter_hour_rate', 0.00222, window_seconds=hour), 0.0)
+            self.assertEqual(coarsen_value(sensitive_chart, series_key, 'counter_hour_rate', 0.003, window_seconds=hour), 0.003)
+            self.assertFalse(is_coarsened_value(sensitive_chart, series_key, 'counter_hour_rate', 0.001, window_seconds=hour))
+            self.assertFalse(is_coarsened_value(sensitive_chart, series_key, 'counter_hour_rate', 0.00222, window_seconds=hour))
+            self.assertTrue(is_coarsened_value(sensitive_chart, series_key, 'counter_hour_rate', 0.003, window_seconds=hour))
+            self.assertEqual(coarsen_value(sensitive_chart, series_key, 'counter_daily_rate', 0.001, window_seconds=DAY), 0.001)
+            self.assertTrue(is_coarsened_value(sensitive_chart, series_key, 'counter_daily_rate', 0.001, window_seconds=DAY))
+        for chart_id, series_key, kind, wsec in (
+            ('transport_rejections', 'conn_rejected', 'counter_hour_rate', hour),
+            ('hsdir_fetches', 'success', 'counter_hour_rate', hour),
+            ('directory_waiting', 'scalar', 'gauge_hour_mean', hour),
+            ('open_circuits', 'scalar', 'gauge_hour_mean', hour),
+            ('hsdir_fetches', 'success', 'counter_daily_rate', DAY),
+            ('directory_waiting', 'scalar', 'gauge_daily_mean', DAY),
+        ):
+            for raw in (0, 0.001, 0.00222, 0.003, 0.12, 1.234, 1234.56):
+                once = coarsen_value(chart_id, series_key, kind, raw, window_seconds=wsec)
+                twice = coarsen_value(chart_id, series_key, kind, once, window_seconds=wsec)
+                self.assertEqual(once, twice, (chart_id, wsec, raw))
+                self.assertTrue(is_coarsened_value(chart_id, series_key, kind, once, window_seconds=wsec), (chart_id, wsec, raw))
         self.assertEqual(coarsen_population_row([1794960000, 100, 100, 30, 20, 3, 50, 80], 104),
                          [1794960000, 104, 104, 32, 24, 0, 48, 80])
 
@@ -765,7 +895,7 @@ class InputValidationTests(unittest.TestCase):
         self.assertTrue(_promql_ranges('sum(rate(x[1d])) # unmatched "\n'))
         data = self.fixture()
         data['charts'][0]['query'] = 'sum(x{a="\\"[1d]})'
-        with self.assertRaisesRegex(ValueError, r'\[1d\]'):
+        with self.assertRaisesRegex(ValueError, r'\[1h\]'):
             validate_snapshot(data)
 
     def test_coarsening_hardening_negative_zero_overflow_and_kinds(self):
@@ -790,7 +920,7 @@ class InputValidationTests(unittest.TestCase):
             with self.subTest(bad_str=bad_str), self.assertRaises(ValueError):
                 _coarsen_count_string(bad_str)
 
-        for bad_kind in ('gauge_hour_mean', 'unknown'):
+        for bad_kind in ('unknown', 'counter_min_rate'):
             for val in (None, 0, 1.0):
                 with self.subTest(kind=bad_kind, val=val):
                     with self.assertRaisesRegex(ValueError, 'kind'):

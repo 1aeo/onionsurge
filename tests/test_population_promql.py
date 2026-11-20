@@ -13,6 +13,22 @@ builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 
 
+class PopulationCatalogueTests(unittest.TestCase):
+    def test_generated_catalogue_emits_hour_and_day_population_routes(self):
+        contract = json.loads((ROOT / 'catalogue/contract.json').read_text())
+        generated = builder.build(contract)
+        queries = generated['queries.json']
+        routes = generated['routes.json']
+        self.assertEqual(queries, json.loads((ROOT / 'catalogue/queries.json').read_text()))
+        self.assertEqual(routes, json.loads((ROOT / 'catalogue/routes.json').read_text()))
+        self.assertEqual(routes['directory_requests.relay_population.hour'], 'relay_population_directory_requests_hour')
+        self.assertEqual(routes['directory_requests.relay_population.day'], 'relay_population_directory_requests_day')
+        self.assertIn('[1h]', queries['relay_population_directory_requests_hour'])
+        self.assertNotIn('hs_get|hs_post|no_request', queries['relay_population_directory_requests_hour'])
+        self.assertIn('[1d]', queries['relay_population_directory_requests_day'])
+        self.assertIn('hs_get|hs_post|no_request', queries['relay_population_directory_requests_day'])
+
+
 @unittest.skipUnless(shutil.which('promtool'), 'promtool is needed for PromQL semantic tests')
 class PopulationPromQLTests(unittest.TestCase):
     def evaluate(self, group, inputs, expected, window='1d', gate=360, interval='2m'):

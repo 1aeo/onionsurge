@@ -24,11 +24,11 @@ class QueryProtocolTests(unittest.TestCase):
         result = builder.build(access.load_json(ROOT / 'catalogue/contract.json'))
         for name, value in result.items():
             self.assertEqual(access.load_json(ROOT / 'catalogue' / name), value)
-        self.assertEqual(len(result['queries.json']), 61)
-        self.assertEqual(len(result['routes.json']), 78)
+        self.assertEqual(len(result['queries.json']), 90)
+        self.assertEqual(len(result['routes.json']), 208)
         populations = {key: value for key, value in result['queries.json'].items()
                        if key.startswith('relay_population_')}
-        self.assertEqual(len(populations), 8)
+        self.assertEqual(len(populations), 16)
         self.assertTrue(all(access.safe_aggregate(query) and len(query) < 10000
                             for query in populations.values()))
 
@@ -107,6 +107,13 @@ class QueryProtocolTests(unittest.TestCase):
         self.assertEqual(access.parse('queries', queries, 1795000000), ('queries',))
         for key in queries:
             self.assertEqual(access.parse(f'prom {key} 1794873600 1794960000 86400', queries, 1795000000)[1], key)
+        for step, begin, end in (
+            (3600, 1794873600, 1794960000),
+            (21600, 1794873600, 1794960000),
+            (86400, 1794355200, 1794960000),
+        ):
+            self.assertEqual(access.parse(f'prom transport_rejections_daily_value {begin} {end} {step}', queries, 1795000000)[2:],
+                             (begin, end, step))
         for command, pattern in (
             ('sh', 'command_not_allowed'),
             ('cat /etc/shadow', 'command_not_allowed'),
@@ -117,17 +124,16 @@ class QueryProtocolTests(unittest.TestCase):
             ('snapshot 20261118T040000Z-aabbccdd ../../etc/shadow', 'command_not_allowed'),
             ('prom sum(up) 1794873600 1794960000 86400', 'invalid_query_request'),
             ('prom transport_rejections_daily_value 1794873600 1794960000 1', 'unaligned_range'),
-            ('prom transport_rejections_daily_value 1794873600 1794960000 3600', 'unaligned_range'),
-            ('prom transport_rejections_daily_value 1794873600 1794960000 21600', 'unaligned_range'),
+            ('prom transport_rejections_daily_value 1794790800 1794877200 21600', 'unaligned_range'),
             ('prom transport_rejections_daily_value 1794790800 1794877200 86400', 'unaligned_range'),
             ('prom transport_rejections_daily_value 1794960000 1795046400 86400', 'invalid_time_range'),
+            ('prom transport_rejections_daily_value 1794999600 1795003200 3600', 'invalid_time_range'),
             ('prom transport_rejections_daily_value 1794182400 1794960000 86400', 'range_limit'),
             ('prom transport_rejections_daily_value 1794873600 9999999999 86400', 'invalid_time_range'),
             ('prom transport_rejections_daily_value 1794873600 1794960000 86400; id', 'command_not_allowed'),
         ):
             with self.subTest(command=command), self.assertRaisesRegex(access.AccessError, pattern):
                 access.parse(command, queries, 1795000000)
-        self.assertEqual(access.parse('prom transport_rejections_daily_value 1794355200 1794960000 86400', queries, 1795000000)[-1], 86400)
         for retired in ('SnapshotDurabilityError', 'open_lock', 'snapshot_manifest', 'online_backup', 'make_snapshot', 'memory_index', 'gateway'):
             self.assertFalse(hasattr(access, retired), retired)
 

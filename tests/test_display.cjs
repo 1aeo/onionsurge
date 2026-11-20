@@ -7,6 +7,110 @@ const data = JSON.parse(fs.readFileSync(path.join(__dirname, '../dist/data.json'
 const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
   (_, entity) => ({amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'"})[entity]);
 
+function toV7Data(src) {
+  if (src.schema_version === 7) return structuredClone(src);
+  const d = structuredClone(src);
+  d.schema_version = 7;
+  d.window_seconds = 3600;
+  const p24 = {
+    id: '24h', summary_key: 'twenty_four_hours', export_suffix: '24h',
+    label: '24 hours', average_label: 'Last 24 hours', plot_label: '24-hour snapshot',
+    window: {unit: 'hours', count: 24, comparison_lag_days: 0},
+    minimum_coverage: 0, minimum_comparison_windows: 30,
+  };
+  const {'24h': _drop24, ...restAliases} = d.time_ranges.legacy_aliases || {};
+  d.time_ranges = {
+    version: 1, default_range: '24h', legacy_aliases: restAliases,
+    card_slots: {fallback_dynamic: '6mo', fixed: ['24h', 'all']},
+    periods: [p24, ...d.time_ranges.periods],
+  };
+  for (const c of d.charts) {
+    c.kind = c.kind === 'gauge_daily_mean' ? 'gauge_hour_mean' : 'counter_hour_rate';
+    const baseDaily = c.history_queries?.daily || {value: c.query, eligible: c.quality_query, available: c.query};
+    c.history_queries = {
+      daily: structuredClone(baseDaily),
+      sampled_hour: {
+        value: c.query.replace(/\[1d\]/g, '[1h]'),
+        eligible: c.quality_query.replace(/\[1d\]/g, '[1h]'),
+        available: baseDaily.available || c.query,
+      },
+      current24: structuredClone(baseDaily),
+    };
+    c.query = c.history_queries.sampled_hour.value;
+    c.quality_query = c.history_queries.sampled_hour.eligible;
+    if (c.builds && typeof c.builds === 'object') c.builds.scope = 'Latest complete hour';
+    for (const s of c.series) {
+      const dayCur = s.current.day;
+      const exp = dayCur.expected_relays ?? Math.max(8, c.relays);
+      const qRow = s.history.daily.slice().reverse().find(r => r[4]);
+      const vals = [], hRel = [], hExp = [];
+      for (let i = 0; i < 24; i++) {
+        const t = d.start + (i + 1) * 3600;
+        if (i === 23) {
+          vals.push([t, dayCur.valid ? dayCur.value : null]);
+          hRel.push([t, dayCur.relays]);
+          hExp.push([t, exp]);
+        } else {
+          vals.push([t, qRow ? qRow[1] : null]);
+          hRel.push([t, qRow ? exp : null]);
+          hExp.push([t, exp]);
+        }
+      }
+      s.values = vals;
+      s.hourly_relays = hRel;
+      s.hourly_expected_relays = hExp;
+      s.history.sampled_hour = s.history.daily.filter(r => r[0] % 21600 === 0).map(r => [...r]);
+      s.current.hour = structuredClone(dayCur);
+      s.reference.hour = structuredClone(s.reference.day);
+      s.peaks.hour = s.peaks.day ? structuredClone(s.peaks.day) : null;
+      if (s.relay_population) {
+        s.relay_population.queries.hour = 'sum(example_hour)';
+        s.relay_population.hour = s.relay_population.day ? [...s.relay_population.day] : null;
+      }
+      if (s.relay_counts) s.relay_counts.hour = structuredClone(s.relay_counts.day);
+    }
+  }
+  return d;
+}
+function toV6Data(src) {
+  if (src.schema_version === 6) return structuredClone(src);
+  const d = structuredClone(src);
+  d.schema_version = 6;
+  d.window_seconds = 86400;
+  const dayEnd = Math.floor(d.end / 86400) * 86400;
+  d.end = dayEnd; d.start = dayEnd - 86400;
+  const dailyPeriods = d.time_ranges.periods.filter(p => p.window.unit !== 'hours');
+  const defaultDaily = dailyPeriods.find(p => p.id === '1mo')?.id || dailyPeriods[0].id;
+  d.time_ranges = {
+    version: 1, default_range: defaultDaily,
+    legacy_aliases: {...(d.time_ranges.legacy_aliases || {}), '24h': defaultDaily, '30d': defaultDaily},
+    card_slots: {fallback_dynamic: defaultDaily, fixed: ['6mo', 'all']},
+    periods: dailyPeriods,
+  };
+  for (const c of d.charts) {
+    c.kind = c.kind === 'gauge_hour_mean' ? 'gauge_daily_mean' : 'counter_daily_rate';
+    c.start = d.start; c.end = d.end;
+    if (c.history_queries?.daily) {
+      c.query = c.history_queries.daily.value;
+      c.quality_query = c.history_queries.daily.eligible;
+      c.history_queries = {daily: c.history_queries.daily};
+    }
+    if (c.builds && typeof c.builds === 'object') c.builds.scope = 'Latest complete UTC day';
+    for (const s of c.series) {
+      delete s.values; delete s.hourly_relays; delete s.hourly_expected_relays;
+      if (s.history) delete s.history.sampled_hour;
+      if (s.current) delete s.current.hour;
+      if (s.reference) delete s.reference.hour;
+      if (s.peaks) delete s.peaks.hour;
+      if (s.relay_population) { delete s.relay_population.hour; if (s.relay_population.queries) delete s.relay_population.queries.hour; }
+      if (s.relay_counts) delete s.relay_counts.hour;
+    }
+  }
+  return d;
+}
+const hasHour = data.schema_version >= 7 || data.window_seconds === 3600;
+const v7Data = toV7Data(data), v6Data = toV6Data(data);
+
 // A small fixture for the markup this renderer produces. It does not model
 // layout; it resolves real rendered tags and models programmatic focus, including
 // detached nodes, disabled controls, and explicit negative tabindex on headings.
@@ -174,8 +278,12 @@ for (const [id,expected] of expectedSelectors) {
     assert.equal(rendered[0].text,expected,'highlight and wbr tags add no formatting whitespace');
     if(expected.includes('{'))assert.match(rendered[0].html,/<wbr>/,'selectors have mobile wrap opportunities');
     const queries=[...html.matchAll(/<pre>([\s\S]*?)<\/pre>/g)].map(([,text])=>decode(text));
-    assert.equal(queries[0],c.history_queries.daily.value,'the full reproduction query is unchanged');
-    assert.equal(queries[1],c.history_queries.daily.eligible,'coverage query is unchanged');
+    const isHour = data.time_ranges.periods.find(p => p.id === range)?.window.unit === 'hours';
+    assert.equal(queries[0],isHour?c.query:c.history_queries.daily.value,'the full reproduction query matches interval');
+    assert.equal(queries[1],isHour?c.quality_query:c.history_queries.daily.eligible,'coverage query matches interval');
+    if (isHour && c.history_queries?.current24?.value) {
+      assert.equal(queries[2],c.history_queries.current24.value,'24h view also exposes the 24-hour headline query');
+    }
   }
 }
 for (const range of ranges) for (const layout of ['full','grid']) {
@@ -216,6 +324,7 @@ for (const [c,series] of [
 const selectorBandData=structuredClone(data);
 for (const c of selectorBandData.charts) for (const series of c.series) {
   Object.assign(series.reference.day,{n:100,p10_per_relay:0,p50_per_relay:1,p90_per_relay:2});
+  if (series.reference.hour) Object.assign(series.reference.hour,{n:100,p10_per_relay:0,p50_per_relay:1,p90_per_relay:2});
 }
 for (const range of ranges) for (const [id,key,focused] of [
   ['transport_rejections','conn_rejected','tor_relay_dos_total{type="conn_rejected"}'],
@@ -228,8 +337,9 @@ for (const range of ranges) for (const [id,key,focused] of [
   assert.deepEqual(selectorMarkup(active).map(item=>item.text),[focused],'an available band focuses the selector with the plot');
   for (const cause of ['too-few','flat']) {
     const unavailable=structuredClone(selectorBandData),series=chart(id,unavailable).series.find(series=>series.key===key);
-    if(cause==='too-few')series.reference.day.n=1;
-    else series.reference.day.p90_per_relay=0;
+    const refObj=range==='24h'?series.reference.hour:series.reference.day;
+    if(cause==='too-few')refObj.n=1;
+    else refObj.p90_per_relay=0;
     const html=application('?view=explorer&chart='+id+'&range='+range+'&series='+key+'&band=1',unavailable).app.markup();
     assert.deepEqual(selectorMarkup(html).map(item=>item.text),[expectedSelectors.get(id)],'an unavailable band still plots all selectors');
   }
@@ -356,7 +466,8 @@ assert.equal(application('?view=invalid&family=invalid&series=%22bad').app.getSt
 assert.equal(application('?view=explorer&family=exit&chart=invalid').app.getState().chartId, 'exit_stream_rejections');
 assert.equal(application('', data, '2').app.getState().range, 'all');
 assert.equal(application('', data, '3').app.getState().view, 'explorer');
-assert.equal(application('?range=24h&all=transport&layout=grid').app.getState().range, '1mo');
+assert.equal(application('?range=24h&all=transport&layout=grid', v6Data).app.getState().range, '1mo');
+assert.equal(application('?range=24h&all=transport&layout=grid', v7Data).app.getState().range, '24h');
 assert.equal(application('?range=30d&all=transport&layout=grid').app.getState().range, '1mo');
 assert.equal(application('?range=1m&all=transport&layout=grid').app.getState().range, '1mo');
 assert.equal(application('?range=6m').app.getState().range, '6mo');
@@ -519,7 +630,7 @@ function roleSummary(total, guard, middle_only, exit, hsdir, v2dir, windows=1) {
     classified_windows:windows,relay_windows:total*windows,
     classified_relay_windows:total*windows,coverage:1,role_bounds:null};
 }
-const roleData = structuredClone(data), roleChart = chart('transport_rejections',roleData);
+const roleData = structuredClone(v6Data), roleChart = chart('transport_rejections',roleData);
 const rolePrimary = roleChart.series.find(series=>series.key===roleChart.primary_series);
 const roleSecondary = roleChart.series.find(series=>series.key!==roleChart.primary_series);
 rolePrimary.relay_counts = {
@@ -541,16 +652,16 @@ roleSecondary.relay_counts = {
   all_time:roleSummary(808,18,28,8,38,48,517),
 };
 const dynamicSlotPeriod = range => {
-  const active = data.time_ranges.card_slots.fixed.includes(range)
-    ? data.time_ranges.card_slots.fallback_dynamic : range;
-  return data.time_ranges.periods.find(p => p.id === active);
+  const active = v6Data.time_ranges.card_slots.fixed.includes(range)
+    ? v6Data.time_ranges.card_slots.fallback_dynamic : range;
+  return v6Data.time_ranges.periods.find(p => p.id === active);
 };
 const expectedRowText = summaryKey => {
   const c = rolePrimary.relay_counts[summaryKey];
-  const prefix = summaryKey === 'day' ? '• Relays' : '• Relays (avg)';
+  const prefix = summaryKey === 'hour' || summaryKey === 'day' ? '• Relays' : '• Relays (avg)';
   return `${prefix}: ${c.total} total · ${c.guard} guard · ${c.middle_only} middle-only · ${c.exit} exit · ${c.hsdir} HSDir · ${c.v2dir} V2Dir`;
 };
-for (const layout of ['full','grid']) for (const range of ranges) for (const view of ['overview','explorer']) {
+for (const layout of ['full','grid']) for (const range of v6Data.time_ranges.periods.map(p => p.id)) for (const view of ['overview','explorer']) {
   const controller = application('?view='+view+'&range='+range+'&layout='+layout+'&chart=transport_rejections',roleData);
   controller.app.start();
   const rows = relayRows(controller,view==='overview'?'transport':null);
@@ -577,6 +688,16 @@ for (const layout of ['full','grid']) for (const range of ranges) for (const vie
     assert.equal(controller.app.getState().layout,layout); assert.equal(controller.app.getState().range,range);
   }
 }
+const roleV7Data = structuredClone(v7Data), roleV7Chart = chart('transport_rejections', roleV7Data);
+const roleV7Primary = roleV7Chart.series.find(s => s.key === roleV7Chart.primary_series);
+roleV7Primary.relay_counts = {hour: roleSummary(99,70,2,0,80,85), ...rolePrimary.relay_counts};
+const roleV7Ctrl = application('?view=explorer&chart=transport_rejections&range=24h', roleV7Data);
+roleV7Ctrl.app.start();
+const roleV7Rows = relayRows(roleV7Ctrl);
+assert.match(roleV7Rows[0].title,/Contributing relays in this 1-hour UTC window\./);
+assert.match(roleV7Rows[1].title,/Contributing relays in this 24-hour UTC window\./);
+assert.match(roleV7Rows[2].title,/Mean daily contributing relays across 177 measured days/);
+assert.match(roleV7Rows[3].title,/Mean daily contributing relays across 517 measured days/);
 const expectedPrimaryRows = ['day', 'one_month', 'six_months', 'all_time'].map(expectedRowText);
 const unknownRoles = structuredClone(roleData), unknownSeries = chart('transport_rejections',unknownRoles).series.find(series=>series.key===roleChart.primary_series);
 unknownSeries.relay_counts.day = roleSummary(0,0,0,0,0,0);
@@ -677,6 +798,10 @@ withBand.start = withBand.end - 86400;
 const selected = withBand.series.find(s => s.key === 'conn_rejected');
 selected.history.daily = [[29 * 86400, 100, 100, 1, true], [30 * 86400, 200, 200, 1, true]];
 selected.reference.day = {n: 100, p10_per_relay: 1, p50_per_relay: 2, p90_per_relay: 3};
+selected.values = Array.from({length: 24}, (_, i) => [withBand.start + (i + 1) * 3600, i === 23 ? 200 : i === 22 ? 100 : null]);
+selected.hourly_relays = Array.from({length: 24}, (_, i) => [withBand.start + (i + 1) * 3600, i === 23 ? 200 : i === 22 ? 100 : null]);
+selected.hourly_expected_relays = Array.from({length: 24}, (_, i) => [withBand.start + (i + 1) * 3600, i === 23 ? 200 : 100]);
+selected.reference.hour = {n: 100, p10_per_relay: 1, p50_per_relay: 2, p90_per_relay: 3};
 withBand.series = [selected];
 withBand.display_keys = ['conn_rejected'];
 for (const bandRange of ranges) {
@@ -738,34 +863,40 @@ function statSections(html) {
   return starts.map((match,index)=>({classes:match[1],
     html:html.slice(match.index,starts[index+1]?.index ?? html.length)}));
 }
-for (const span of ranges) {
-  const viewMarkup = application('?view=explorer&chart=transport_rejections&range=' + span).app.markup();
-  const slot2 = dynamicSlotPeriod(span);
+for (const span of v6Data.time_ranges.periods.map(p => p.id)) {
+  const viewMarkup = application('?view=explorer&chart=transport_rejections&range=' + span, v6Data).app.markup();
+  const active = v6Data.time_ranges.card_slots.fixed.includes(span) ? v6Data.time_ranges.card_slots.fallback_dynamic : span;
+  const slot2 = v6Data.time_ranges.periods.find(p => p.id === active);
   const labels = statSections(viewMarkup).map(section => section.html.match(/<div class="stat-label">([^<]+)<\/div>/)?.[1]);
   assert.deepEqual(labels, ['24-hour average', slot2.average_label, 'Last 6 months average', 'All-time average'],
     'adaptive 2x2 stat grid on ' + span);
   assert.equal((viewMarkup.match(/class="stat-number"/g) || []).length, 4, '2x2 stat grid on ' + span);
-  const csvPattern = new RegExp(`exports\\/transport_rejections-${slot2 && span ? data.time_ranges.periods.find(p => p.id === span).export_suffix : ''}\\.csv`);
+  const csvPattern = new RegExp(`exports\\/transport_rejections-${slot2 && span ? v6Data.time_ranges.periods.find(p => p.id === span).export_suffix : ''}\\.csv`);
   assert.match(viewMarkup, csvPattern, 'Explorer CSV link uses active period export_suffix on ' + span);
 }
 const directory = application('?view=explorer&chart=directory_requests&range=all').app.markup();
+const directoryV6 = application('?view=explorer&chart=directory_requests&range=all', v6Data).app.markup();
 const sixMonths = chart('directory_requests').series.find(s => s.key === 'hs_get').historical_averages.six_months;
 assert.ok(directory.includes(`${sixMonths.days} / ${sixMonths.expected_days} days`));
-assert.equal((statSections(directory).slice(0,2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
+assert.equal((statSections(directoryV6).slice(0, 2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
   'directory_requests 1mo partial window is ready under zero minimum_coverage alongside 24h');
-const directoryGated = structuredClone(data);
+const directoryGated = structuredClone(v6Data);
 chart('directory_requests', directoryGated).series.find(s => s.key === 'hs_get').historical_averages.one_month.status = 'insufficient_data';
-assert.equal((statSections(application('?view=explorer&chart=directory_requests&range=all', directoryGated).app.markup()).slice(0,2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 1,
+assert.equal((statSections(application('?view=explorer&chart=directory_requests&range=all', directoryGated).app.markup()).slice(0, 2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 1,
   'explicit insufficient_data 1mo window still suppresses the Current 24h ruler');
-const directory7d = application('?view=explorer&chart=directory_requests&range=7d').app.markup();
-assert.equal((statSections(directory7d).slice(0,2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
+const directory7d = application('?view=explorer&chart=directory_requests&range=7d', v6Data).app.markup();
+assert.equal((statSections(directory7d).slice(0, 2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
   'directory_requests 7d window is ready and displays its Current 24h ruler');
+const directoryGatedV7 = structuredClone(v7Data);
+chart('directory_requests', directoryGatedV7).series.find(s => s.key === 'hs_get').historical_averages.six_months.status = 'insufficient_data';
+assert.equal((statSections(application('?view=explorer&chart=directory_requests&range=all', directoryGatedV7).app.markup()).slice(1, 3).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 1,
+  'explicit insufficient_data 6mo fallback window in v7 suppresses the Current 24h ruler');
 
-const comparisonData = structuredClone(data), comparisonChart = chart('transport_rejections',comparisonData);
+const comparisonData = structuredClone(v6Data), comparisonChart = chart('transport_rejections',comparisonData);
 const comparisonSeries = comparisonChart.series.find(series=>series.key===comparisonChart.primary_series);
 function comparison(n, rank, flat_zero=false) {
-  return {method:'daily-per-relay-midrank-v1',cutoff:data.reference_cutoff,n,
-    start:n?data.reference_cutoff-n*86400:null,end:n?data.reference_cutoff:null,
+  return {method:'daily-per-relay-midrank-v1',cutoff:v6Data.reference_cutoff,n,
+    start:n?v6Data.reference_cutoff-n*86400:null,end:n?v6Data.reference_cutoff:null,
     current_percentile:rank,flat_zero};
 }
 Object.assign(comparisonSeries.current.day,{valid:true,value:12,display:'12'});
@@ -775,11 +906,13 @@ comparisonSeries.historical_averages.three_months.comparison = comparison(90,93)
 comparisonSeries.historical_averages.six_months.comparison = comparison(116,99);
 comparisonSeries.historical_averages.twelve_months.comparison = comparison(300,95);
 comparisonSeries.historical_averages.all_time.comparison = comparison(400,99.7);
-for (const layout of ['full','grid']) for (const range of ranges) {
+const v6Ranges = v6Data.time_ranges.periods.map(p => p.id);
+for (const layout of ['full','grid']) for (const range of v6Ranges) {
   const view = application('?view=explorer&chart=transport_rejections&layout='+layout+'&range='+range,comparisonData);
   view.app.start();
   const panels = statSections(view.page.innerHTML);
-  const slot2 = dynamicSlotPeriod(range);
+  const active = v6Data.time_ranges.card_slots.fixed.includes(range) ? v6Data.time_ranges.card_slots.fallback_dynamic : range;
+  const slot2 = v6Data.time_ranges.periods.find(p => p.id === active);
   assert.equal(panels.length,4);
   assert.equal((view.page.innerHTML.match(/class="historical-comparison"/g) || []).length,3);
   assert.match(view.page.innerHTML,/18-month average: <b>/);
@@ -855,12 +988,14 @@ assert.equal(selectedComparison.browser.document.activeElement,selectedCompariso
 
 const valuesTable = directory.match(/<table data-values-table>([\s\S]*?)<\/table>/)[1];
 const tableHeaders = [...valuesTable.matchAll(/<th>(.*?)<\/th>/g)].map(([,h]) => decode(h));
-assert.deepEqual(tableHeaders, ['Series', 'Unit', '24-hour average', ...data.time_ranges.periods.map(p => p.average_label)]);
-assert.equal(tableHeaders.length, 9, '2 label columns + 7 data columns');
+const dailyPeriods = data.time_ranges.periods.filter(p => p.window.unit !== 'hours');
+const expectedTableHeaders = ['Series', 'Unit', ...(hasHour ? ['Last complete hour'] : []), '24-hour average', ...dailyPeriods.map(p => p.average_label)];
+assert.deepEqual(tableHeaders, expectedTableHeaders);
+assert.equal(tableHeaders.length, hasHour ? 10 : 9);
 const rows = [...valuesTable.matchAll(/<tr><td>(.*?)<\/td><td>(.*?)<\/td>/g)]
   .map(([, name, unit]) => [decode(name), decode(unit)]);
 const tableBodyRows = [...valuesTable.matchAll(/<tbody>([\s\S]*?)<\/tbody>/g)][0][1].match(/<tr>[\s\S]*?<\/tr>/g);
-assert.ok(tableBodyRows.every(rowHtml => (rowHtml.match(/<td>/g) || []).length === 9));
+assert.ok(tableBodyRows.every(rowHtml => (rowHtml.match(/<td>/g) || []).length === expectedTableHeaders.length));
 const expectedUnits = {
   hs_get: 'requests/s', hs_post: 'requests/s', consensus: 'requests/s', microdesc: 'requests/s',
   descriptor: 'requests/s', other_get: 'requests/s', other_post: 'requests/s',
@@ -945,7 +1080,7 @@ extremeChart.end = 8.64e12;
 assert.equal(ui.preparePlot(extremeChart, extremeChart.series, 'all', data.time_ranges), null, 'corrupt range cannot allocate an unbounded gap grid');
 
 for (const value of [undefined, null, -1, Infinity, '1']) {
-  const missingCurrent = structuredClone(data), missingChart = chart('transport_rejections', missingCurrent);
+  const missingCurrent = structuredClone(v6Data), missingChart = chart('transport_rejections', missingCurrent);
   const missingSeries = missingChart.series.find(s => s.key === missingChart.primary_series);
   Object.assign(missingSeries.current.day, {value, valid: true, display: '1234'});
   missingSeries.peaks.day.current_is_record = true;
@@ -957,7 +1092,7 @@ for (const value of [undefined, null, -1, Infinity, '1']) {
 for (const [scale, value] of [
   [2, Number.MAX_VALUE], [0, 1], [-1, 1], [Infinity, 1], [NaN, 1],
 ]) {
-  const invalidScale = structuredClone(data), scaledChart = chart('transport_rejections', invalidScale);
+  const invalidScale = structuredClone(v6Data), scaledChart = chart('transport_rejections', invalidScale);
   scaledChart.display_scale = scale;
   const scaledSeries = scaledChart.series.find(s => s.key === scaledChart.primary_series);
   Object.assign(scaledSeries.current.day, {value, valid: true, display: '1234'});
@@ -979,7 +1114,7 @@ function assertUnavailableSummaries(html) {
   assert.doesNotMatch(table, /<td>9012<\/td>/, 'table averages reject the same invalid scale');
 }
 for (const scale of [0, -1, Infinity, NaN, undefined, '1']) for (const cached of [false, true]) {
-  const fixture = structuredClone(data), item = chart('transport_rejections', fixture);
+  const fixture = structuredClone(v6Data), item = chart('transport_rejections', fixture);
   const series = item.series.find(s => s.key === item.primary_series);
   item.display_scale = scale;
   series.reference.day.mean_per_relay = 2;
@@ -988,11 +1123,11 @@ for (const scale of [0, -1, Infinity, NaN, undefined, '1']) for (const cached of
   else delete series.current.day.reference_display;
   series.current.day.peak_display = '5678';
   series.peaks.day.fleet_peak = 2;
-  for (const period of data.time_ranges.periods) Object.assign(series.historical_averages[period.summary_key], {status: 'ready', value: 2, display: '9012'});
+  for (const period of v6Data.time_ranges.periods) Object.assign(series.historical_averages[period.summary_key], {status: 'ready', value: 2, display: '9012'});
   assertUnavailableSummaries(application('?view=explorer&chart=transport_rejections&range=all', fixture).app.markup());
 }
 for (const cached of [false, true]) {
-  const fixture = structuredClone(data), item = chart('transport_rejections', fixture);
+  const fixture = structuredClone(v6Data), item = chart('transport_rejections', fixture);
   const series = item.series.find(s => s.key === item.primary_series);
   Object.assign(series.current.day, {valid: false, value: null, relays: 3});
   series.reference.day.mean_per_relay = 2;
@@ -1002,14 +1137,14 @@ for (const cached of [false, true]) {
   assert.deepEqual(referenceTexts(html), ['6'], 'reference means survive insufficient current coverage');
   assert.doesNotMatch(html, /class="rank-ruler/);
 }
-const overflowingSummaries = structuredClone(data), overflowingChart = chart('transport_rejections', overflowingSummaries);
+const overflowingSummaries = structuredClone(v6Data), overflowingChart = chart('transport_rejections', overflowingSummaries);
 const overflowingSeries = overflowingChart.series.find(s => s.key === overflowingChart.primary_series);
 overflowingChart.display_scale = 2;
 overflowingSeries.reference.day.mean_per_relay = Number.MAX_VALUE;
 overflowingSeries.current.day.reference_display = '1234';
 overflowingSeries.peaks.day.fleet_peak = Number.MAX_VALUE;
 overflowingSeries.current.day.peak_display = '5678';
-for (const period of data.time_ranges.periods) Object.assign(overflowingSeries.historical_averages[period.summary_key], {value: Number.MAX_VALUE, display: '9012'});
+for (const period of v6Data.time_ranges.periods) Object.assign(overflowingSeries.historical_averages[period.summary_key], {value: Number.MAX_VALUE, display: '9012'});
 assertUnavailableSummaries(application('?view=explorer&chart=transport_rejections&range=all', overflowingSummaries).app.markup());
 overflowingChart.display_scale = 0.1;
 overflowingSeries.reference.day.mean_per_relay = 8e307;
@@ -1017,7 +1152,7 @@ overflowingSeries.current.day.relays = 3;
 delete overflowingSeries.current.day.reference_display;
 assert.equal(referenceTexts(application('?view=explorer&chart=transport_rejections', overflowingSummaries).app.markup())[0],
   ui.number((8e307 * 0.1) * 3), 'reference scaling retains a finite final product');
-const validZero = structuredClone(data), zeroChart = chart('transport_rejections', validZero);
+const validZero = structuredClone(v6Data), zeroChart = chart('transport_rejections', validZero);
 const zeroSeries = zeroChart.series.find(s => s.key === zeroChart.primary_series);
 Object.assign(zeroSeries.current.day, {value: 0, valid: true, display: '0'});
 Object.assign(zeroSeries.reference.day, {current_percentile: 0, flat_zero: false});
@@ -1067,6 +1202,7 @@ for (const item of data.charts) for (const span of ranges) {
 const emptyChart = structuredClone(chart('transport_rejections'));
 for (const series of emptyChart.series) {
   series.history.daily = [];
+  series.values = [];
 }
 for (const period of data.time_ranges.periods) {
   const span = period.id;
@@ -1084,6 +1220,7 @@ for (const period of data.time_ranges.periods) {
   const zeroChart=structuredClone(restored);
   for(const series of zeroChart.series){
     series.history.daily=series.history.daily.map(row=>[row[0],0,...row.slice(2)]);
+    if(series.values)series.values=series.values.map(([t])=>[t,0]);
   }
   noDataView.draw(output,zeroChart,span);
   assert.doesNotMatch(output.getAttribute('aria-label'),/No retained samples/,'measured zeros remain observations, not a no-data state');
@@ -1120,7 +1257,7 @@ for (const layout of ['full','grid']) for (const range of ranges) {
 // Count reads of the real observations, rather than exposing cache internals.
 // Navigation may reuse a release's prepared plots; a replacement must prepare
 // them again, and a failed replacement must restore the prior release's cache.
-const cachedData = structuredClone(data), cachedChart = chart('transport_rejections', cachedData);
+const cachedData = structuredClone(v6Data), cachedChart = chart('transport_rejections', cachedData);
 let dailyReads = 0;
 for (const series of cachedChart.series) {
   const daily = series.history.daily;
@@ -1136,13 +1273,13 @@ assert.equal(dailyReads, firstDefaultReads, 'view redraw retains default prepara
 click(cachedView, '[data-all-range]', {allRange: 'all'});
 const afterAllReads = dailyReads;
 assert.ok(afterAllReads > firstDefaultReads, 'first All time view prepares all-time observations');
-click(cachedView, '[data-all-range]', {allRange: defaultRange});
+click(cachedView, '[data-all-range]', {allRange: v6Data.time_ranges.default_range});
 click(cachedView, '[data-all-range]', {allRange: 'all'});
 assert.equal(dailyReads, afterAllReads, 'range redraw reuses both default and all-time preparations');
-cachedView.app.replaceRelease(cachedData, releaseContext(cachedData, 'cache-new', () => data.end));
+cachedView.app.replaceRelease(cachedData, releaseContext(cachedData, 'cache-new', () => v6Data.end));
 assert.ok(dailyReads > afterAllReads, 'replacement resets preparation even for the same chart identities');
 const beforeRejectedPlot = element(); cachedView.app.draw(beforeRejectedPlot, cachedChart, 'all');
-const rejectedData = structuredClone(data);
+const rejectedData = structuredClone(v6Data);
 for (const series of chart('transport_rejections', rejectedData).series) {
   series.history.daily = series.history.daily.map(row => [row[0], 1000000, ...row.slice(2)]);
 }
@@ -1153,18 +1290,18 @@ cachedView.browser.document.querySelectorAll = selector => {
   return originalQueryAll(selector);
 };
 const readsBeforeFailure = dailyReads;
-assert.throws(() => cachedView.app.replaceRelease(rejectedData, releaseContext(rejectedData, 'cache-rejected', () => data.end)), /reject prepared candidate/);
+assert.throws(() => cachedView.app.replaceRelease(rejectedData, releaseContext(rejectedData, 'cache-rejected', () => v6Data.end)), /reject prepared candidate/);
 const afterRejectedPlot = element(); cachedView.app.draw(afterRejectedPlot, cachedChart, 'all');
 assert.equal(afterRejectedPlot.innerHTML, beforeRejectedPlot.innerHTML, 'rollback retains the old plot geometry');
 assert.equal(dailyReads, readsBeforeFailure, 'rollback restores the prior preparation cache');
 
-let liveNow=data.end+108001;
-const freshNow=data.end+7200;
+let liveNow=data.end+(hasHour?7201:108001);
+const freshNow=data.end+(hasHour?3600:7200);
 const firstRelease=releaseContext(data,'first',()=>freshNow);
 const liveView=application('?view=explorer&chart=transport_rejections&range=all&layout=grid&series=concurrent_conn_rejected&band=1',data,'1',firstRelease);
 liveView.app.start();
 assert.match(liveView.app.markup(),/Observed through/);
-assert.doesNotMatch(liveView.app.markup(),/Saved snapshot|Daily 00:00 UTC publication planned|Update delayed/);
+assert.doesNotMatch(liveView.app.markup(),/Saved snapshot|(?:Daily 00:00|Hourly) UTC publication planned|Update delayed/);
 assert.match(liveView.app.markup(),/href="blob:first\/exports\/transport_rejections-all-time.csv" download="first-transport_rejections-all-time.csv"/);
 const selectedControl=liveView.browser.document.querySelector('[data-series-select]');selectedControl.focus({preventScroll:true});
 const priorState=liveView.app.getState(),clickHandler=liveView.events.get('click');
@@ -1341,7 +1478,7 @@ delete chart('transport_rejections',noHistQueries).history_queries;
 const noHistMarkup=application('?view=explorer&chart=transport_rejections',noHistQueries).app.markup();
 assert.match(noHistMarkup,/PromQL/);
 
-const staleDisplay=structuredClone(data),staleChart=chart('transport_rejections',staleDisplay);
+const staleDisplay=structuredClone(v6Data),staleChart=chart('transport_rejections',staleDisplay);
 const staleSeries=staleChart.series.find(s=>s.key===staleChart.primary_series);
 staleChart.display_scale=1;
 Object.assign(staleSeries.current.day,{value:50,valid:true,relays:100,display:'9999'});
@@ -1360,7 +1497,7 @@ assert.match(staleMarkup,/Last 6 months average<\/div><div class="stat-number"[^
 assert.doesNotMatch(staleMarkup,/9999|7777|8888|6666|5555/);
 assert.ok(staleMarkup.indexOf('class="series-toolbar"')!==-1&&staleMarkup.indexOf('class="series-toolbar"')<staleMarkup.indexOf('class="stat-pair'));
 
-const subnormalFixture=structuredClone(data),subnormalChart=chart('transport_rejections',subnormalFixture);
+const subnormalFixture=structuredClone(v6Data),subnormalChart=chart('transport_rejections',subnormalFixture);
 const subnormalSeries=subnormalChart.series.find(s=>s.key===subnormalChart.primary_series);
 subnormalChart.display_scale=0.1;
 Object.assign(subnormalSeries.current.day,{value:Number.MIN_VALUE,valid:true,relays:8});
@@ -1378,16 +1515,20 @@ assert.doesNotMatch(phantomMarkup,/Reference 10th–90th percentiles/);
 const missingQuantiles=structuredClone(data),mqChart=chart('transport_rejections',missingQuantiles);
 const mqSeries=mqChart.series.find(s=>s.key===mqChart.primary_series);
 mqSeries.reference.day={n:100};
+if(mqSeries.reference.hour)mqSeries.reference.hour={n:100};
 const mqMarkup=application('?view=explorer&chart=transport_rejections',missingQuantiles).app.markup();
 assert.match(mqMarkup,/Reference percentile range unavailable/);
 assert.doesNotMatch(mqMarkup,/10th and 90th percentiles are equal/);
 mqSeries.reference.day={n:-5};
+if(mqSeries.reference.hour)mqSeries.reference.hour={n:-5};
 assert.match(application('?view=explorer&chart=transport_rejections',missingQuantiles).app.markup(),/Reference percentile range unavailable/);
 
 const nullRefMeta=structuredClone(data),nullRefChart=chart('transport_rejections',nullRefMeta);
 const nullRefSeries=nullRefChart.series.find(s=>s.key===nullRefChart.primary_series);
 nullRefSeries.reference.day={n:1,start:null,end:null};
 nullRefSeries.current.day={value:null,relays:null,valid:false};
+if(nullRefSeries.reference.hour)nullRefSeries.reference.hour={n:1,start:null,end:null};
+if(nullRefSeries.current.hour)nullRefSeries.current.hour={value:null,relays:null,valid:false};
 const nullRefOverview=application('',nullRefMeta).app.markup();
 assert.doesNotMatch(nullRefOverview,/1 Jan 1970/);
 assert.match(nullRefOverview,/Unavailable reporting relays/);
@@ -1454,6 +1595,12 @@ for(const text of ['7 days','1 month','3 months','6 months','12 months','All tim
  '6 for 7 days','25 for 1 month']){
  assert.ok(methodsHtml.includes(text),`methods() documents ${text}`);
 }
+if (hasHour) {
+ for (const text of ['24 hours','Last complete hour','Sampled 1h fleet peak','Hourly publication and reference updates']) {
+  assert.ok(methodsHtml.includes(text),`v7 methods() documents ${text}`);
+ }
+ assert.doesNotMatch(methodsHtml,/Last 24 hours<\/b> are unweighted|Last 24 hours<\/th>/,'24h snapshot is not mislabeled as a daily average');
+}
 
 for(const [endIso,periodId,expectedStartIso] of [
  ['2024-03-31T00:00:00Z','1mo','2024-02-29T00:00:00Z'],
@@ -1472,48 +1619,52 @@ for(const [endIso,periodId,expectedStartIso] of [
  assert.equal(prepared.start,Date.parse(expectedStartIso)/1000,`calendar plot start for ${endIso} / ${periodId}`);
 }
 
+const dayIdx = d => d.time_ranges.periods.findIndex(p => p.window.unit === 'days');
+const monIdx = d => d.time_ranges.periods.findIndex(p => p.window.unit === 'months');
 for(const mutate of [
  d=>{delete d.time_ranges;},
  d=>{d.time_ranges.version=2;},
  d=>{d.time_ranges.periods=[];},
- d=>{d.time_ranges.periods=Array.from({length:17},(_,i)=>({...structuredClone(d.time_ranges.periods[0]),id:`p${i}`,summary_key:`p_${i}`,export_suffix:`p${i}`}));},
+ d=>{const dp=d.time_ranges.periods[dayIdx(d)];d.time_ranges.periods=Array.from({length:17},(_,i)=>({...structuredClone(dp),id:`p${i}`,summary_key:`p_${i}`,export_suffix:`p${i}`}));},
  d=>{d.time_ranges.periods=d.time_ranges.periods.filter(p=>p.window.unit!=='all_time');d.time_ranges.card_slots.fixed=['7d','6mo'];},
  d=>{const dup=structuredClone(d.time_ranges.periods.at(-1));dup.id='all2';dup.summary_key='all_two';dup.export_suffix='all-two';d.time_ranges.periods.push(dup);},
- d=>{d.time_ranges.periods[0].id='24h';},
- d=>{d.time_ranges.periods[0].id='1h';},
- d=>{d.time_ranges.periods[0].id='30m';},
- d=>{d.time_ranges.periods[0].id='60s';},
- d=>{d.time_ranges.periods[0].id='1d';},
- d=>{d.time_ranges.periods[0].export_suffix='24h';},
- d=>{d.time_ranges.periods[0].export_suffix='foo-24h';},
- d=>{d.time_ranges.periods[0].summary_key='day';},
+ d=>{d.time_ranges.periods[dayIdx(d)].id='24h';},
+ d=>{d.time_ranges.periods[dayIdx(d)].id='1h';},
+ d=>{d.time_ranges.periods[dayIdx(d)].id='30m';},
+ d=>{d.time_ranges.periods[dayIdx(d)].id='60s';},
+ d=>{d.time_ranges.periods[dayIdx(d)].id='1d';},
+ d=>{d.time_ranges.periods[dayIdx(d)].id='024h';},
+ d=>{d.time_ranges.periods[dayIdx(d)].id='23h';},
+ d=>{d.time_ranges.periods[dayIdx(d)].export_suffix='24h';},
+ d=>{d.time_ranges.periods[dayIdx(d)].export_suffix='foo-24h';},
+ d=>{d.time_ranges.periods[dayIdx(d)].summary_key='day';},
  ...['hour','sampled_hour','hourly_relays','hourly_expected_relays','current24'].flatMap(key=>[
-  d=>{d.time_ranges.periods[0].summary_key=key;},
+  d=>{d.time_ranges.periods[dayIdx(d)].summary_key=key;},
   d=>{d.time_ranges.legacy_aliases[key]='1mo';},
  ]),
- d=>{d.time_ranges.periods[0].window.count=1;},
- d=>{d.time_ranges.periods[0].minimum_coverage=-0;},
- d=>{d.time_ranges.periods[0].minimum_coverage=-0.1;},
- d=>{d.time_ranges.periods[0].minimum_coverage=1.1;},
- d=>{d.time_ranges.periods[1].minimum_coverage=-0;},
- d=>{d.time_ranges.periods[1].minimum_coverage=-0.1;},
- d=>{d.time_ranges.periods[1].minimum_coverage=1.1;},
+ d=>{d.time_ranges.periods[dayIdx(d)].window.count=1;},
+ d=>{d.time_ranges.periods[dayIdx(d)].minimum_coverage=-0;},
+ d=>{d.time_ranges.periods[dayIdx(d)].minimum_coverage=-0.1;},
+ d=>{d.time_ranges.periods[dayIdx(d)].minimum_coverage=1.1;},
+ d=>{d.time_ranges.periods[monIdx(d)].minimum_coverage=-0;},
+ d=>{d.time_ranges.periods[monIdx(d)].minimum_coverage=-0.1;},
+ d=>{d.time_ranges.periods[monIdx(d)].minimum_coverage=1.1;},
  d=>{d.time_ranges.periods.at(-1).minimum_coverage=-0;},
  d=>{d.time_ranges.periods.at(-1).minimum_coverage=0.5;},
  d=>{d.time_ranges.card_slots.fixed=['6mo','6mo'];},
- d=>{d.time_ranges.card_slots.fallback_dynamic='6mo';},
- d=>{d.time_ranges.periods[0].label='🚀'.repeat(81);},
- d=>{d.time_ranges.periods[0].average_label='🚀'.repeat(81);},
- d=>{d.time_ranges.periods[0].plot_label='🚀'.repeat(81);},
- d=>{d.time_ranges.periods[0].label='\uFEFF';},
- d=>{d.time_ranges.periods[0].average_label='\x85';},
- d=>{d.time_ranges.periods[0].plot_label='\x1f';},
+ d=>{d.time_ranges.card_slots.fallback_dynamic=d.time_ranges.card_slots.fixed[0];},
+ d=>{d.time_ranges.periods[dayIdx(d)].label='🚀'.repeat(81);},
+ d=>{d.time_ranges.periods[dayIdx(d)].average_label='🚀'.repeat(81);},
+ d=>{d.time_ranges.periods[dayIdx(d)].plot_label='🚀'.repeat(81);},
+ d=>{d.time_ranges.periods[dayIdx(d)].label='\uFEFF';},
+ d=>{d.time_ranges.periods[dayIdx(d)].average_label='\x85';},
+ d=>{d.time_ranges.periods[dayIdx(d)].plot_label='\x1f';},
  d=>{d.time_ranges.legacy_aliases['🚀'.repeat(33)]='1mo';},
  d=>{d.time_ranges.legacy_aliases['\uFEFF']='1mo';},
  d=>{d.time_ranges.legacy_aliases['\x85']='1mo';},
  d=>{d.time_ranges.legacy_aliases['\x1c']='1mo';},
  d=>{d.time_ranges.legacy_aliases['7d']='1mo';},
- d=>{d.time_ranges.legacy_aliases['24h']='missing';},
+ d=>{d.time_ranges.legacy_aliases['30d']='missing';},
 ]){
  const badTr=structuredClone(data);
  mutate(badTr);
@@ -1523,9 +1674,9 @@ assert.equal(ui.parseLocation(data,'?range=1mo').range,'1mo');
 
 for(const cov of [0,0.9]){
  const covData=structuredClone(data);
- covData.time_ranges.periods[0].minimum_coverage=cov;
- covData.time_ranges.periods[1].minimum_coverage=cov;
- assert.equal(ui.validateTimeRanges(covData.time_ranges).periods[0].minimum_coverage,cov,`validateTimeRanges accepts minimum_coverage=${cov} on days/months`);
+ covData.time_ranges.periods[dayIdx(covData)].minimum_coverage=cov;
+ covData.time_ranges.periods[monIdx(covData)].minimum_coverage=cov;
+ assert.equal(ui.validateTimeRanges(covData.time_ranges).periods[dayIdx(covData)].minimum_coverage,cov,`validateTimeRanges accepts minimum_coverage=${cov} on days/months`);
 }
 
 // Partial-period coverage (minimum_coverage: 0), n >= 2 Explorer percentile band,
@@ -1535,18 +1686,19 @@ assert.ok(methodsHtml.includes('uses all available qualifying days in the window
 assert.doesNotMatch(methodsHtml,/at least 0% of days|requires ≥ 0%/);
 const customMethodsHtml=application('?view=methods',(()=>{
  const d=structuredClone(data);
- d.time_ranges.periods[0].minimum_coverage=0.9;
+ d.time_ranges.periods[dayIdx(d)].minimum_coverage=0.9;
  return d;
 })()).app.markup();
 assert.ok(customMethodsHtml.includes('at least 90% of days required'),'methods() keeps percentage wording for non-zero thresholds');
 
+const v6HistOffset=0,v6HistSliceEnd=2;
 for(const cid of ['hsdir_fetches','directory_rejections','protocol_closes']){
- const ch=chart(cid),prim=ch.series.find(s=>s.key===ch.primary_series)||ch.series[0];
- for(const p of data.time_ranges.periods){
+ const ch=chart(cid,v6Data),prim=ch.series.find(s=>s.key===ch.primary_series)||ch.series[0];
+ for(const p of v6Data.time_ranges.periods){
   assert.equal(prim.historical_averages[p.summary_key].status,'ready',`${cid} primary ${p.id} is ready under partial coverage`);
  }
- for(const r of ranges){
-  const html=application(`?view=explorer&chart=${cid}&range=${r}`).app.markup();
+ for(const r of v6Ranges){
+  const html=application(`?view=explorer&chart=${cid}&range=${r}`,v6Data).app.markup();
   const histPanels=statSections(html).slice(1);
   assert.equal(histPanels.length,3);
   for(const panel of histPanels){
@@ -1582,12 +1734,12 @@ btSeries.reference.day={n:2,p10_per_relay:1,p50_per_relay:2,p90_per_relay:3,mean
 assert.doesNotMatch(application('?view=explorer&chart=directory_rejections&range=1mo&band=1',bandThresholdData).app.markup(),/data-band-toggle[^>]*disabled/);
 
 // Narrowed partial window .average-dates hover title vs full-window no-title.
-const narrowedHtml=application('?view=explorer&chart=directory_rejections&range=6mo').app.markup();
-const dirRej6mo=chart('directory_rejections').series.find(s=>s.key===chart('directory_rejections').primary_series).historical_averages.six_months;
+const narrowedHtml=application('?view=explorer&chart=directory_rejections&range=6mo',v6Data).app.markup();
+const dirRej6mo=chart('directory_rejections',v6Data).series.find(s=>s.key===chart('directory_rejections',v6Data).primary_series).historical_averages.six_months;
 assert.ok(dirRej6mo.observed_start>dirRej6mo.start,'directory_rejections 6mo has narrower observed_start than calendar start');
 const avgDateTag=narrowedHtml.match(/<div class="average-dates"[^>]*>[^<]+<\/div>/g)[1];
 assert.match(avgDateTag,/title="Measured observations: [^"]+ UTC\."/);
-const exactDatesData=structuredClone(data),exChart=chart('transport_rejections',exactDatesData);
+const exactDatesData=structuredClone(v6Data),exChart=chart('transport_rejections',exactDatesData);
 const exSeries=exChart.series.find(s=>s.key===exChart.primary_series);
 const ex6mo=exSeries.historical_averages.six_months;
 ex6mo.observed_start=ex6mo.start;ex6mo.observed_end=ex6mo.end;
@@ -1595,7 +1747,7 @@ const exactDateTag=application('?view=explorer&chart=transport_rejections&range=
 assert.doesNotMatch(exactDateTag,/title=/,'full-window summary omits redundant .average-dates title');
 
 // Explicit 0-day / insufficient_data states remain well-behaved under minimum_coverage: 0 and 0.9.
-const zeroDayData=structuredClone(data),zdChart=chart('transport_rejections',zeroDayData);
+const zeroDayData=structuredClone(v6Data),zdChart=chart('transport_rejections',zeroDayData);
 const zdSeries=zdChart.series.find(s=>s.key===zdChart.primary_series);
 Object.assign(zdSeries.historical_averages.six_months,{days:0,coverage:0,status:'insufficient_data',value:null,observed_start:null,observed_end:null});
 const zeroDayPanels=statSections(application('?view=explorer&chart=transport_rejections&range=all',zeroDayData).app.markup());
@@ -1608,14 +1760,14 @@ const gatedZeroPanels=statSections(application('?view=explorer&chart=transport_r
 assert.match(gatedZeroPanels[2].html,/At least 90% daily coverage is required for last 6 months average/);
 
 const unicodeTr=structuredClone(data);
-unicodeTr.time_ranges.periods[0].label='🚀'.repeat(80);
-unicodeTr.time_ranges.periods[0].average_label='🚀'.repeat(80);
-unicodeTr.time_ranges.periods[0].plot_label='🚀'.repeat(80);
+unicodeTr.time_ranges.periods[dayIdx(unicodeTr)].label='🚀'.repeat(80);
+unicodeTr.time_ranges.periods[dayIdx(unicodeTr)].average_label='🚀'.repeat(80);
+unicodeTr.time_ranges.periods[dayIdx(unicodeTr)].plot_label='🚀'.repeat(80);
 unicodeTr.time_ranges.legacy_aliases['🚀'.repeat(32)]='7d';
 assert.equal(ui.parseLocation(unicodeTr,'?range='+encodeURIComponent('🚀'.repeat(32))).range,'7d',
  'supplementary Unicode code-point limits accept 80-char labels and 32-char legacy aliases');
 
-const customData=structuredClone(data);
+const customData=structuredClone(v6Data);
 customData.time_ranges={
  version:1,
  default_range:'14d',
@@ -1646,7 +1798,7 @@ for(const [r,expectedCsv] of [['14d','14d'],['2mo','2mo'],['all','all-time']]){
   ['Series','Unit','24-hour average','Last 14 days average','Last 2 months average','All-time average']);
 }
 
-const v5Data=structuredClone(data);
+const v5Data=structuredClone(v6Data);
 v5Data.schema_version=5;
 delete v5Data.time_ranges;
 for(const c of v5Data.charts)for(const s of c.series){
@@ -1666,11 +1818,11 @@ assert.match(v5ExactApp.page.innerHTML,/href="blob:v5-old\/exports\/transport_re
 const v5Upgrading=application('?view=overview',v5Data,'1',v5Release);
 v5Upgrading.app.start();
 assert.equal(v5Upgrading.app.getState().range,'30d');
-v5Upgrading.app.replaceRelease(data,releaseContext(data,'v6-new',()=>data.end));
+v5Upgrading.app.replaceRelease(v6Data,releaseContext(v6Data,'v6-new',()=>v6Data.end));
 assert.equal(v5Upgrading.app.getState().range,'1mo','live upgrade from v5 30d migrates via legacy_aliases to 1mo');
 
-// V4 Concurrent DoS hero card: Overview isolation (7d|all), non-overlapping math, responsive SVGs, URL/live/keyboard parity.
-const heroDefault=application('?view=overview');
+// V4 Concurrent DoS hero card on v6 fallback: Overview isolation (7d|all), non-overlapping math, responsive SVGs, URL/live/keyboard parity.
+const heroDefault=application('?view=overview',v6Data);
 heroDefault.app.start();
 assert.equal(heroDefault.app.getState().heroRange,'7d');
 assert.equal(heroDefault.app.getState().heroScale,'linear');
@@ -1684,16 +1836,16 @@ assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-range]').
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-scale]').length,2);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-hsdir]').length,1);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-panel]').length,2);
-assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel active');
-assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel');
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel active desktop-left');
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel desktop-right');
 assert.match(heroHtml,/data-hero-plot="concurrent_dos_7d" data-hero-plot-range="7d"/);
 assert.match(heroHtml,/data-hero-plot="concurrent_dos_all" data-hero-plot-range="all"/);
 assert.match(heroHtml,/Last 7 days[\s\S]*7 × 24h[\s\S]*All time[\s\S]*548 × 24h/);
 assert.equal(heroDefault.app.url('overview'),'?view=overview&range=1mo&layout=full&family=directory&chart=directory_requests',
  'default hero settings omit extra query parameters');
 click(heroDefault,'[data-hero-range]',{heroRange:'all'});
-assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel');
-assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel active');
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel desktop-left');
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel active desktop-right');
 assert.equal(heroDefault.app.getState().heroRange,'all');
 assert.equal(heroDefault.app.getState().range,'1mo','hero All time toggle leaves 6-family 1mo range unchanged');
 assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-range="all"]'));
@@ -1713,7 +1865,7 @@ const heroParams=new URLSearchParams(heroDefault.app.url('overview').slice(1));
 assert.equal(heroParams.get('hero_range'),'all');
 assert.equal(heroParams.get('hero_scale'),'symlog');
 assert.equal(heroParams.get('hero_hsdir'),'0');
-assert.deepEqual(ui.parseLocation(data,heroDefault.browser.location.search),heroDefault.app.getState(),
+assert.deepEqual(ui.parseLocation(v6Data,heroDefault.browser.location.search),heroDefault.app.getState(),
  'hero state round-trips between URL and parseLocation');
 heroDefault.back();
 assert.equal(heroDefault.app.getState().heroHsdir,true);
@@ -1724,7 +1876,7 @@ click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
 click(heroDefault,'[data-hero-scale]',{heroScale:'linear'});
 click(heroDefault,'[data-hero-hsdir]',{});
 assert.deepEqual([heroDefault.app.getState().heroRange,heroDefault.app.getState().heroScale,heroDefault.app.getState().heroHsdir],['7d','linear',true]);
-assert.equal(new URLSearchParams(heroDefault.app.url('overview').slice(1)).has('hero_range'),false);
+assert.equal(new URLSearchParams(heroDefault.app.url('overview').slice(1)).get('hero_range'),'7d');
 click(heroDefault,'[data-hero-range]',{heroRange:'all'});
 click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
 click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
@@ -1732,9 +1884,9 @@ click(heroDefault,'[data-hero-scale]',{heroScale:'linear'});
 heroDefault.back();
 assert.equal(heroDefault.app.getState().heroRange,'all','no-op hero clicks never push duplicate history entries');
 
-const h7=ui.prepareHeroPlot(data,'7d',true);
-const h7NoHsdir=ui.prepareHeroPlot(data,'7d',false);
-const hAll=ui.prepareHeroPlot(data,'all',true);
+const h7=ui.prepareHeroPlot(v6Data,'7d',true);
+const h7NoHsdir=ui.prepareHeroPlot(v6Data,'7d',false);
+const hAll=ui.prepareHeroPlot(v6Data,'all',true);
 assert.equal(h7.times.length,7);
 assert.equal(h7.end-h7.start,7*86400);
 assert.equal(hAll.times.length,548);
@@ -1744,7 +1896,7 @@ const hsdirVec=h7.vectors.find(v=>v.id==='hsdir');
 for(let i=0;i<7;i++){
  assert.ok(Math.abs((h7.totals[i]-h7NoHsdir.totals[i])-hsdirVec.values[i])<1e-9,'HSDir toggle subtracts hs_get+hs_post cleanly');
 }
-const overlapCheckData=structuredClone(data);
+const overlapCheckData=structuredClone(v6Data);
 for(const row of chart('onionskin_drops',overlapCheckData).series.find(s=>s.key==='ntor_v3').history.daily)row[1]=999999;
 for(const row of chart('queue_limit_circuits',overlapCheckData).series.find(s=>s.key==='circuit_killed_max_cell_outq').history.daily)row[1]=999999;
 const hsSuccess=chart('hsdir_fetches',overlapCheckData).series.find(s=>s.key==='success');
@@ -1755,7 +1907,7 @@ assert.deepEqual(hOverlap.totals,h7.totals,'subset counters never double-count i
 const hsUploadSuccess=chart('hsdir_uploads',overlapCheckData).series.find(s=>s.key==='success');
 hsUploadSuccess.reference.day={n:100,current_percentile:100,flat_zero:false};
 for(const fam of h7.families)assert.equal(fam.rows.length,7);
-const allNormalAlerts=structuredClone(data);
+const allNormalAlerts=structuredClone(v6Data);
 for(const f of allNormalAlerts.families)for(const cid of f.children)for(const s of chart(cid,allNormalAlerts).series){
  s.reference.day={n:100,current_percentile:10,flat_zero:false};
 }
@@ -1765,7 +1917,7 @@ const noFalseAlert=ui.prepareHeroPlot(allNormalAlerts,'7d',true);
 assert.equal(noFalseAlert.families.find(f=>f.id==='directory').rows[6].state,'neutral','benign hsdir success counters never trigger DoS alerts');
 
 for(const heroRange of ['7d','all'])for(const heroScale of ['linear','symlog'])for(const includeHsdir of [true,false]){
- const app=application(`?view=overview&hero_range=${heroRange}&hero_scale=${heroScale}${includeHsdir?'':'&hero_hsdir=0'}`).app;
+ const app=application(`?view=overview&hero_range=${heroRange}&hero_scale=${heroScale}${includeHsdir?'':'&hero_hsdir=0'}`,v6Data).app;
  for(const width of [240,262,360,800,1680]){
   const plot=element(width);
   app.drawHero(plot,heroRange,heroScale,includeHsdir);
@@ -1779,28 +1931,33 @@ for(const heroRange of ['7d','all'])for(const heroScale of ['linear','symlog'])f
   if(heroRange==='all')assert.match(plot.innerHTML,/class="hero-alert-missing"/);
  }
 }
-const heroExtreme=structuredClone(data);
+const heroExtreme=structuredClone(v6Data);
 chart('transport_rejections',heroExtreme).series[0].history.daily.forEach(row=>{if(row[4])row[1]=Number.MAX_VALUE;});
 const heroExtremePlot=element(800);
 application('',heroExtreme).app.drawHero(heroExtremePlot,'7d','symlog',true);
 assert.doesNotMatch(heroExtremePlot.innerHTML,/NaN|Infinity|undefined/);
-const heroEmpty=structuredClone(data);
+const heroEmpty=structuredClone(v6Data);
 for(const item of heroEmpty.charts)for(const series of item.series)series.history.daily=[];
 const heroEmptyPlot=element(240);
 application('',heroEmpty).app.drawHero(heroEmptyPlot,'7d','linear',true);
 assert.match(heroEmptyPlot.innerHTML,/No retained samples available/);
 assert.equal((heroEmptyPlot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g)||[]).length,1);
 
-for(const selector of ['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_7d"]','[data-hero-plot="concurrent_dos_all"]']){
- const heroLive=application('?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=0',data,'1',releaseContext(data,'hero-old',()=>data.end));
- heroLive.app.start();
- const before=heroLive.app.getState();
- heroLive.browser.document.querySelector(selector).focus({preventScroll:true});
- const fresh=structuredClone(data);
- heroLive.app.replaceRelease(fresh,releaseContext(fresh,'hero-new',()=>fresh.end));
- assert.deepEqual(heroLive.app.getState(),before,'replaceRelease preserves hero controls');
- assert.equal(heroLive.browser.document.activeElement,heroLive.browser.document.querySelector(selector),
-  `replaceRelease restores focus on ${selector}`);
+for(const [dataset,urlQuery,plots] of [
+ [v6Data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=0',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_7d"]','[data-hero-plot="concurrent_dos_all"]']],
+ [data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=0',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_24h"]','[data-hero-plot="concurrent_dos_all"]']],
+]){
+ for(const selector of plots){
+  const heroLive=application(urlQuery,dataset,'1',releaseContext(dataset,'hero-old',()=>dataset.end));
+  heroLive.app.start();
+  const before=heroLive.app.getState();
+  heroLive.browser.document.querySelector(selector).focus({preventScroll:true});
+  const fresh=structuredClone(dataset);
+  heroLive.app.replaceRelease(fresh,releaseContext(fresh,'hero-new',()=>fresh.end));
+  assert.deepEqual(heroLive.app.getState(),before,'replaceRelease preserves hero controls');
+  assert.equal(heroLive.browser.document.activeElement,heroLive.browser.document.querySelector(selector),
+   `replaceRelease restores focus on ${selector}`);
+ }
 }
 
 const inspectHero=(dataset,r,keys)=>{
@@ -1885,20 +2042,29 @@ application('',subOneGauge).app.drawHero(subOnePlot,'7d','linear',true);
 assert.match(subOnePlot.innerHTML,/<line x1="62" y1="256\.00"[^>]*\/>\s*<text[^>]*>100%<\/text>/);
 assert.match(subOnePlot.innerHTML,/class="hero-gauge-series" d="M[^"]*L788\.00,256\.00"/);
 
-// Tiny openCircuits (<0.1% fleet record) uses local 7d windowPeak on 7d and rawPeak on All time.
+// Tiny openCircuits (<0.1% fleet record) uses local windowPeak on 24h and 7d and rawPeak on All time.
 const tinyGauge=structuredClone(data),ocSeries=chart('open_circuits',tinyGauge).series[0];
 ocSeries.peaks.day.fleet_peak=1e6;
+ocSeries.peaks.hour.fleet_peak=1e6;
 ocSeries.history.daily=ocSeries.history.daily.map(row=>row[0]===tinyGauge.end?[row[0],100,104,1,true]:row[4]?[row[0],50,104,1,true]:row);
-const tiny7=ui.prepareHeroPlot(tinyGauge,'7d',true),tinyAll=ui.prepareHeroPlot(tinyGauge,'all',true);
+ocSeries.values=ocSeries.values.map(([t],idx)=>[t,idx===23?100:50]);
+ocSeries.hourly_relays=ocSeries.hourly_relays.map(([t])=>[t,104]);
+ocSeries.hourly_expected_relays=ocSeries.hourly_expected_relays.map(([t])=>[t,104]);
+const tiny24=ui.prepareHeroPlot(tinyGauge,'24h',true),tiny7=ui.prepareHeroPlot(tinyGauge,'7d',true),tinyAll=ui.prepareHeroPlot(tinyGauge,'all',true);
+assert.equal(tiny24.gauges.openCircuits.windowPeak,100);
+assert.equal(tiny24.gauges.openCircuits.scalePeak,100,'24h normalizes gauge curve to 24h peak');
 assert.equal(tiny7.gauges.openCircuits.windowPeak,100);
 assert.equal(tiny7.gauges.openCircuits.scalePeak,100,'7d normalizes gauge curve to 7d peak');
 assert.equal(tinyAll.gauges.openCircuits.scalePeak,1e6,'all-time keeps gauge normalized to retained fleet record');
 assert.match(application('?view=overview',tinyGauge).app.markup(),/&lt;0\.1% of 1M peak/);
+assert.match(inspectHero(tinyGauge,'24h',['End']).steps[0].tooltipHtml,/Open circuits: 100 \(&lt;0\.1%, 100% of 24h peak\)/);
 assert.match(inspectHero(tinyGauge,'7d',['End']).steps[0].tooltipHtml,/Open circuits: 100 \(&lt;0\.1%, 100% of 7d peak\)/);
 assert.match(inspectHero(tinyGauge,'all',['End']).steps[0].tooltipHtml,/Open circuits: 100 \(&lt;0\.1%\)/);
 const zeroWinGauge=structuredClone(tinyGauge);
 chart('open_circuits',zeroWinGauge).series[0].history.daily.forEach(row=>{if(row[0]>=zeroWinGauge.end-6*86400)row[1]=0;});
+chart('open_circuits',zeroWinGauge).series[0].values=chart('open_circuits',zeroWinGauge).series[0].values.map(([t])=>[t,0]);
 assert.equal(ui.prepareHeroPlot(zeroWinGauge,'7d',true).gauges.openCircuits.scalePeak,1,'all-zero 7d gauge falls back cleanly to scalePeak 1');
+assert.equal(ui.prepareHeroPlot(zeroWinGauge,'24h',true).gauges.openCircuits.scalePeak,1,'all-zero 24h gauge falls back cleanly to scalePeak 1');
 
 const partialHeroData=structuredClone(data);
 for(const row of chart('directory_rejections',partialHeroData).series[0].history.daily){
@@ -1906,7 +2072,7 @@ for(const row of chart('directory_rejections',partialHeroData).series[0].history
 }
 const hPartial=ui.prepareHeroPlot(partialHeroData,'7d',true);
 assert.equal(hPartial.partialRates[6],true);assert.equal(hPartial.partialRates[5],false);assert.equal(hPartial.hasPartialRate,true);
-const partialHeroMarkup=application('?view=overview',partialHeroData).app.markup();
+const partialHeroMarkup=application('?view=overview&hero_range=7d',partialHeroData).app.markup();
 assert.match(partialHeroMarkup,/partial source coverage/);assert.match(partialHeroMarkup,/Partial rate coverage/);
 const partialHeroSvg=element(800),partialHeroAllSvg=element(800);
 application('?view=overview',partialHeroData).app.drawHero(partialHeroSvg,'7d','linear',true);
@@ -1915,7 +2081,7 @@ assert.ok(partialHeroSvg.innerHTML.lastIndexOf('hero-rate-bar')<partialHeroSvg.i
 assert.ok(partialHeroAllSvg.innerHTML.lastIndexOf('hero-rate-area')<partialHeroAllSvg.innerHTML.indexOf('hero-rate-partial'),'partial hatch after areas');
 
 const allZeroRateData=structuredClone(data);
-for(const item of allZeroRateData.charts)if(item.kind==='counter_daily_rate')for(const s of item.series)s.history.daily=s.history.daily.map(row=>[row[0],0,104,1,true]);
+for(const item of allZeroRateData.charts)if(item.kind.startsWith('counter_'))for(const s of item.series)s.history.daily=s.history.daily.map(row=>[row[0],0,104,1,true]);
 const hZeroRates=ui.prepareHeroPlot(allZeroRateData,'7d',true);
 assert.deepEqual(hZeroRates.partialRates,Array(7).fill(false));
 assert.deepEqual(hZeroRates.totals,Array(7).fill(0));
@@ -1933,7 +2099,7 @@ assert.match(pIns.steps[0].tooltipHtml,/Total active rate<\/span><span>[^<]*\(pa
 assert.match(pIns.steps[1].tooltipHtml,/Unmeasured families:[^<]*Directory floods/);
 assert.match(pIns.steps[1].liveText,/Unmeasured families:/);
 
-const noQualData=structuredClone(data);
+const noQualData=structuredClone(v6Data);
 for(const f of noQualData.families)for(const cid of f.children)for(const s of chart(cid,noQualData).series)s.reference.day={n:19,current_percentile:95,flat_zero:false};
 const noQualOverview=application('?view=overview',noQualData).app.markup();
 assert.match(noQualOverview,/No qualifying family alerts/);
@@ -1996,30 +2162,38 @@ for(const [base,mob] of [['.hero-card { margin-bottom: 26px','.hero-card { margi
 }
 const desktopMedia=cssText.match(/@media\(min-width:1000px\)\s*\{[\s\S]*?\n\}/)?.[0]||'';
 assert.match(cssText,/\.hero-panel \{ display: none;/);
+assert.match(cssText,/\.hero-window-desktop \{ display: none;/);
 assert.match(desktopMedia,/\.hero-panels \{ display: grid;/);
-assert.match(desktopMedia,/\.hero-panel \{ display: block;/);
-assert.match(desktopMedia,/\.hero-window-control \{ display: none;/);
+assert.match(desktopMedia,/\.hero-panel \{ display: none;/);
+assert.match(desktopMedia,/\.hero-panel\.desktop-left,\.hero-panel\.desktop-right \{ display: block;/);
+assert.match(desktopMedia,/\.hero-window-desktop \{ display: flex;/);
+assert.match(desktopMedia,/\.hero-window-mobile \{ display: none;/);
 {
  const savedSetTimeout=globalThis.setTimeout,queued=[];
  globalThis.setTimeout=(cb,ms)=>{queued.push([cb,ms]);return 0;};
  try{
   const hiddenSkip=application('?view=overview');
   hiddenSkip.app.start();
-  const pAll=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_all"]');
+  const p24=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_24h"]');
   const p7=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_7d"]');
-  pAll.innerHTML='stale';
-  pAll.getBoundingClientRect=()=>({top:0,width:0});
-  p7.getBoundingClientRect=()=>({top:0,width:500});
+  const pAll=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_all"]');
+  p7.innerHTML='stale';
+  p7.getBoundingClientRect=()=>({top:0,width:0});
+  p24.getBoundingClientRect=()=>({top:0,width:500});
+  pAll.getBoundingClientRect=()=>({top:0,width:500});
   hiddenSkip.windowEvents.get('resize')();
   queued.at(-1)[0]();
-  assert.equal(pAll.innerHTML,'stale','hidden zero-width hero panel skips drawHero');
-  assert.match(p7.innerHTML,/<svg /,'visible hero panel draws normally');
+  assert.equal(p7.innerHTML,'stale','hidden zero-width hero panel skips drawHero');
+  assert.match(p24.innerHTML,/<svg /,'visible left hero panel draws normally');
+  assert.match(pAll.innerHTML,/<svg /,'visible right hero panel draws normally');
  }finally{
   globalThis.setTimeout=savedSetTimeout;
  }
 }
-assert.match(application('?view=methods',data).app.markup(),/Last 7 days<\/b> and <b>All time<\/b> side by side on desktop/);
-assert.match(application('?view=methods',data).app.markup(),/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
+assert.match(application('?view=methods',v6Data).app.markup(),/Last 7 days<\/b> and <b>All time<\/b> side by side on desktop/);
+assert.match(application('?view=methods',v6Data).app.markup(),/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
+assert.match(application('?view=methods',data).app.markup(),/<b>Last 24 hours<\/b> or <b>Last 7 days<\/b> \(selectable via <b>Window<\/b>\) alongside <b>All time<\/b> on desktop/);
+assert.match(application('?view=methods',data).app.markup(),/rank ≥90 with at least 20 reference windows \(elevated, unless the high rule applies\)/);
 
 const copiedQueries=[];
 const copyCtrl=application('?view=explorer&chart=transport_rejections');
@@ -2041,7 +2215,7 @@ copyCtrl.app.start();
   }
   await new Promise(resolve=>setImmediate(resolve));
   const trChart=chart('transport_rejections');
-  assert.deepEqual(copiedQueries,[trChart.history_queries.daily.value,trChart.history_queries.daily.eligible]);
+  assert.deepEqual(copiedQueries,hasHour?[trChart.query,trChart.quality_query]:[trChart.history_queries.daily.value,trChart.history_queries.daily.eligible]);
   copyCtrl.browser.navigator.clipboard={async writeText(){throw new Error('denied');}};
   const errBtn={dataset:{copy:'transport_rejections',queryKind:'plot'},textContent:'Copy',isConnected:true,closest:s=>s==='[data-copy]'?errBtn:null};
   await copyCtrl.events.get('click')({target:errBtn});
@@ -2104,24 +2278,29 @@ copyCtrl.app.start();
    const s=chart(cid,negZeroData).series[0];
    s.history.daily.at(-1)[1]=-0;s.current.day={value:-0,relays:8,expected_relays:8,coverage:1,valid:true};
    s.peaks.day={fleet_peak:100,fleet_peak_at:negZeroData.end,fleet_peak_relays:8,current_is_record:false};
+   if(s.current.hour)s.current.hour={value:-0,relays:8,expected_relays:8,coverage:1,valid:true};
+   if(s.peaks.hour)s.peaks.hour={fleet_peak:100,fleet_peak_at:negZeroData.end,fleet_peak_relays:8,current_is_record:false};
   }
   const nzSeries=chart('transport_rejections',negZeroData).series[0];
   nzSeries.current.day={value:-0,relays:8,expected_relays:8,coverage:1,valid:true};
   nzSeries.reference.day={n:-0,current_percentile:null,flat_zero:false,mean_per_relay:0,start:negZeroData.reference_window.start,end:negZeroData.reference_window.end};
+  if(nzSeries.current.hour)nzSeries.current.hour={value:-0,relays:8,expected_relays:8,coverage:1,valid:true};
+  if(nzSeries.reference.hour)nzSeries.reference.hour={n:-0,current_percentile:null,flat_zero:false,mean_per_relay:0,start:negZeroData.reference_window.start,end:negZeroData.reference_window.end};
   nzSeries.historical_averages.seven_days.days=-0;
   nzSeries.relay_counts.day={total:-0,guard:null,middle_only:null,exit:null,hsdir:null,v2dir:null,role_bounds:{guard:[-0,-0],middle_only:[0,0],exit:[0,0],hsdir:[0,0],v2dir:[0,0]},measured_windows:-0,classified_windows:0,relay_windows:0,classified_relay_windows:0,coverage:-0};
+  if(nzSeries.relay_counts.hour)nzSeries.relay_counts.hour={total:-0,guard:null,middle_only:null,exit:null,hsdir:null,v2dir:null,role_bounds:{guard:[-0,-0],middle_only:[0,0],exit:[0,0],hsdir:[0,0],v2dir:[0,0]},measured_windows:-0,classified_windows:0,relay_windows:0,classified_relay_windows:0,coverage:-0};
   nzSeries.relay_counts.seven_days.coverage=-0;
   for(const viewSearch of ['?view=overview','?view=explorer&chart=transport_rejections','?view=methods']){
    const html=application(viewSearch,negZeroData).app.markup();
    assert.doesNotMatch(html,/>-0(?:<|%| total| \/| non-exit)/,`no -0 UI leak in ${viewSearch}`);
   }
   for(const [patch,rx] of [
-   [tr=>{tr.periods[0].window.comparison_lag_days=-0;},/time_ranges days window/],
+   [tr=>{tr.periods.find(p=>p.window.unit==='days').window.comparison_lag_days=-0;},/time_ranges days window/],
    [tr=>{tr.periods.at(-1).window.comparison_lag_days=-0;},/time_ranges all_time window/],
-   [tr=>{tr.periods[0].minimum_coverage=-0;},/time_ranges minimum_coverage/],
-   [tr=>{tr.periods[0].window.unit=['days'];},/Unsupported time_ranges window unit/],
-   [tr=>{tr.periods[1].window.unit=['months'];},/Unsupported time_ranges window unit/],
-   [tr=>{tr.periods[0].window.unit=123;},/Unsupported time_ranges window unit/],
+   [tr=>{tr.periods.find(p=>p.window.unit==='days').minimum_coverage=-0;},/time_ranges minimum_coverage/],
+   [tr=>{tr.periods.find(p=>p.window.unit==='days').window.unit=['days'];},/Unsupported time_ranges window unit/],
+   [tr=>{tr.periods.find(p=>p.window.unit==='months').window.unit=['months'];},/Unsupported time_ranges window unit/],
+   [tr=>{tr.periods.find(p=>p.window.unit==='days').window.unit=123;},/Unsupported time_ranges window unit/],
   ]){
    const badTr=structuredClone(data.time_ranges);patch(badTr);
    assert.throws(()=>ui.validateTimeRanges(badTr),rx);
@@ -2287,14 +2466,16 @@ copyCtrl.app.start();
   // replaceRelease disabled control & unmarked #app element focus fallback to view heading.
   const bandData=structuredClone(data);
   chart('transport_rejections',bandData).series.forEach(s=>{
-   s.reference.day={n:100,p10_per_relay:0.01,p50_per_relay:0.05,p90_per_relay:0.2,mean_per_relay:0.05,current_percentile:50,flat_zero:false,start:bandData.reference_window.start,end:bandData.reference_window.end};
+   const refVal={n:100,p10_per_relay:0.01,p50_per_relay:0.05,p90_per_relay:0.2,mean_per_relay:0.05,current_percentile:50,flat_zero:false,start:bandData.reference_window.start,end:bandData.reference_window.end};
+   s.reference.day=structuredClone(refVal);
+   if(s.reference.hour)s.reference.hour=structuredClone(refVal);
   });
   const disRelCtrl=application('?view=explorer&chart=transport_rejections',bandData,'1',releaseContext(bandData,'band-on',()=>bandData.end));
   disRelCtrl.app.start();
   disRelCtrl.browser.document.querySelector('[data-band-toggle]').focus({preventScroll:true});
   assert.equal(disRelCtrl.browser.document.activeElement.getAttribute('data-band-toggle'),'');
   const noBandData=structuredClone(bandData);
-  chart('transport_rejections',noBandData).series.forEach(s=>{s.reference.day.n=1;});
+  chart('transport_rejections',noBandData).series.forEach(s=>{s.reference.day.n=1;if(s.reference.hour)s.reference.hour.n=1;});
   disRelCtrl.app.replaceRelease(noBandData,releaseContext(noBandData,'band-off',()=>noBandData.end));
   assert.equal(disRelCtrl.browser.document.activeElement,disRelCtrl.browser.document.querySelector('[data-view-heading]'));
 
@@ -2339,11 +2520,11 @@ copyCtrl.app.start();
   assert.equal((starBand.innerHTML.match(/class="measurement-series"/g)||[]).length,1);
 
   // Oxford commas in methods() lag sentence, validTime in .average-dates, and xAxisTicks invalid bounds.
-  const lag3Data=structuredClone(data);
-  const p7=structuredClone(data.time_ranges.periods[0]);
+  const lag3Data=structuredClone(v6Data);
+  const p7=structuredClone(v6Data.time_ranges.periods[0]);
   const p14={...structuredClone(p7),id:'14d',summary_key:'fourteen_days',export_suffix:'14d',label:'14 days',average_label:'Last 14 days average',plot_label:'Last 14 days',window:{unit:'days',count:14,comparison_lag_days:1}};
   const p28={...structuredClone(p7),id:'28d',summary_key:'twenty_eight_days',export_suffix:'28d',label:'28 days',average_label:'Last 28 days average',plot_label:'Last 28 days',window:{unit:'days',count:28,comparison_lag_days:1}};
-  lag3Data.time_ranges.periods=[p7,p14,p28,...data.time_ranges.periods.slice(1)];
+  lag3Data.time_ranges.periods=[p7,p14,p28,...v6Data.time_ranges.periods.slice(1)];
   for(const c of lag3Data.charts)for(const s of c.series){
    s.historical_averages.fourteen_days={...structuredClone(s.historical_averages.seven_days)};
    s.historical_averages.twenty_eight_days={...structuredClone(s.historical_averages.seven_days)};
@@ -2383,8 +2564,8 @@ copyCtrl.app.start();
   assert.equal(ovCtrl.browser.document.activeElement,inAppOverviews()[0]);
 
   // Custom period id='band' does not collide with bandReference cache key 'band:<r>:<key>'.
-  const bandPeriodData=structuredClone(data);
-  const p7d=structuredClone(data.time_ranges.periods[0]),p1m=structuredClone(data.time_ranges.periods[1]),pAll=structuredClone(data.time_ranges.periods.at(-1));
+  const bandPeriodData=structuredClone(v6Data);
+  const p7d=structuredClone(v6Data.time_ranges.periods[0]),p1m=structuredClone(v6Data.time_ranges.periods[1]),pAll=structuredClone(v6Data.time_ranges.periods.at(-1));
   bandPeriodData.time_ranges={
    version:1,default_range:'1',legacy_aliases:{},card_slots:{fallback_dynamic:'1',fixed:['band','all']},
    periods:[
@@ -2410,6 +2591,274 @@ copyCtrl.app.start();
   // .hero-controls keeps margin-bottom spacing when wrapping at <=1200px widths.
   const latestCss=fs.readFileSync(path.join(__dirname,'..','site','style.css'),'utf8');
   assert.match(latestCss,/\.hero-controls\s*\{[^}]*margin-bottom:\s*14px;/);
+
+  // Schema 7 (24h x 1h) coverage: hero 24h, metric 24h plots, 24h band, 4-card statPair, Explorer & live fallback.
+  const v7NonMidnight=structuredClone(v7Data);
+  const shiftSec=13*3600;
+  v7NonMidnight.end+=shiftSec;v7NonMidnight.start+=shiftSec;
+  for(const c of v7NonMidnight.charts){
+   c.end+=shiftSec;c.start+=shiftSec;
+   for(const s of c.series){
+    s.values=s.values.map(([t,v])=>[t+shiftSec,v]);
+    s.hourly_relays=s.hourly_relays.map(([t,v])=>[t+shiftSec,v]);
+    s.hourly_expected_relays=s.hourly_expected_relays.map(([t,v])=>[t+shiftSec,v]);
+    s.current.hour.value=s.values.at(-1)[1];
+    s.current.hour.relays=s.hourly_relays.at(-1)[1];
+    s.current.hour.expected_relays=s.hourly_expected_relays.at(-1)[1];
+    s.current.hour.coverage=s.current.hour.relays!=null?s.current.hour.relays/s.current.hour.expected_relays:null;
+    s.current.hour.valid=s.current.hour.value!==null&&s.current.hour.relays>=8&&s.current.hour.coverage>=0.9;
+   }
+  }
+  const v7Overview=application('?view=overview',v7NonMidnight);
+  v7Overview.app.start();
+  assert.equal(v7Overview.app.getState().heroRange,'24h');
+  assert.equal(v7Overview.app.getState().range,'24h');
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-range]').length,5);
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-panel]').length,3);
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel active desktop-left');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel desktop-right');
+  assert.equal(new URLSearchParams(v7Overview.app.url('overview').slice(1)).has('hero_range'),false,'default 24h hero_range is omitted from URL');
+  assert.equal(ui.parseLocation(v6Data,'?hero_range=24h').heroRange,'7d','legacy bundle without hourly data clamps hero_range=24h to 7d');
+  click(v7Overview,'[data-hero-range]',{heroRange:'7d'});
+  assert.equal(new URLSearchParams(v7Overview.app.url('overview').slice(1)).get('hero_range'),'7d');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel active desktop-left');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel desktop-right');
+  click(v7Overview,'[data-hero-range]',{heroRange:'all'});
+  const desktopWinHtml=v7Overview.page.innerHTML.match(/hero-window-desktop"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
+  const mobileWinHtml=v7Overview.page.innerHTML.match(/hero-window-mobile"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
+  assert.equal([...desktopWinHtml.matchAll(/<button /g)].length,2);
+  assert.equal([...mobileWinHtml.matchAll(/<button /g)].length,3);
+  assert.match(desktopWinHtml,/data-hero-range="24h" class="active" aria-pressed="true"/);
+  assert.match(desktopWinHtml,/data-hero-range="7d" class="" aria-pressed="false"/);
+  assert.match(mobileWinHtml,/data-hero-range="all" class="active" aria-pressed="true"/);
+  assert.match(mobileWinHtml,/data-hero-range="24h" class="" aria-pressed="false"/);
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel desktop-left');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel active desktop-right');
+  click(v7Overview,'[data-hero-range]',{heroRange:'24h'});
+  // When hidden control precedes visible control, redrawControl restores focus to the visible one (offsetParent !== null).
+  const visCtrl=application('?view=overview',v7NonMidnight);
+  const origVisQSA=visCtrl.browser.document.querySelectorAll;
+  visCtrl.browser.document.querySelectorAll=s=>{
+   const out=origVisQSA(s);
+   if(s==='[data-hero-range="7d"]'&&out.length===2){out[0].offsetParent=null;out[1].offsetParent={};}
+   return out;
+  };
+  visCtrl.app.start();
+  click(visCtrl,'[data-hero-range]',{heroRange:'7d'});
+  assert.equal(visCtrl.browser.document.activeElement,origVisQSA('[data-hero-range="7d"]')[1],'focus skips hidden button (offsetParent===null)');
+  assert.match(v7Overview.page.innerHTML,/Hourly UTC publication planned/);
+  assert.match(v7Overview.page.innerHTML,/Latest 1h mitigated &amp; flood rate/);
+  assert.match(v7Overview.page.innerHTML,/Concurrent family alerts \(1h\)/);
+  assert.match(v7Overview.page.innerHTML,/Open circuits \(1h mean\)/);
+  assert.match(v7Overview.page.innerHTML,/Stalled BEGIN_DIR \(1h mean\)/);
+  assert.match(v7Overview.page.innerHTML,/sampled 1-hour|20 sampled reference hours/);
+
+  // Null 24h hero plot must not fall back to daily h7/hAll under Latest 1h KPI labels.
+  const emptyHourlyOnly=structuredClone(v7NonMidnight);
+  for(const c of emptyHourlyOnly.charts)for(const s of c.series){
+   s.values=s.values.map(([t])=>[t,null]);
+   s.hourly_relays=s.hourly_relays.map(([t])=>[t,0]);
+   s.current.hour={value:null,relays:0,expected_relays:Math.max(8,c.relays),coverage:0,valid:false};
+  }
+  const empty24Kpi=application('?view=overview',emptyHourlyOnly).app.markup();
+  assert.match(empty24Kpi,/Latest 1h mitigated &amp; flood rate<\/div><div class="hero-kpi-value unknown">Unavailable/);
+  assert.match(empty24Kpi,/No measured family series/);
+
+  // Non-midnight v7 snapshot: 7d hero end cell ranks 00:00 UTC daily bar via baseline rather than rolling reference.day.
+  const nonMidHeroAlert=structuredClone(v7NonMidnight);
+  const trNm=chart('transport_rejections',nonMidHeroAlert).series[0];
+  const nmDayEnd=Math.floor(nonMidHeroAlert.end/86400)*86400;
+  trNm.history.daily=Array.from({length:25},(_,k)=>{
+   const t=nonMidHeroAlert.reference_window.start+(k+1)*86400;
+   return [t,k===24?10:100,100,1,true];
+  });
+  trNm.history.daily.push([nmDayEnd,10,100,1,true]);
+  trNm.reference.day={n:100,current_percentile:99,flat_zero:false,start:nonMidHeroAlert.reference_window.start,end:nonMidHeroAlert.reference_window.end};
+  const nonMidHero7=ui.prepareHeroPlot(nonMidHeroAlert,'7d',true);
+  assert.equal(nonMidHero7.families.find(f=>f.id==='transport').rows[6].state,'neutral','non-midnight 7d hero ignores current24 reference.day');
+  const midSameAlert=structuredClone(nonMidHeroAlert);
+  midSameAlert.end=nmDayEnd;midSameAlert.start=nmDayEnd-86400;
+  assert.equal(ui.prepareHeroPlot(midSameAlert,'7d',true).families.find(f=>f.id==='transport').rows[6].state,'high','midnight 7d hero still uses matching reference.day');
+
+  // 24h prepareHeroPlot: non-midnight 24h window, sampled_hour baseline ranking (t<end) vs reference.hour (t===end), low-coverage rejection, gauge hour peak.
+  const h24Custom=structuredClone(v7NonMidnight);
+  const trPrimary24=chart('transport_rejections',h24Custom).series[0];
+  trPrimary24.values[22][1]=100;trPrimary24.hourly_relays[22][1]=100;trPrimary24.hourly_expected_relays[22][1]=100;
+  trPrimary24.history.sampled_hour=Array.from({length:25},(_,k)=>[h24Custom.reference_window.start+(k+1)*21600,k>=23?150:10,100,1,true]);
+  chart('transport_rejections',h24Custom).series[1].hourly_relays[21][1]=80;
+  chart('transport_rejections',h24Custom).series[1].hourly_expected_relays[21][1]=100; // 0.8 < 0.9 coverage -> omitted
+  chart('open_circuits',h24Custom).series[0].peaks.day={fleet_peak:9000000,fleet_peak_at:h24Custom.end-86400,fleet_peak_relays:100,current_is_record:false};
+  chart('open_circuits',h24Custom).series[0].peaks.hour={fleet_peak:5000000,fleet_peak_at:h24Custom.end-3600,fleet_peak_relays:100,current_is_record:false};
+  const prep24=ui.prepareHeroPlot(h24Custom,'24h',true);
+  assert.equal(prep24.window,3600);
+  assert.equal(prep24.times.length,24);
+  assert.equal(prep24.end,h24Custom.end);
+  assert.equal(prep24.end-prep24.start,86400);
+  assert.equal(prep24.gauges.openCircuits.rawPeak,5000000);
+  assert.equal(prep24.families.find(f=>f.id==='transport').rows[22].state,'elevated','sampled_hour baseline ranks hour t<end at >=90th');
+  for(const heroScale of ['linear','symlog'])for(const width of [240,800]){
+   const el=element(width);
+   v7Overview.app.drawHero(el,'24h',heroScale,true);
+   assert.match(el.innerHTML,/1h intervals · UTC/);
+   assert.doesNotMatch(el.innerHTML,/NaN|Infinity|undefined|Invalid Date/);
+   assert.match(el.innerHTML,/:\d{2}</,'24h hero chart renders HH:MM X-axis ticks');
+  }
+  const h24Ins=inspectHero(h24Custom,'24h',['ArrowLeft','ArrowLeft']);
+  assert.match(h24Ins.steps[0].tooltipHtml,/UTC \(1h\)/);
+  assert.match(h24Ins.steps[1].tooltipHtml,/\d{2}:\d{2}–\d{2}:\d{2} UTC \(1h\)/);
+
+  // Metric 24h plot + Explorer 24h band (uses reference.hour, NOT reference.day) + 2x2 cards + headline Copy button.
+  const v7BandDoc=structuredClone(v7NonMidnight),v7Tr=chart('transport_rejections',v7BandDoc);
+  const v7TrPrim=v7Tr.series.find(s=>s.key===v7Tr.primary_series);
+  v7TrPrim.reference.day={n:100,p10_per_relay:0.01,p50_per_relay:0.02,p90_per_relay:0.03,mean_per_relay:0.02,current_percentile:50,flat_zero:false,start:v7BandDoc.reference_window.start,end:v7BandDoc.reference_window.end};
+  v7TrPrim.reference.hour={n:100,p10_per_relay:10,p50_per_relay:20,p90_per_relay:30,mean_per_relay:20,current_percentile:99,flat_zero:false,start:v7BandDoc.reference_window.start,end:v7BandDoc.reference_window.end};
+  v7TrPrim.peaks.hour={fleet_peak:777,fleet_peak_at:v7BandDoc.end-3600,fleet_peak_relays:240,current_is_record:true};
+  v7TrPrim.current.hour={value:777,relays:240,expected_relays:240,coverage:1,valid:true};
+  v7TrPrim.values[23][1]=777;v7TrPrim.hourly_relays[23][1]=240;v7TrPrim.hourly_expected_relays[23][1]=240;
+  v7Tr.display_scale=1;
+  const v7Exp=application('?view=explorer&chart=transport_rejections&range=24h&band=1',v7BandDoc);
+  v7Exp.app.start();
+  const v7Labels=statSections(v7Exp.page.innerHTML).map(s=>s.html.match(/<div class="stat-label">([^<]+)<\/div>/)?.[1]);
+  assert.deepEqual(v7Labels,['Last complete hour','24-hour average','Last 6 months average','All-time average']);
+  assert.match(v7Exp.page.innerHTML,/Sampled 1h fleet peak:/);
+  assert.match(v7Exp.page.innerHTML,/Highest sampled hourly fleet value/);
+  assert.match(v7Exp.page.innerHTML,/sampled hours \/ .*? days/);
+  assert.match(v7Exp.page.innerHTML,/exports\/transport_rejections-24h\.csv/);
+  assert.match(v7Exp.page.innerHTML,/PromQL · hourly plot/);
+  assert.match(v7Exp.page.innerHTML,/24-hour headline query/);
+  assert.match(v7Exp.page.innerHTML,/24 samples per 1-hour UTC interval/);
+  assert.match(v7Exp.page.innerHTML,/<th>Last complete hour<\/th><th>24-hour average<\/th>/);
+  const v7Copied=[];
+  v7Exp.browser.navigator.clipboard={async writeText(txt){v7Copied.push(txt);}};
+  const headBtn={dataset:{copy:'transport_rejections',queryKind:'headline'},textContent:'Copy',isConnected:true,closest:s=>s==='[data-copy]'?headBtn:null};
+  await v7Exp.events.get('click')({target:headBtn});
+  assert.equal(v7Copied[0],v7Tr.history_queries.current24.value);
+  const plot24El=element(800);
+  v7Exp.app.draw(plot24El,v7Tr,'24h');
+  assert.match(plot24El.innerHTML,/1h intervals · UTC/);
+  assert.match(plot24El.innerHTML,/<rect class="reference-band"[^>]*y="48\.[12][^>]*height="133\.2/);
+  assert.match(plot24El.innerHTML,/<path class="reference-median" d="M62\.00,114\.80/);
+  assert.match(plot24El.innerHTML,/>8,000</,'24h band axis scales from reference.hour (7,200 upper bound), not reference.day');
+  assert.match(plot24El.innerHTML,/:00</);
+  const expLive={textContent:''};
+  let expCursor=null,expTooltip=null;
+  const expSvg={querySelector:s=>s==='.plot-cursor'?expCursor:null,appendChild:n=>{expCursor=n;}};
+  const expWrap={innerHTML:'',getBoundingClientRect:()=>({width:800,height:400}),closest:s=>s==='[data-chart-plot]'?expWrap:null,
+   querySelector:s=>s==='svg'?expSvg:s==='.plot-cursor'?expCursor:s==='.chart-tooltip'?expTooltip:null,
+   appendChild:n=>{expTooltip=n;},setAttribute(){},hasAttribute:()=>false};
+  const expBandCtrl=application('?view=explorer&chart=transport_rejections&range=24h&band=1',v7BandDoc);
+  const origExpQS=expBandCtrl.browser.document.querySelector;
+  expBandCtrl.browser.document.querySelector=s=>s==='[data-live-status]'?expLive:origExpQS(s);
+  expBandCtrl.browser.document.createElement=tag=>({tag,className:'',innerHTML:'',style:{},remove(){if(this===expTooltip)expTooltip=null;}});
+  expBandCtrl.browser.document.createElementNS=(ns,tag)=>({ns,tag,attrs:{},setAttribute(k,v){this.attrs[k]=v;},remove(){if(this===expCursor)expCursor=null;}});
+  expBandCtrl.app.start();
+  expBandCtrl.app.draw(expWrap,v7Tr,'24h');
+  expBandCtrl.events.get('keydown')({key:'End',target:expWrap,preventDefault(){}});
+  assert.match(expTooltip.innerHTML,/10th–90th: 2,400–7,200 \(median 4,800\)/,'24h band tooltip reflects 240-relay reference.hour');
+
+  // Empty reference.day ({n:0}) must not shadow a valid populated reference.hour span in reference(s).
+  const hourOnlyRefDoc=structuredClone(v7BandDoc),trHourOnly=chart('transport_rejections',hourOnlyRefDoc);
+  trHourOnly.series.find(s=>s.key===trHourOnly.primary_series).reference.day={n:0,current_percentile:null,flat_zero:false};
+  const hourOnlyMarkup=application('?view=explorer&chart=transport_rejections&range=24h',hourOnlyRefDoc).app.markup();
+  assert.match(hourOnlyMarkup,/100 sampled hours \/ 0 days/);
+  assert.doesNotMatch(hourOnlyMarkup,/No reference observations yet/);
+
+  // Live replaceRelease rollback v7 (24h hero + 24h range) -> v6 (7d hero + 1mo alias + daily freshness), plus implicit v6->v7 upgrade & explicit 7d preservation.
+  const v7Rel=releaseContext(v7NonMidnight,'rel-v7',()=>v7NonMidnight.end+300);
+  const v6Rel=releaseContext(v6Data,'rel-v6',()=>v6Data.end+300);
+  const rbCtrl=application('?view=overview',v7NonMidnight,'1',v7Rel);
+  rbCtrl.app.start();
+  assert.match(rbCtrl.page.innerHTML,/Updated hourly/);
+  assert.equal(rbCtrl.app.getState().heroRange,'24h');
+  assert.equal(rbCtrl.app.getState().range,'24h');
+  rbCtrl.app.replaceRelease(v6Data,v6Rel);
+  assert.equal(rbCtrl.app.getState().heroRange,'7d','rollback to daily v6 clamps heroRange to 7d');
+  assert.equal(rbCtrl.app.getState().range,'1mo','rollback to v6 migrates 24h range via legacy_aliases to 1mo');
+  assert.match(rbCtrl.page.innerHTML,/Updated daily \(00:00 UTC\)/);
+  assert.doesNotMatch(rbCtrl.page.innerHTML,/data-hero-range="24h"/);
+  rbCtrl.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(rbCtrl.app.getState().heroRange,'24h','implicit v6->v7 upgrade restores default 24h heroRange');
+  const exp7Upgrade=application('?view=overview&hero_range=7d',v6Data,'1',v6Rel);
+  exp7Upgrade.app.start();
+  exp7Upgrade.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(exp7Upgrade.app.getState().heroRange,'7d','explicit hero_range=7d persists across v6->v7 upgrade');
+  assert.throws(()=>exp7Upgrade.app.replaceRelease({},v6Rel),/Missing chart data/);
+  exp7Upgrade.app.replaceRelease(v6Data,v6Rel);
+  assert.equal(exp7Upgrade.app.getState().heroRange,'7d');
+  click(exp7Upgrade,'[data-hero-range]',{heroRange:'all'});
+  assert.equal(exp7Upgrade.app.getState().heroRange,'all');
+  exp7Upgrade.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(exp7Upgrade.app.getState().heroRange,'all','user-clicked heroRange remains explicit across v6->v7 upgrade');
+
+  // Explicit hero_range=24h on schema-6 fallback renders 7d, preserves request across failed swap & url(), and upgrades to 24h when schema-7 arrives.
+  const req24Ctrl=application('?view=overview&hero_range=24h',v6Data,'1',v6Rel);
+  req24Ctrl.app.start();
+  assert.equal(req24Ctrl.app.getState().heroRange,'7d','explicit hero_range=24h renders as 7d on schema-6 fallback');
+  assert.equal(new URLSearchParams(req24Ctrl.app.url('overview').slice(1)).get('hero_range'),'24h','url() retains requested hero_range=24h during schema-6 fallback');
+  assert.throws(()=>req24Ctrl.app.replaceRelease({},v6Rel),/Missing chart data/);
+  assert.equal(req24Ctrl.app.getState().heroRange,'7d');
+  req24Ctrl.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(req24Ctrl.app.getState().heroRange,'24h','explicit hero_range=24h upgrades to 24h on schema-7 payload');
+  assert.throws(()=>req24Ctrl.app.replaceRelease({},v7Rel),/Missing chart data/);
+  assert.equal(req24Ctrl.app.getState().heroRange,'24h','failed swap restores heroRange');
+  req24Ctrl.app.replaceRelease(v6Data,v6Rel);
+  assert.equal(req24Ctrl.app.getState().heroRange,'7d');
+  req24Ctrl.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(req24Ctrl.app.getState().heroRange,'24h','requestedHeroRange 24h survives rollback->recovery');
+
+  // Explicit ?hero_range=7d on schema-6 survives navigation + popstate + schema-7 upgrade, and clicking 7d updates fallback hero_range=24h URL.
+  const expV6Nav=application('?view=overview&hero_range=7d',v6Data,'1',v6Rel);
+  expV6Nav.app.start();
+  assert.equal(new URLSearchParams(expV6Nav.app.url('overview').slice(1)).get('hero_range'),'7d');
+  click(expV6Nav,'[data-all-range]',{allRange:'all'});
+  assert.equal(new URLSearchParams(expV6Nav.browser.location.search).get('hero_range'),'7d');
+  expV6Nav.back();
+  expV6Nav.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(expV6Nav.app.getState().heroRange,'7d','explicit hero_range=7d on v6 survives popstate and v7 upgrade');
+  const clampSwitch=application('?view=overview&hero_range=24h',v6Data,'1',v6Rel);
+  clampSwitch.app.start();
+  click(clampSwitch,'[data-hero-range]',{heroRange:'7d'});
+  assert.equal(new URLSearchParams(clampSwitch.browser.location.search).get('hero_range'),'7d','clicking 7d overwrites clamped 24h request in URL');
+  clampSwitch.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(clampSwitch.app.getState().heroRange,'7d');
+
+  const impClick=application('?view=overview',v6Data,'1',v6Rel);
+  impClick.app.start();
+  assert.equal(new URLSearchParams(impClick.app.url('overview').slice(1)).has('hero_range'),false,'implicit hero_range is absent before click');
+  click(impClick,'[data-hero-range]',{heroRange:'7d'});
+  assert.equal(new URLSearchParams(impClick.app.url('overview').slice(1)).get('hero_range'),'7d','clicking implicit 7d persists hero_range in links');
+  assert.equal(new URLSearchParams(impClick.browser.location.search).get('hero_range'),'7d','clicking implicit 7d persists hero_range in URL');
+  click(impClick,'[data-hero-range]',{heroRange:'7d'});
+  impClick.back();
+  assert.equal(new URLSearchParams(impClick.browser.location.search).has('hero_range'),false,'repeated click on explicit 7d pushes no duplicate history entry');
+  const impUpgrade=application('?view=overview',v6Data,'1',v6Rel);
+  impUpgrade.app.start();
+  click(impUpgrade,'[data-hero-range]',{heroRange:'7d'});
+  impUpgrade.app.replaceRelease(v7NonMidnight,v7Rel);
+  assert.equal(impUpgrade.app.getState().heroRange,'7d','v6->v7 upgrade retains explicitly clicked 7d');
+
+  // validateTimeRanges rejects malformed hours definitions (including 24h minimum_coverage=0.5 parity with Python).
+  for(const badHours of [
+   tr=>{tr.periods[0].window.count=12;},
+   tr=>{tr.periods[0].window.comparison_lag_days=1;},
+   tr=>{tr.periods[0].minimum_coverage=0.5;},
+   tr=>{tr.periods[0].id='custom24';},
+   tr=>{tr.periods[0].export_suffix='custom-24';},
+   tr=>{tr.periods.push({...structuredClone(tr.periods[0]),id:'h2',summary_key:'h_2',export_suffix:'h-2'});},
+   tr=>{tr.card_slots={fallback_dynamic:'7d',fixed:['6mo','all']};},
+  ]){
+   const bad=structuredClone(v7NonMidnight.time_ranges);
+   badHours(bad);
+   assert.throws(()=>ui.validateTimeRanges(bad),/time_ranges|minimum_coverage/);
+  }
+  const badHourCov=structuredClone(v7NonMidnight.time_ranges);
+  badHourCov.periods[0].minimum_coverage=0.5;
+  assert.throws(()=>ui.validateTimeRanges(badHourCov),/Invalid time_ranges hours minimum_coverage/);
+  const validHourCov=structuredClone(v7NonMidnight.time_ranges);
+  validHourCov.periods[0].minimum_coverage=0;
+  assert.equal(ui.validateTimeRanges(validHourCov),validHourCov,'validateTimeRanges accepts 24h with minimum_coverage=0');
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

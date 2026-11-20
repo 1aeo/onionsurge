@@ -109,6 +109,9 @@ function timings(ui, data) {
     result[range+'_svg'] = measure(()=>{for (const chart of primaries) ctx.app.draw(element,chart,range);});
   }
   if (typeof ctx.app.drawHero === 'function') {
+    if (data.schema_version >= 7 || data.window_seconds === 3600) {
+      result.hero_24h_svg = measure(()=>{ctx.app.drawHero(element,'24h');});
+    }
     result.hero_7d_svg = measure(()=>{ctx.app.drawHero(element,'7d');});
     result.hero_all_svg = measure(()=>{ctx.app.drawHero(element,'all');});
   }
@@ -132,8 +135,8 @@ try {
   const input = fs.readFileSync(options.get('--data') || path.join(repository,'dist/data.json'));
   const data = JSON.parse(input);
   assert.equal(data.families.length,6); assert.ok(data.charts.length>0);
-  if (data.schema_version===6 || data.time_ranges!==undefined) {
-    assert.ok(Array.isArray(data.time_ranges?.periods) && data.time_ranges.periods.length>0);
+  if (data.schema_version >= 6 || data.time_ranges !== undefined) {
+    assert.ok(Array.isArray(data.time_ranges?.periods) && data.time_ranges.periods.length > 0);
   }
   const currentPath = path.join(repository,'site/app.js'), current = require(currentPath);
   const result = {node:process.version,input_sha256:hash(input),

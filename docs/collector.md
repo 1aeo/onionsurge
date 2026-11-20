@@ -1,13 +1,13 @@
-# Daily aggregate collector
+# Hourly and daily aggregate collector
 
-`scripts/collect.py` produces the application's schema-3 (`86400 s` `00:00 UTC`) input,
+`scripts/collect.py` produces the application's schema-4 (`window_seconds: 3600`, `24 × 1h` current hours + `21,600s` sampled `1h` points + `86,400s` `00:00 UTC` daily history) input,
 applies deterministic `dir-spec` coarsening (`0` for `< 8`, nearest multiple of `8` for
 `>= 8`, `open_circuits` rounded to `100`, sensitive rates binned to `0.001/s`, counter
 rates to `8`-event increments and `3` sig figs), then calls `validation.validate_snapshot`
 before atomically replacing the output. It does not upload files, start timers, change
-relays, or install access. The application builder remains responsible for schema-6
-output, daily frozen references, percentiles, retained peaks, and configurable
-multi-period historical averages (defaulting to `7d`/`1mo`/`3mo`/`6mo`/`12mo`/`all-time`).
+relays, or install access. The application builder remains responsible for schema-7
+output, daily frozen `hour`/`day` references, percentiles, retained peaks, and configurable
+multi-period historical averages (defaulting to `24h`/`7d`/`1mo`/`3mo`/`6mo`/`12mo`/`all-time`).
 
 ```sh
 python3 scripts/collect.py \
@@ -27,10 +27,10 @@ provide both files); otherwise both catalogue files come from the collector's ow
 remain synthetic). Output paths overlapping the active seed snapshot (`--seed`,
 `SOURCE_SEED_SNAPSHOT`, or `inputs/snapshot.json`), `observations.sqlite3`, `collect.lock`,
 `queries.json`, or `routes.json` are rejected.
-The default endpoint is the latest completed `00:00:00 UTC` calendar day
-(`(int(time.time()) // 86400) * 86400`). `--end UNIX_SECONDS` selects another
-completed UTC-midnight timestamp at or after the seed snapshot (`end % 86400 == 0`).
-Run once per UTC day after the day's scrapes have settled (default `00:20 UTC`).
+The default endpoint is the latest completed UTC hour
+(`(int(time.time()) // 3600) * 3600`). `--end UNIX_SECONDS` selects another
+completed UTC-hour timestamp at or after the seed snapshot (`end % 3600 == 0`).
+Run hourly (or on the release schedule) after the hour's scrapes settle.
 
 Private source configuration (`source.env`, copied from `source.env.example` with mode
 `0600`) uses `SOURCE_SSH_HOST` (an explicit destination, not an ambient SSH alias),
@@ -44,7 +44,7 @@ and never passes provider credentials or shell snippets to the telemetry source.
 
 The reviewed catalogue (`catalogue/contract.json`, expanded deterministically into
 `catalogue/queries.json` and `catalogue/routes.json` via `scripts/build_catalogue.py`)
-defines every query and operation (`61` fixed query IDs, `78` operations). Collection
+defines every query and operation (`90` fixed query IDs, `208` operations). Collection
 stops if the source advertises a different catalogue. Ordinary requests are sequential,
 at most seven days and 169 evaluated points, with `query_protocol.py`'s timeout,
 size, aggregate-label and warning checks. Errors and execution warnings abort
@@ -55,34 +55,30 @@ keyed by source identity, exact expression hash, step and time. An empty success
 response is recorded distinctly from a numeric zero. Existing observations are reused;
 missing endpoints are fetched in bounded contiguous batches. The configured seed snapshot
 (via `--seed`, `SOURCE_SEED_SNAPSHOT`, or the repository fixture `inputs/snapshot.json`)
-seeds all retained daily history. Its already-coarsened historical observations
-(`< end`) are preserved unchanged without re-coarsening. Only missing completed
-UTC-midnight daily history tails are appended and coarsened.
+accepts both schema-4 and legacy schema-3 (`allow_v3_seed=True`) bundles and seeds all retained daily and sampled-hour history. Already-coarsened historical observations
+(`< end`) are preserved unchanged without re-coarsening. Missing completed UTC-midnight `daily` and `21,600 s` `sampled_hour` history tails (up to 560 days when bootstrapping a v3 seed's `sampled_hour`), the 24 completed hourly `[end - 86400 + 3600 .. end]` windows, and intra-day `current24` are queried and coarsened deterministically.
 
-- All observations use completed `00:00:00 UTC` (`86,400 s` / `[1d]`) intervals. Counters use per-source
-  `rate(...[1d])` before summing; gauges use `avg_over_time(...[1d])` (`>= 360` of `720` samples per day).
-  No sub-24h windows (`1h`, `6h`, `current24`, or intra-day rolling snapshots) are queried or emitted.
-- The directory request classes require all three previous-hop strata to meet the daily sample gate
-  before rate and relay counts contribute (`previous_hop` itself never crosses the SSH gateway).
+- Hourly observations (`current_hour`, `3,600 s` / `[1h]`) and `21,600 s`-spaced `sampled_hour` baselines evaluate per-source `rate(...[1h])` before summing for counters and `avg_over_time(...[1h])` for gauges (`>= 24` of `30` samples per hour). Daily (`86,400 s` `00:00:00 UTC` / `[1d]`) and rolling `current24` (`[1d]` evaluated at `end`) observations evaluate `rate(...[1d])` / `avg_over_time(...[1d])` (`>= 360` of `720` samples per 24h window).
+- The directory request classes require all three previous-hop strata to meet the sample gate
+  before rate and relay counts contribute (`previous_hop` itself never crosses the SSH gateway; `current_hour` covers all 10 classes while `daily` and `sampled_hour` cover `hs_get`, `hs_post`, and `no_request`).
   Partial stratum counts are never divided by three.
 - Each daily denominator uses the coarsened 31-day maximum eligible population on the UTC
-  midnight grid in `(end - 31 days, end]`, or endpoint availability, whichever is larger.
-  `current.day` matches the completed daily row at `end`.
+  midnight grid in `(end - 31 days, end]` (and rolling hourly windows use a 32-day context `(end - 32 days, end]`), or endpoint availability, whichever is larger.
+  `current.hour` matches the final hour in `series.values` (`end`), and `current.day` matches the `[1d]` measurement ending at `end` (`current24` intra-day, or the final `history.daily` row when `end % 86400 == 0`).
 - Qualification requires at least 90% coverage (`>= 8` coarsened relays). Unqualified values
-  on `current.day` are `null`. A successful empty cohort produces a zero observed population and
+  are `null`. A successful empty cohort produces a zero observed population and
   fresh gaps, while retaining historical data and a positive expected population (`>= 8`).
-  Unqueried auxiliary daily values remain unavailable.
+  Unqueried auxiliary historical values remain unavailable.
 
-Thirty historical series and all 37 current series remain in the input. The seven
-auxiliary directory classes retain current-only status. Their missing history is
-not fabricated. Queue totals retain their included output-queue subset; the two
+Thirty historical series (in both `history.daily` and `history.sampled_hour`) and all 37 current/hourly series remain in the input. The seven
+auxiliary directory classes retain current/24h hourly status without fabricated multi-day history. Queue totals retain their included output-queue subset; the two
 series are never added together.
 
 ## Contributors and recorded flags
 
 Each series also carries optional `relay_population` metadata with method
-`eligible-last-flags-v1`. Its `day` row uses the exact eligible
-contributors for the `end` day (coarsened to multiples of `8`, `0` below `8`). Its `daily` rows
+`eligible-last-flags-v1`. Its `hour` and `day` rows use the exact eligible
+contributors for the `1h` and `24h` windows ending at `end` (coarsened to multiples of `8`, `0` below `8`). Its `daily` rows
 cover qualifying retained daily observations; no current fleet count is substituted for history. Rows are
 `[end, total, classified, guard, middle_only, exit, hsdir, v2dir]`. Unavailable or
 total-mismatched current rows are `null`; unavailable daily rows are omitted.
@@ -93,8 +89,7 @@ and V2Dir—are present and binary, with agreeing values across any duplicate
 streams for the same relay/flag. Agreeing duplicates collapse to one recorded
 value; missing, conflicting or nonbinary observations remain unclassified. The
 eligibility mask and its contributor total are unchanged. Flags use
-`last_over_time(tor_relay_flag[1d])` for the same one-day UTC window
-as the metric. This includes an eligible contributor whose last scrape preceded
+`last_over_time(tor_relay_flag[1h])` for `hour` and `last_over_time(tor_relay_flag[1d])` for `day`/`daily`. This includes an eligible contributor whose last scrape preceded
 the endpoint. Guard, Exit, HSDir and V2Dir count their reported positive flags.
 Middle-only requires Running=1 and the other four flags explicitly zero. All-zero
 flags count as observed records, but never as Middle-only. These are reported Tor

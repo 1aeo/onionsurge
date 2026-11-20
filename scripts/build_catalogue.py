@@ -17,9 +17,10 @@ OPERATION_KEY = re.compile(r'^[a-z0-9][a-z0-9._-]{0,95}\Z')
 SLUG = re.compile(r'^[a-z0-9][a-z0-9_-]{0,95}\Z')
 
 
-def population_query(group, window, samples):
+def population_query(group, window, samples, *, selector=None):
     """Count eligible sources and their last recorded, complete flag sets."""
-    eligible = f'count_over_time({group["selector"]}[{window}]) >= {samples}'
+    source_selector = group['selector'] if selector is None else selector
+    eligible = f'count_over_time({source_selector}[{window}]) >= {samples}'
     if group.get('strata'):
         eligible = f'count by(instance,type)({eligible}) == 3'
     eligible = f'(({eligible}) > bool 0)'
@@ -62,17 +63,23 @@ def build(contract):
     for name, group in groups.items():
         require(isinstance(name, str) and SLUG.fullmatch(name) and isinstance(group, dict), 'Invalid relay population group')
         require(nonblank(group.get('selector')), 'Invalid relay population selector')
+        if 'hour_selector' in group:
+            require(nonblank(group['hour_selector']), 'Invalid relay population hour_selector')
         require(group.get('label') in ('', 'type', 'action'), 'Unsupported population grouping label')
         charts = group.get('charts')
         require(isinstance(charts, list) and charts and all(isinstance(c, str) and SLUG.fullmatch(c) for c in charts),
                 'Invalid relay population chart list')
-        key = f'relay_population_{name}_day'
-        require(key not in queries, 'Duplicate generated query ID')
-        queries[key] = population_query(group, '1d', 360)
-        for chart in charts:
-            operation = f'{chart}.relay_population.day'
-            require(operation not in routes, 'Duplicate population operation')
-            routes[operation] = key
+        for period, window, samples, selector in [
+            ('hour', '1h', 24, group.get('hour_selector', group['selector'])),
+            ('day', '1d', 360, group['selector']),
+        ]:
+            key = f'relay_population_{name}_{period}'
+            require(key not in queries, 'Duplicate generated query ID')
+            queries[key] = population_query(group, window, samples, selector=selector)
+            for chart in charts:
+                operation = f'{chart}.relay_population.{period}'
+                require(operation not in routes, 'Duplicate population operation')
+                routes[operation] = key
     access.validate_catalogue(queries)
     require(routes and all(isinstance(k, str) and OPERATION_KEY.fullmatch(k) and isinstance(v, str) and v in queries
                            for k, v in routes.items()),
