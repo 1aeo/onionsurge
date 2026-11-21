@@ -1846,6 +1846,14 @@ class CollectorTests(unittest.TestCase):
             cfg = collector.load_source_config(cfg_file)
             state_dir = root / 'state'
 
+            # Oversized hourly archive fails before snapshot publication and rolls back cache writes.
+            oversized_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            with mock.patch.object(collector, 'MAX_ARCHIVE_ROW_BYTES', 16), \
+                    self.assertRaisesRegex(collector.CollectionError, 'Archived hourly payload exceeds size limit'):
+                collector.collect(cfg, ROOT, state_dir, root / 'out_oversized.json',
+                                  end=target_end, source=oversized_src, config_path=cfg_file)
+            self.assertFalse((root / 'out_oversized.json').exists())
+
             # Rollback on commit failure leaves zero orphan hourly_archive rows.
             fail_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
             with mock.patch.object(collector.ObservationCache, 'commit', side_effect=sqlite3.OperationalError('disk full')), \

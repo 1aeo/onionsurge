@@ -1467,6 +1467,7 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                 try:
                     data = Collector(source, cache, queries, routes, seed_obj).collect(target_end, ctx['seed_sha'])
                     validate_snapshot(data)
+                    cache.record_hourly_archive(source_id, target_end, data)
                     atomic_json(out, data)
                 except BaseException:
                     try:
@@ -1475,7 +1476,6 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                         pass
                     raise
                 try:
-                    cache.record_hourly_archive(source_id, target_end, data)
                     cache.record_completion(source_id, target_end)
                     cache.prune_expired_hourly(target_end - HOURLY_CACHE_RETENTION_DAYS * DAY)
                     cache.commit()
