@@ -191,7 +191,7 @@ function periodWindowStart(dayEnd,periodDef,lag=0){
 const isGaugeKind=c=>c?.kind==='gauge_hour_mean'||c?.kind==='gauge_daily_mean';
 const qualifiedDailyRow=(p,scale=1)=>Array.isArray(p)&&validTime(p[0])&&p[0]%DAY===0&&isFiniteNumber(p[1])&&p[1]>=0&&isFiniteNumber(p[1]*scale)&&p[4]===true&&Number.isInteger(p[2])&&p[2]>0&&isFiniteNumber(p[3])&&p[3]>=0.9&&p[3]<=1;
 const qualifiedSampledHourRow=(p,scale=1)=>Array.isArray(p)&&validTime(p[0])&&p[0]%21600===0&&isFiniteNumber(p[1])&&p[1]>=0&&isFiniteNumber(p[1]*scale)&&p[4]===true&&Number.isInteger(p[2])&&p[2]>=8&&isFiniteNumber(p[3])&&p[3]>=0.9&&p[3]<=1;
-const hasHourPayload=D=>!!(D&&(D.schema_version>=7||D.window_seconds===HOUR||D.charts?.some(c=>c?.series?.some(s=>Array.isArray(s?.values)&&s.values.length>0))));
+const hasHourPayload=D=>!!(D&&(D.window_seconds===HOUR||(D.window_seconds===undefined&&D.charts?.some(c=>c?.series?.some(s=>Array.isArray(s?.values)&&s.values.length>0)))));
 function hourlyObservations(s,scale,start,end){
  const valuesByTime=new Map(),populations=new Map();
  const vals=s?.values,rels=s?.hourly_relays,exps=s?.hourly_expected_relays;

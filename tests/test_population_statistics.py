@@ -171,6 +171,12 @@ class PopulationSummaryTests(unittest.TestCase):
         self.assertEqual(counts['hour']['total'], 80)
         self.assertEqual(counts['fourteen_days']['total'], 100)
         self.assertIsNone(counts['two_months']['total'])
+        daily_only_counts = relay_counts(
+            {'current': {'day': {'relays': 100}}, 'relay_population': series['relay_population']},
+            END, averages, windows,
+        )
+        self.assertEqual(set(daily_only_counts), {'day', 'fourteen_days', 'two_months', 'all_time'})
+        self.assertEqual(daily_only_counts['day']['total'], 100)
         with self.assertRaisesRegex(ValueError, 'summary keys'):
             relay_counts(series, END, {'hour': {'status': 'ready'}}, {'hour': []})
         with self.assertRaisesRegex(ValueError, 'summary keys'):

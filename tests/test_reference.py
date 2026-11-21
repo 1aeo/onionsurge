@@ -282,6 +282,31 @@ class ReferenceTests(unittest.TestCase):
         self.assertTrue(peak['current_is_normalized_record'])
         self.assertEqual(peak['at'], 200)
 
+    def test_daily_only_reference_omits_hour_bucket_and_rejects_hour_cache(self):
+        t = epoch('2026-11-18T00:00:00')
+        past = t - 3 * DAY
+        daily_charts = [{'id': 'test', 'history_status': 'ready', 'kind': 'counter_daily_rate',
+                         'query': 'q', 'quality_query': 'cq', 'history_queries': {},
+                         'series': [{'key': 'a', 'history': {'daily': [[past, 4, 2, 1, True]]}}]}]
+        with tempfile.TemporaryDirectory() as folder:
+            payload, _, daily_id, _ = frozen_reference(daily_charts, t, Path(folder), sha('daily'), include_hours=False)
+            self.assertEqual(set(payload['distributions']['test']['a']), {'day'})
+            self.assertEqual(payload['distributions']['test']['a']['day'], [[past, 2.0]])
+            # Hourly builds keep a separate cache key even for identical series IDs.
+            hourly_payload, _, hourly_id, _ = frozen_reference(charts(t), t, Path(folder), sha('hourly'), include_hours=True)
+            self.assertNotEqual(daily_id, hourly_id)
+            self.assertEqual(set(hourly_payload['distributions']['test']['a']), {'hour', 'day'})
+            # Injecting an 'hour' period into a daily-only cache fails closed.
+            daily_cache = next(
+                p for p in Path(folder).rglob('*.json')
+                if 'hour' not in json.loads(p.read_text())['distributions']['test']['a']
+            )
+            corrupt = json.loads(daily_cache.read_text())
+            corrupt['distributions']['test']['a']['hour'] = [[past, 1.0]]
+            daily_cache.write_text(json.dumps(corrupt))
+            with self.assertRaisesRegex(ValueError, 'period mismatch'):
+                frozen_reference(daily_charts, t, Path(folder), sha('daily'), include_hours=False)
+
 
 if __name__ == '__main__':
     unittest.main()

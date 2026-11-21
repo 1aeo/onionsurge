@@ -108,8 +108,9 @@ function toV6Data(src) {
   }
   return d;
 }
-const hasHour = data.schema_version >= 7 || data.window_seconds === 3600;
+const hasHour = data.window_seconds === 3600;
 const v7Data = toV7Data(data), v6Data = toV6Data(data);
+const v7DailyData = Object.assign(toV6Data(data), {schema_version: 7});
 
 // A small fixture for the markup this renderer produces. It does not model
 // layout; it resolves real rendered tags and models programmatic focus, including
@@ -2974,6 +2975,37 @@ copyCtrl.app.start();
   const cssMobTail=latestCss.slice(latestCss.lastIndexOf('@media(max-width:600px)'));
   assert.ok(cssMobTail.includes('.hero-alert-link { font-size: 11px')&&latestCss.lastIndexOf('.hero-alert-link { font-size: 11px')>latestCss.indexOf('.hero-alert-link { display:'),
    'mobile .hero-alert-link overrides base rule');
+
+  // schema_version 7 with window_seconds 86400 renders daily-only UI (no 24h hero panel or Last complete hour cards/columns, 30h freshness threshold).
+  const v7DailyPaths=['data.json','manifest.json',v7DailyData.reference_document,
+   ...v7DailyData.charts.flatMap(item=>v7DailyData.time_ranges.periods.map(p=>'exports/'+item.id+'-'+p.export_suffix+'.csv'))];
+  let dailyNow=v7DailyData.end+10000; // > 2h (7200s) but < 30h (108000s): delayed only if misclassified as hourly
+  const v7DailyRelease={mode:'live',id:'v7-daily-rel',generatedAt:v7DailyData.end+600,now:()=>dailyNow,
+   downloads:new Map(v7DailyPaths.map(file=>[file,'blob:v7-daily/'+file]))};
+  const v7DailyOverview=application('?view=overview',v7DailyData,'1',v7DailyRelease);
+  v7DailyOverview.app.start();
+  assert.equal(v7DailyOverview.app.getState().heroRange,'7d');
+  assert.equal(v7DailyOverview.browser.document.querySelectorAll('[data-hero-panel]').length,2);
+  assert.equal(v7DailyOverview.browser.document.querySelector('[data-hero-panel="24h"]'),null);
+  assert.match(v7DailyOverview.page.innerHTML,/Concurrent family alerts \(24h\)/);
+  assert.match(v7DailyOverview.page.innerHTML,/Updated daily \(00:00 UTC\)/);
+  assert.doesNotMatch(v7DailyOverview.page.innerHTML,/Update delayed|Updated hourly|Last complete hour|Sampled 1h fleet peak/);
+  dailyNow=v7DailyData.end+108000;
+  v7DailyOverview.app.updateFreshness({failed:false});
+  assert.doesNotMatch(v7DailyOverview.app.markup(),/Update delayed/);
+  dailyNow=v7DailyData.end+108001;
+  v7DailyOverview.app.updateFreshness({failed:false});
+  assert.match(v7DailyOverview.browser.document.querySelector('.snapshot').innerHTML,/Update delayed/);
+  assert.match(v7DailyOverview.app.markup(),/Update delayed/);
+
+  const v7DailyExp=application('?view=explorer&chart=transport_rejections&range=1mo',v7DailyData,'1',v7DailyRelease);
+  v7DailyExp.app.start();
+  const v7DailyStatLabels=statSections(v7DailyExp.page.innerHTML).map(s=>s.html.match(/<div class="stat-label">([^<]+)<\/div>/)?.[1]);
+  assert.deepEqual(v7DailyStatLabels,['24-hour average','Last 1 month average','Last 6 months average','All-time average']);
+  const v7DailyTable=v7DailyExp.page.innerHTML.match(/<table data-values-table>([\s\S]*?)<\/table>/)[1];
+  const v7DailyHeaders=[...v7DailyTable.matchAll(/<th>(.*?)<\/th>/g)].map(([,h])=>decode(h));
+  assert.ok(!v7DailyHeaders.includes('Last complete hour'));
+  assert.match(application('?view=methods',v7DailyData,'1',v7DailyRelease).app.markup(),/Daily publication and reference updates/);
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

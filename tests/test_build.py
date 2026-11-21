@@ -44,8 +44,9 @@ class BuildTests(unittest.TestCase):
             self.assertIn('data-mode="live"', page)
             self.assertNotIn('<script src="data.js">', page)
             self.assertIn('<script src="app.js"></script><script src="live.js"></script>', page)
-            self.assertNotIn('noindex,nofollow', page)
+            self.assertIn('<meta name="robots" content="noindex,nofollow">', page)
             self.assertNotIn('Local preview', page)
+            self.assertIn('Hourly UTC measurements', page)
             self.assertIn('data/manifest.json', page)
             self.assertEqual(json.loads((output / 'data.json').read_text()), self.data)
             self.assertLess((output / 'data.json').stat().st_size, (self.output / 'data.json').stat().st_size)
@@ -1152,6 +1153,90 @@ class BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Duplicate export path: exports/connection-rate-7d.csv'):
                 builder.write_outputs(colliding_data, ref_json, stage)
             self.assertEqual(list(stage.iterdir()), [])
+
+    def test_daily_v3_snapshot_builds_schema7_without_hourly_fields(self):
+        from time_ranges import FORBIDDEN_HOURLY_KEYS, load_time_ranges
+        from windows import DAY
+        v3 = clone_snapshot(self.input)
+        v3.update(input_schema_version=3, window_seconds=DAY, minimum_samples=360, expected_samples=720)
+        if 'runtime_resolution' in v3['versions']:
+            v3['versions']['runtime_resolution']['snapshot_start'] = v3['start']
+        for chart in v3['charts']:
+            chart['kind'] = 'gauge_daily_mean' if chart['kind'] == 'gauge_hour_mean' else 'counter_daily_rate'
+            chart['query'] = chart['history_queries']['daily']['value']
+            chart['quality_query'] = chart['history_queries']['daily']['eligible']
+            chart['history_queries'] = {'daily': chart['history_queries']['daily']}
+            for series in chart['series']:
+                for field in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    series.pop(field, None)
+                series['history'].pop('sampled_hour', None)
+                series['current'] = {'day': series['current']['day']}
+                if 'relay_population' in series:
+                    series['relay_population'].pop('hour', None)
+                    series['relay_population']['queries'] = {'day': series['relay_population']['queries']['day']}
+
+        full_ranges = load_time_ranges()
+        daily_periods = [p for p in full_ranges['periods'] if p['window']['unit'] != 'hours']
+        daily_ranges = {
+            'version': 1,
+            'default_range': '1mo',
+            'legacy_aliases': {'24h': '1mo', '30d': '1mo'},
+            'card_slots': {'fallback_dynamic': '1mo', 'fixed': ['7d', 'all']},
+            'periods': daily_periods,
+        }
+
+        def walk_keys(value):
+            stack = [value]
+            found = set()
+            while stack:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    found.update(cur)
+                    stack.extend(cur.values())
+                elif isinstance(cur, list):
+                    stack.extend(cur)
+            return found
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            snap_path = root / 'v3.json'
+            snap_path.write_text(json.dumps(v3))
+            daily_tr_path = root / 'daily_time_ranges.json'
+            daily_tr_path.write_text(json.dumps(daily_ranges))
+
+            # Daily inputs cannot declare an 'hours' time-range period.
+            with self.assertRaisesRegex(ValueError, 'Hours time-range period'):
+                builder.prepare(clone_snapshot(v3), 'a' * 64, root / 'bad-cache')
+
+            off_out, cache = root / 'dist-daily', root / 'cache'
+            builder.build(snap_path, off_out, cache, time_ranges_path=daily_tr_path)
+            off_data = json.loads((off_out / 'data.json').read_text())
+            off_ref = json.loads((off_out / off_data['reference_document']).read_text())
+            self.assertEqual(off_data['schema_version'], 7)
+            self.assertEqual(off_data['window_seconds'], DAY)
+            self.assertFalse(FORBIDDEN_HOURLY_KEYS & walk_keys(off_data))
+            self.assertFalse(FORBIDDEN_HOURLY_KEYS & walk_keys(off_ref))
+            self.assertFalse(list((off_out / 'exports').glob('*-24h.csv')))
+            self.assertEqual(len(list((off_out / 'exports').glob('*.csv'))), len(off_data['charts']) * len(daily_periods))
+            for chart in off_data['charts']:
+                self.assertEqual(chart['builds']['scope'], 'Latest complete UTC day')
+                for series in chart['series']:
+                    self.assertEqual(set(series['current']), {'day'})
+                    self.assertEqual(set(series['reference']), {'day'})
+                    self.assertEqual(set(series['peaks']), {'day'})
+                    self.assertNotIn('hour', series['relay_counts'])
+                    self.assertEqual(set(off_ref['distributions'][chart['id']][series['key']]), {'day'})
+
+            live_out = root / 'dist-daily-live'
+            builder.build(snap_path, live_out, cache, live=True, time_ranges_path=daily_tr_path)
+            live_data = json.loads((live_out / 'data.json').read_text())
+            self.assertEqual(live_data, off_data)
+            live_page = (live_out / 'index.html').read_text()
+            self.assertIn('<meta name="robots" content="noindex,nofollow">', live_page)
+            self.assertIn('Daily UTC measurements', live_page)
+            manifest = json.loads((live_out / 'build-manifest.json').read_text())
+            self.assertEqual(manifest['schema_version'], 7)
+            self.assertFalse(any(p.endswith('-24h.csv') for p in manifest['release_objects']))
 
 
 if __name__ == '__main__':
