@@ -19,7 +19,7 @@ from io_helpers import BUILD_FORMAT, cleanup_warning, file_sha256, filesystem_co
 from reference_statistics import describe_reference, frozen_reference, retained_peak
 from time_ranges import DEFAULT_TIME_RANGES_PATH, load_time_ranges, resolve_period_bounds, validate_time_ranges
 from validation import PUBLIC_VERSION_FIELDS, validate_snapshot
-from windows import DAY, MINIMUM_POPULATION_COVERAGE, finite_number, hourly_observations, require, usable_measurement, valid_rows
+from windows import DAY, HOUR, MINIMUM_POPULATION_COVERAGE, finite_number, hourly_observations, require, usable_measurement, valid_rows
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -59,7 +59,7 @@ def _validated_export_periods(charts, period_bounds):
 
 
 def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
-    validate_snapshot(snapshot)
+    validate_snapshot(snapshot, allow_v3_seed=True)
     tr_path = DEFAULT_TIME_RANGES_PATH if time_ranges_path is None else Path(time_ranges_path)
     tr_bytes = tr_path.read_bytes()
     time_ranges = validate_time_ranges(parse_json(tr_bytes))
@@ -67,6 +67,10 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
     data = copy.deepcopy(snapshot)
     data['start'] = int(data['start'])
     data['end'] = int(data['end'])
+    is_hourly = int(data['window_seconds']) == HOUR
+    current_periods = ('hour', 'day') if is_hourly else ('day',)
+    require(is_hourly or all(p['window']['unit'] != 'hours' for p in time_ranges['periods']),
+            'Hours time-range period requires an hourly snapshot')
     day_end, cutoff, period_bounds = resolve_period_bounds(data['end'], time_ranges)
     avg_bounds = (day_end, period_bounds)
     _validated_export_periods(data['charts'], period_bounds)
@@ -76,12 +80,14 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
     reference, encoded, ref_id, ref_sha = frozen_reference(
         data['charts'], data['end'], cache, source_sha, refresh=refresh,
         qualification={k: data.get('history_methods', {}).get(k) for k in
-                       ['row_fields', 'counter', 'gauge', 'coverage', 'custom_directory', 'sampling', 'coarsening']})
+                       ['row_fields', 'counter', 'gauge', 'coverage', 'custom_directory', 'sampling', 'coarsening']},
+        include_hours=is_hourly)
     ref_end = reference['window']['end']
     labels = data['versions']['cohort_labels']
     cohorts = data['versions']['metric_cohorts']
+    builds_scope = 'Latest complete hour' if is_hourly else 'Latest complete UTC day'
     builds_meta = {
-        key: ('Latest complete hour', 'Earlier running versions are not recorded.',
+        key: (builds_scope, 'Earlier running versions are not recorded.',
               '; '.join(f'{label}: {int(cohort[k])} relays' for k, label in labels.items() if cohort.get(k)))
         for key, cohort in cohorts.items()
     }
@@ -92,7 +98,7 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
                            'scope': scope, 'historical_scope': hist_scope}
         scale = chart['display_scale']
         for series in chart['series']:
-            for period in ('hour', 'day'):
+            for period in current_periods:
                 current = series['current'][period]
                 hourly_expected = series.get('hourly_expected_relays')
                 default_expected = (hourly_expected[-1][1] if (period == 'hour' and hourly_expected)
@@ -108,16 +114,18 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
             cutoff_end = bisect_right(daily_ts, cutoff)
             cutoff_rows = daily_rows[:cutoff_end]
             ratios = {row[0]: Fraction(row[1]) / int(row[2]) for row in daily_rows}
-            recent = hourly_observations(series)
+            recent = hourly_observations(series) if is_hourly else ()
             series['reference'] = {
                 period: describe_reference(reference['distributions'][chart['id']][series['key']][period],
                                            series['current'][period])
-                for period in ('hour', 'day')
+                for period in current_periods
             }
-            series['peaks'] = {
-                'hour': retained_peak(series['history']['sampled_hour'], series['current']['hour'], data['end'], recent),
-                'day': retained_peak(raw_daily, series['current']['day'], data['end'], valid_daily=daily_rows, ratios=ratios),
-            }
+            day_peak = retained_peak(raw_daily, series['current']['day'], data['end'], valid_daily=daily_rows, ratios=ratios)
+            series['peaks'] = (
+                {'hour': retained_peak(series['history']['sampled_hour'], series['current']['hour'], data['end'], recent),
+                 'day': day_peak}
+                if is_hourly else {'day': day_peak}
+            )
             series['historical_averages'], population_windows = historical_averages_and_windows(
                 raw_daily, data['end'], time_ranges=time_ranges, daily_rows=daily_rows, bounds=avg_bounds)
             series['relay_counts'] = relay_counts(series, data['end'], series['historical_averages'], population_windows)
@@ -131,7 +139,7 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
                              else daily_rows[bisect_left(daily_ts, comp_start + DAY, 0, cutoff_end):cutoff_end])
                 summary['comparison'] = historical_comparison(comp_rows, series['current']['day'], ref_end,
                                                               summary['status'] == 'ready', ratios=ratios)
-            for period in ('hour', 'day'):
+            for period in current_periods:
                 current = series['current'][period]
                 value, n = current.get('value'), current.get('relays')
                 current['display'] = scaled_display(value if current['valid'] else None, scale)
@@ -159,13 +167,12 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
     return data, encoded
 
 
-def live_index(page):
+def live_index(page, *, hourly=True):
     replacements = {
         'data-mode="offline"': 'data-mode="live"',
-        '<meta name="robots" content="noindex,nofollow">': '',
         '<script src="data.js"></script>': '',
         '<script src="app.js"></script>': '<script src="app.js"></script><script src="live.js"></script>',
-        'Local preview · saved measurements': 'Hourly UTC measurements',
+        'Local preview · saved measurements': 'Hourly UTC measurements' if hourly else 'Daily UTC measurements',
         '<a href="data.json" download>download the chart data and methods (JSON)</a>':
             '<a href="data/manifest.json" download>download the release manifest (JSON)</a>',
     }
@@ -187,7 +194,10 @@ def write_outputs(data, reference_json, stage, *, live=False):
     shutil.copytree(site, stage, dirs_exist_ok=True)
     if live:
         index = stage / 'index.html'
-        index.write_text(live_index(index.read_text(encoding='utf-8')), encoding='utf-8')
+        index.write_text(
+            live_index(index.read_text(encoding='utf-8'), hourly=(data.get('window_seconds') == HOUR)),
+            encoding='utf-8',
+        )
     (stage / 'reference').mkdir(exist_ok=True)
     (stage / data['reference_document']).write_bytes(reference_json.encode('utf-8'))
     compact_json = json_text(data, pretty=False)
@@ -200,6 +210,9 @@ def write_outputs(data, reference_json, stage, *, live=False):
                      'methods': data.get('history_methods')}
         (stage / 'catalogue.json').write_text(json_text(catalogue, pretty=True), encoding='utf-8')
     (stage / 'exports').mkdir(exist_ok=True)
+    has_hourly_exports = any(window_unit == 'hours' for _, window_unit, _ in period_exports)
+    require(not has_hourly_exports or data.get('window_seconds') == HOUR,
+            'Hours time-range period requires an hourly snapshot')
     timestamp_labels = {}
     for chart in data['charts']:
         all_daily_rows = [
@@ -207,11 +220,14 @@ def write_outputs(data, reference_json, stage, *, live=False):
             for series in chart['series']
         ]
         daily_endpoints = sorted({t for _, mapping in all_daily_rows for t in mapping})
-        all_hourly_rows = [
-            (series['key'], {row[0]: row[1] for row in series['values'] if row[0] <= data_end})
-            for series in chart['series']
-        ]
-        hourly_endpoints = sorted({t for _, mapping in all_hourly_rows for t in mapping})
+        if has_hourly_exports:
+            all_hourly_rows = [
+                (series['key'], {row[0]: row[1] for row in series['values'] if row[0] <= data_end})
+                for series in chart['series']
+            ]
+            hourly_endpoints = sorted({t for _, mapping in all_hourly_rows for t in mapping})
+        else:
+            all_hourly_rows, hourly_endpoints = [], []
         unit = chart['unit']
         for t in (*daily_endpoints, *hourly_endpoints):
             if t not in timestamp_labels:

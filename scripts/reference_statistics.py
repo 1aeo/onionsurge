@@ -41,7 +41,7 @@ def method_fingerprint():
     return sha256_hex(b'\0'.join(path.read_bytes() for path in paths))
 
 
-def _check_cache(payload, window, catalogue_sha, method_sha, charts):
+def _check_cache(payload, window, catalogue_sha, method_sha, charts, *, include_hours=True):
     fields = {
             'window', 'catalogue_sha256', 'method_sha256', 'source_input_sha256',
             'source_snapshot_end', 'distributions'}
@@ -56,14 +56,16 @@ def _check_cache(payload, window, catalogue_sha, method_sha, charts):
             and timestamp(source_end) and window['next_refresh'] - DAY <= source_end <= window['next_refresh'],
             'Reference cache source provenance is missing or invalid')
     require(set(payload) == fields, 'Reference cache is missing public payload fields')
+    period_specs = (('hour', HOUR, SAMPLED_HOUR_STEP), ('day', DAY, DAY)) if include_hours else (('day', DAY, DAY),)
+    expected_periods = {period for period, _, _ in period_specs}
     distributions = payload['distributions']
     require(isinstance(distributions, dict) and set(distributions) == {c['id'] for c in charts}, 'Reference cache chart mismatch')
     for chart in charts:
         found = distributions[chart['id']]
         require(isinstance(found, dict) and set(found) == {s['key'] for s in chart['series']}, 'Reference cache series mismatch')
         for series in found.values():
-            require(isinstance(series, dict) and set(series) == {'hour', 'day'}, 'Reference cache period mismatch')
-            for period, duration, step in (('hour', HOUR, SAMPLED_HOUR_STEP), ('day', DAY, DAY)):
+            require(isinstance(series, dict) and set(series) == expected_periods, 'Reference cache period mismatch')
+            for period, duration, step in period_specs:
                 require(isinstance(series[period], list), 'Reference cache observations must be arrays')
                 prior = None
                 for point in series[period]:
@@ -76,7 +78,7 @@ def _check_cache(payload, window, catalogue_sha, method_sha, charts):
                     prior = point[0]
 
 
-def frozen_reference(charts, snapshot_end, cache_directory, input_sha, refresh=False, qualification=None):
+def frozen_reference(charts, snapshot_end, cache_directory, input_sha, refresh=False, qualification=None, *, include_hours=True):
     require(all(c.get('history_status') == 'ready' for c in charts), 'Reference creation requires complete history inputs')
     require(is_sha256(input_sha), 'Reference input identity must be a SHA-256 digest')
     window = reference_window(snapshot_end)
@@ -85,6 +87,8 @@ def frozen_reference(charts, snapshot_end, cache_directory, input_sha, refresh=F
                     series_keys=sorted(s['key'] for s in c['series'])) for c in charts],
                  'normalization_schema': 'qualified-window-per-reporting-relay-v1',
                  'qualification': qualification}
+    if not include_hours:
+        catalogue['include_hours'] = False
     catalogue_sha = sha256_hex(json_text(catalogue).encode())
     method_sha = method_fingerprint()
     cache_key = sha256_hex((METHOD_VERSION + catalogue_sha + method_sha).encode())[:16]
@@ -93,8 +97,12 @@ def frozen_reference(charts, snapshot_end, cache_directory, input_sha, refresh=F
     with file_lock(path.with_suffix('.lock')):
         if path.exists() and not refresh:
             payload = read_json(path)
-            _check_cache(payload, window, catalogue_sha, method_sha, charts)
+            _check_cache(payload, window, catalogue_sha, method_sha, charts, include_hours=include_hours)
         else:
+            dist_specs = (
+                (('hour', 'sampled_hour', HOUR, SAMPLED_HOUR_STEP), ('day', 'daily', DAY, DAY))
+                if include_hours else (('day', 'daily', DAY, DAY),)
+            )
             distributions = {}
             for chart in charts:
                 distributions[chart['id']] = {}
@@ -103,10 +111,7 @@ def frozen_reference(charts, snapshot_end, cache_directory, input_sha, refresh=F
                         period: [[row[0], row[1] / row[2]]
                                  for row in valid_rows(series['history'].get(history_key, []), alignment=step)
                                  if row[0] - duration >= window['start'] and row[0] <= window['end']]
-                        for period, history_key, duration, step in (
-                            ('hour', 'sampled_hour', HOUR, SAMPLED_HOUR_STEP),
-                            ('day', 'daily', DAY, DAY),
-                        )
+                        for period, history_key, duration, step in dist_specs
                     }
             payload = {'window': window, 'catalogue_sha256': catalogue_sha,
                        'method_sha256': method_sha, 'source_input_sha256': input_sha,

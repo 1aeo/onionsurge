@@ -61,7 +61,7 @@ def relay_counts(series, snapshot_end, historical_averages, historical_windows):
             'Historical averages and windows must share non-current summary keys')
     population = series.get('relay_population', {})
     result = {}
-    for period in ('hour', 'day'):
+    for period in (('hour', 'day') if 'hour' in series['current'] else ('day',)):
         n = series['current'][period].get('relays')
         row = population.get(period)
         require(row is None or (isinstance(row, (list, tuple)) and row and timestamp(row[0])),

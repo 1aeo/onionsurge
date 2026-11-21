@@ -1691,3 +1691,54 @@ test('stale bfcache pageshow queues one follow-up refresh across pending success
  await p3;await pause(0);
  assert.equal(calls,5,'stopped controller does not launch queued follow-up');
 });
+
+test('daily schema_version 7 release (86400s) validates end-to-end and rejects hourly fields or non-midnight bounds',async()=>{
+ const v7Daily=fixture('v7-daily',{
+  referenceChange:ref=>Object.assign(ref,toV6Ref(ref)),
+  dataChange:data=>{
+   Object.assign(data,toV6Data(data));
+   data.schema_version=7;
+  },
+ });
+ assert.equal(v7Daily.manifest.data_schema_version,7);
+ assert.equal(v7Daily.data.window_seconds,86400);
+ assert.equal(v7Daily.objects.size,2+source.charts.length*6);
+ assert.ok(!v7Daily.objects.has('exports/transport_rejections-24h.csv'));
+
+ const loaded=await loader(server([v7Daily],v7Daily,null)).load();
+ assert.equal(loaded.fallback,false);
+ assert.equal(loaded.data.schema_version,7);
+ assert.equal(loaded.data.window_seconds,86400);
+ assert.equal(loaded.objects.size,2+source.charts.length*6);
+
+ // Non-midnight observation_end on an 86400s schema-7 release fails closed.
+ const badMidnight=fixture('v7-daily-nonmid',{
+  referenceChange:ref=>Object.assign(ref,toV6Ref(ref)),
+  dataChange:data=>{
+   Object.assign(data,toV6Data(data));
+   data.schema_version=7;
+   data.end+=3600;
+   data.start+=3600;
+  },
+ });
+ await assert.rejects(loader(server([badMidnight],badMidnight,null)).load(),/Invalid data window/);
+
+ // Reject 24h hours period, hourly kinds, forbidden keys, and reference.hour when window_seconds === 86400.
+ const badHoursTr=structuredClone(v7Daily.data);
+ badHoursTr.time_ranges=structuredClone(source.time_ranges);
+ assert.throws(()=>checkData(badHoursTr,v7Daily.manifest),/Sub-24h time_ranges/);
+
+ const badKind=structuredClone(v7Daily.data);
+ badKind.charts[0].kind='counter_hour_rate';
+ assert.throws(()=>checkData(badKind,v7Daily.manifest),/Invalid chart metadata/);
+
+ for(const badKey of ['hour','sampled_hour','hourly_relays','hourly_expected_relays','current24']){
+  const polluted=structuredClone(v7Daily.data);
+  polluted[badKey]={};
+  assert.throws(()=>checkData(polluted,v7Daily.manifest),/Sub-24h field in live JSON/);
+ }
+
+ const badRef=structuredClone(v7Daily.reference);
+ badRef.distributions[v7Daily.data.charts[0].id][v7Daily.data.charts[0].series[0].key].hour=[];
+ assert.throws(()=>checkReference(badRef,v7Daily.data),/Sub-24h field in live JSON/);
+});

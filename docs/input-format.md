@@ -1,7 +1,7 @@
 # Aggregate input contract
 
-`inputs/snapshot.json` is the repository's synthetic schema-4 (`input_schema_version: 4`) example measurement bundle (production deployments configure a private `0600` seed snapshot via `SOURCE_SEED_SNAPSHOT` or `--seed`; `collect.py` also accepts legacy schema-3 seeds via `allow_v3_seed=True`), paired with declarative range definitions in `inputs/time_ranges.json` (or `--time-ranges <path>`).
-The builder accepts only the public fields described by `scripts/validation.py` and `scripts/time_ranges.py` and emits `schema_version: 7` with the validated `time_ranges` block embedded.
+`inputs/snapshot.json` is the repository's synthetic schema-4 (`input_schema_version: 4`) example measurement bundle (production deployments configure a private `0600` seed snapshot via `SOURCE_SEED_SNAPSHOT` or `--seed`; `collect.py` upgrades legacy schema-3 seeds via `allow_v3_seed=True`), paired with declarative range definitions in `inputs/time_ranges.json` (or `--time-ranges <path>`).
+`build.py` accepts validated `input_schema_version: 4` (`window_seconds: 3600` hourly) or `input_schema_version: 3` (`window_seconds: 86400` daily-only, paired with a daily-only `--time-ranges` config declaring no `'hours'` period) and emits `schema_version: 7` with the validated `time_ranges` block embedded (preserving `window_seconds` and omitting all hourly/sub-24h keys on `86,400s` builds).
 Computed reference distributions, ranks, display strings and historical averages
 are produced by the build, not supplied by the collector.
 

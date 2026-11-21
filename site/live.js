@@ -124,13 +124,13 @@ function checkCurrentCoverage(current,chart,period='day'){
  if(relays===null||relays===0||!current.valid)requireLive(current.value===null,'Invalid current eligibility');
  if(current.valid)requireLive(current.value!==null&&relays>=8&&coverage!==null&&coverage>=MINIMUM_POPULATION_COVERAGE&&inferred>=MINIMUM_POPULATION_COVERAGE,'Invalid current eligibility');
 }
-function checkRelayPopulations(series,end,timeRanges,relayKeys,isV7=false){
+function checkRelayPopulations(series,end,timeRanges,relayKeys,hasHours=false){
  const raw=series.relay_population,history=series.history.daily,dayEnd=Math.floor(end/DAY)*DAY;
  if(raw!==undefined){
-  exactKeys(raw,isV7?['method','queries','hour','day','daily']:['method','queries','day','daily'],'Invalid relay population fields');
+  exactKeys(raw,hasHours?['method','queries','hour','day','daily']:['method','queries','day','daily'],'Invalid relay population fields');
   requireLive(raw.method==='eligible-last-flags-v1','Invalid relay population method');
-  exactKeys(raw.queries,isV7?['hour','day']:['day'],'Invalid relay population queries');
-  for(const qk of isV7?['hour','day']:['day'])requireLive(textField(raw.queries[qk])&&raw.queries[qk].trim(),'Invalid relay population queries');
+  exactKeys(raw.queries,hasHours?['hour','day']:['day'],'Invalid relay population queries');
+  for(const qk of hasHours?['hour','day']:['day'])requireLive(textField(raw.queries[qk])&&raw.queries[qk].trim(),'Invalid relay population queries');
   const checkRow=(row,t,n)=>{
    requireLive(Array.isArray(row)&&row.length===8&&!Object.is(row[0],-0)&&row[0]===t&&n!==null&&n!==undefined&&row[1]===n,'Invalid relay population measurement');
    for(let i=1;i<8;i++)requireLive(coarsenedCount(row[i]),'Invalid relay population measurement');
@@ -139,7 +139,7 @@ function checkRelayPopulations(series,end,timeRanges,relayKeys,isV7=false){
    for(let i=3;i<8;i++)requireLive(row[i]<=c,'Invalid relay population classification');
    requireLive(row[4]<=c-row[3]&&row[4]<=c-row[5]&&row[4]<=c-row[6]&&row[4]<=c-row[7],'Invalid relay population classification');
   };
-  for(const p of isV7?['hour','day']:['day'])if(raw[p]!==null)checkRow(raw[p],end,series.current[p].relays);
+  for(const p of hasHours?['hour','day']:['day'])if(raw[p]!==null)checkRow(raw[p],end,series.current[p].relays);
   requireLive(Array.isArray(raw.daily)&&raw.daily.length<=history.length,'Invalid daily relay population array');
   let hi=0,previous=-1;
   for(const row of raw.daily){
@@ -161,7 +161,7 @@ function checkRelayPopulations(series,end,timeRanges,relayKeys,isV7=false){
   qTime.push(t);qN.push(row[2]);qPop.push(di<dailyRows.length&&dailyRows[di][0]===t?dailyRows[di]:null);
  }
  const near=(a,b)=>finite(a)&&finite(b)&&(b===0?a===0:Math.abs(a-b)<=4*Number.EPSILON*Math.max(1,Math.abs(a),Math.abs(b))),qLen=qTime.length;
- const currentKeys=isV7?['hour','day']:['day'];
+ const currentKeys=hasHours?['hour','day']:['day'];
  for(let ci=0;ci<currentKeys.length+periods.length;ci++){
   const current=ci<currentKeys.length,periodDef=current?null:periods[ci-currentKeys.length],period=current?currentKeys[ci]:periodDef.summary_key,isAllTime=!current&&periodDef.window.unit==='all_time';
   const summary=series.relay_counts[period];
@@ -273,9 +273,11 @@ function checkData(data,manifest){
  requireLive(record(data),'Invalid data window');
  const isV7=data.schema_version===7;
  requireLive((isV7||data.schema_version===5||data.schema_version===6)&&data.schema_version===manifest.data_schema_version,'Invalid data window');
- const expectedWindow=isV7?HOUR:DAY;
- requireLive(data.window_seconds===expectedWindow&&data.end===manifest.observation_end&&timestamp(data.start)&&timestamp(data.end)&&data.start%expectedWindow===0&&data.end%expectedWindow===0&&data.end-data.start===DAY,'Invalid data window');
- if(!isV7)rejectForbiddenKeys(data,FORBIDDEN_HOURLY_KEYS);
+ requireLive(isV7?(data.window_seconds===HOUR||data.window_seconds===DAY):data.window_seconds===DAY,'Invalid data window');
+ const hasHours=isV7&&data.window_seconds===HOUR;
+ const expectedWindow=hasHours?HOUR:DAY;
+ requireLive(data.end===manifest.observation_end&&timestamp(data.start)&&timestamp(data.end)&&data.start%expectedWindow===0&&data.end%expectedWindow===0&&data.end-data.start===DAY,'Invalid data window');
+ if(!hasHours)rejectForbiddenKeys(data,FORBIDDEN_HOURLY_KEYS);
  const dayEnd=Math.floor(data.end/DAY)*DAY;
  const timeRanges=data.schema_version>=6?validateTimeRanges(data.time_ranges):(requireLive(data.time_ranges===undefined,'Unexpected time_ranges in legacy release'),LEGACY_V5_TIME_RANGES);
  for(const k of ['fleet','custom','defense'])if(data[k]!==undefined)requireLive(coarsenedCount(data[k]),'Invalid coarsened data population');
@@ -285,9 +287,9 @@ function checkData(data,manifest){
   if(data.provenance[key]!==undefined)requireLive(matches(SHA256,data.provenance[key]),msg);
  }
  requireLive(data.provenance.query_contract_sha256===undefined||(matches(SHA256,data.provenance.query_contract_sha256)&&data.provenance.query_contract_sha256===manifest.query_contract_sha256),'Invalid query contract identity');
- const summaryKeys=[],relayKeys=isV7?['hour','day']:['day'],periodBounds=[];
+ const summaryKeys=[],relayKeys=hasHours?['hour','day']:['day'],periodBounds=[];
  for(const p of timeRanges.periods){
-  if(p.window.unit==='hours'){requireLive(isV7,'Sub-24h time_ranges period forbidden in legacy schema');continue;}
+  if(p.window.unit==='hours'){requireLive(hasHours,'Sub-24h time_ranges period forbidden in daily release');continue;}
   summaryKeys.push(p.summary_key);relayKeys.push(p.summary_key);
   periodBounds.push([p,periodWindowStart(dayEnd,p,0),periodWindowStart(dayEnd,p,p.window.comparison_lag_days)]);
  }
@@ -295,7 +297,7 @@ function checkData(data,manifest){
  const nearVal=(a,b)=>(a===null&&b===null)||(a!==null&&b!==null&&Math.abs(a-b)<=Math.max(1e-12*Math.max(Math.abs(a),Math.abs(b)),1e-12));
  for(const chart of data.charts){
   requireLive(record(chart)&&matches(CHART_ID,chart.id)&&!chartsById.has(chart.id),'Invalid chart ID');chartsById.set(chart.id,chart);
-  if(isV7){
+  if(hasHours){
    exactKeys(chart.history_queries,['daily','sampled_hour','current24'],'Invalid chart metadata');
    for(const qk of ['daily','sampled_hour','current24']){
     const q=chart.history_queries[qk];
@@ -303,27 +305,27 @@ function checkData(data,manifest){
     requireLive(textField(q.value)&&textField(q.eligible)&&textField(q.available),'Invalid chart metadata');
    }
   }else exactKeys(chart.history_queries,['daily'],'Invalid chart metadata');
-  const validKind=isV7?(chart.kind==='counter_hour_rate'||chart.kind==='gauge_hour_mean'):(chart.kind==='counter_daily_rate'||chart.kind==='gauge_daily_mean');
+  const validKind=hasHours?(chart.kind==='counter_hour_rate'||chart.kind==='gauge_hour_mean'):(chart.kind==='counter_daily_rate'||chart.kind==='gauge_daily_mean');
   requireLive(matches(CHART_ID,chart.family_id)&&['title','definition','display_unit','query','quality_query','metric_origin'].every(k=>textField(chart[k]))&&Array.isArray(chart.metrics)&&chart.metrics.length>0&&chart.metrics.every(textField)&&validKind&&finite(chart.display_scale)&&chart.display_scale>0&&chart.start===data.start&&chart.end===data.end&&coarsenedCount(chart.relays),'Invalid chart metadata');
   requireLive(Array.isArray(chart.series)&&chart.series.length>0&&chart.series.length<=64,'Invalid series array');
   const seriesIds=new Set();
   for(const series of chart.series){
    requireLive(record(series)&&matches(CHART_ID,series.key)&&!seriesIds.has(series.key)&&textField(series.name)&&matches(HEX_COLOR,series.color),'Invalid series metadata');seriesIds.add(series.key);
-   if(isV7)checkHourlySeries(series,chart);
+   if(hasHours)checkHourlySeries(series,chart);
    else requireLive(series.values===undefined&&series.hourly_relays===undefined&&series.hourly_expected_relays===undefined,'Sub-24h series fields are forbidden');
    requireLive(record(series.history),'Invalid history');
-   exactKeys(series.history,isV7?['daily','sampled_hour']:['daily'],'Invalid history periods');
+   exactKeys(series.history,hasHours?['daily','sampled_hour']:['daily'],'Invalid history periods');
    rows(series.history.daily,5,dayEnd,-1,true,DAY);
-   if(isV7)rows(series.history.sampled_hour,5,data.end,-1,true,SAMPLED_HOUR_STEP);
+   if(hasHours)rows(series.history.sampled_hour,5,data.end,-1,true,SAMPLED_HOUR_STEP);
    requireLive(record(series.current)&&record(series.reference)&&record(series.peaks)&&record(series.historical_averages),'Missing series summaries');
-   const currentPeriods=isV7?['hour','day']:['day'];
+   const currentPeriods=hasHours?['hour','day']:['day'];
    exactKeys(series.current,currentPeriods,'Invalid current periods');exactKeys(series.reference,currentPeriods,'Invalid reference periods');exactKeys(series.peaks,currentPeriods,'Invalid peak periods');
    for(const cp of currentPeriods){
     const current=series.current[cp],reference=series.reference[cp],peak=series.peaks[cp];
     requireLive(record(current)&&typeof current.valid==='boolean'&&(current.value===null||nonNegative(current.value))&&(current.relays===null||coarsenedCount(current.relays))&&record(reference)&&count(reference.n)&&(reference.current_percentile===null||(nonNegative(reference.current_percentile)&&reference.current_percentile<=100))&&(peak===null||record(peak)),'Invalid current/reference summary');
     checkCurrentCoverage(current,chart,cp);
    }
-   if(isV7){
+   if(hasHours){
     const hCur=series.current.hour;
     requireLive(nearVal(hCur.value,series.values[23][1])&&hCur.relays===series.hourly_relays[23][1]&&hCur.expected_relays===series.hourly_expected_relays[23][1],'Headline and plotted final hour disagree');
    }
@@ -333,7 +335,7 @@ function checkData(data,manifest){
    }
    exactKeys(series.historical_averages,summaryKeys,'Invalid historical periods');
    checkHistoricalSeries(series,periodBounds,data);
-   if(series.relay_population!==undefined||series.relay_counts!==undefined)checkRelayPopulations(series,data.end,timeRanges,relayKeys,isV7);
+   if(series.relay_population!==undefined||series.relay_counts!==undefined)checkRelayPopulations(series,data.end,timeRanges,relayKeys,hasHours);
   }
   const displaySet=new Set();
   requireLive(Array.isArray(chart.display_keys)&&chart.display_keys.length>0,'Invalid displayed series');
@@ -355,8 +357,8 @@ function checkData(data,manifest){
 }
 function checkReference(reference,data){
  requireLive(record(reference)&&record(reference.window)&&record(reference.distributions)&&(reference.method_sha256===undefined||matches(SHA256,reference.method_sha256))&&(reference.source_input_sha256===undefined||matches(SHA256,reference.source_input_sha256))&&(data.provenance.reference_method_sha256===undefined||reference.method_sha256===data.provenance.reference_method_sha256)&&timestamp(reference.source_snapshot_end)&&reference.source_snapshot_end<=data.end,'Invalid frozen reference');
- const isV7=data.schema_version===7;
- if(!isV7)rejectForbiddenKeys(reference,FORBIDDEN_HOURLY_KEYS);
+ const hasHours=data.schema_version===7&&data.window_seconds===HOUR;
+ if(!hasHours)rejectForbiddenKeys(reference,FORBIDDEN_HOURLY_KEYS);
  const keys=['date','start','end','months','next_refresh','method_version'];
  exactKeys(reference.window,keys,'Invalid reference window');exactKeys(data.reference_window,keys,'Invalid data reference window');
  requireLive(keys.every(k=>reference.window[k]===data.reference_window[k])&&matches(ISO_DATE,reference.window.date)&&reference.window.months===18&&timestamp(reference.window.next_refresh)&&textField(reference.window.method_version)&&timestamp(reference.window.start)&&timestamp(reference.window.end)&&reference.window.start%DAY===0&&reference.window.end%DAY===0&&reference.window.next_refresh%DAY===0&&reference.window.start<reference.window.end&&reference.window.end<=data.start&&data.reference_cutoff===reference.window.end,'Reference window mismatch');
@@ -366,7 +368,7 @@ function checkReference(reference,data){
   requireLive(record(group)&&Object.keys(group).length===chart.series.length,'Reference series mismatch');
   for(const series of chart.series){
    const periods=group[series.key];requireLive(record(periods),'Missing reference series');
-   if(isV7){
+   if(hasHours){
     exactKeys(periods,['hour','day'],'Invalid reference period map');
     rows(periods.hour,2,reference.window.end,reference.window.start,false,SAMPLED_HOUR_STEP);
     requireLive(periods.hour.length===series.reference.hour.n,'Reference count mismatch');
