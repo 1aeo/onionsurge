@@ -16,11 +16,12 @@ python3 scripts/collect.py \
   --output "$HOME/.local/state/onionsurge/snapshot.json"
 ```
 
-Two companion subcommands support orchestrated hourly runners without exposing `source.env`, SSH keys, `observations.sqlite3`, or seed snapshots outside the collector:
+Two companion subcommands and a read-only archive exporter support orchestrated hourly runners and lossless multi-year storage without exposing `source.env`, SSH keys, `observations.sqlite3`, or seed snapshots outside the collector:
 
 ```sh
 python3 scripts/collect.py --plan --config ... --state-dir ... [--previous-end T] [--max-catchup-days 31] [--forbid-overlap PATH ...]
 python3 scripts/collect.py --record-checkpoint --config ... --state-dir ... --end T [--forbid-overlap PATH ...]
+python3 scripts/collect.py --export-hourly-archive PATH --config ... --state-dir ... [--start T0] [--end T1] [--forbid-overlap PATH ...]
 ```
 
 - `--application-dir` is optional and defaults to the checkout containing `scripts/collect.py`.
@@ -50,15 +51,24 @@ prints `{snapshot_end, catchup_days, recommended_timeout_seconds}` dynamically s
 `catalogue/routes.json`, protocol batch bounds, and any cold `v3` `sampled_hour` backfill span.
 - Normal collection prints `{snapshot_end, charts, series, source_requests,
 cache_committed, checkpoint_updated}`. Output publication precedes a single SQLite
-transaction that commits both `observations` rows and the `(source_identity_sha256,
-observation_end)` completion proof in `collection_completions` (`cache_committed: true`),
-followed by atomically updating `0600` `<state_dir>/checkpoint.json` (`checkpoint_updated:
-true`; if `cache.commit()` fails, both flags are `false` and the checkpoint is unchanged,
-while if `checkpoint.json` update fails afterwards, `cache_committed: true` and
-`checkpoint_updated: false`). `--record-checkpoint` verifies `observations.sqlite3` holds
-committed observation rows and a matching `(source_identity_sha256, --end)` entry in
-`collection_completions` under the collector lock (requiring rollback mode or an active
-WAL `-shm` index) before recording `checkpoint.json` explicitly (for example after manual catch-up).
+transaction that commits `observations` rows, the compressed unique hourly delta in
+`hourly_archive`, the `(source_identity_sha256, observation_end)` completion proof in
+`collection_completions`, and expired raw `1h` (`step = 3600`, `< end - 35 days`) cache
+pruning (`cache_committed: true`), followed by best-effort `PRAGMA incremental_vacuum(256)`
+(when `auto_vacuum = INCREMENTAL`) and atomically updating `0600` `<state_dir>/checkpoint.json`
+(`checkpoint_updated: true`; if `cache.commit()` fails, both flags are `false` and the
+checkpoint is unchanged, while if `checkpoint.json` update fails afterwards,
+`cache_committed: true` and `checkpoint_updated: false`). `--record-checkpoint` verifies
+`observations.sqlite3` holds committed observation rows and a matching
+`(source_identity_sha256, --end)` entry in `collection_completions` under the collector lock
+(requiring rollback mode or an active WAL `-shm` index) before recording `checkpoint.json`
+explicitly (for example after manual catch-up).
+- `--export-hourly-archive PATH` (with optional UTC-hour bounds `--start` and `--end`,
+mutually exclusive with `--plan`, `--record-checkpoint`, and `--output`, and respecting
+`--forbid-overlap`) opens an existing private `<state_dir>/observations.sqlite3` in strict
+non-mutating read-only mode without opening SSH or acquiring `collect.lock`, decompresses
+and schema-checks each stored `hourly_archive` row for the configured `source_identity`, and
+atomically writes ordered `0600` JSON Lines to `PATH`.
 The default endpoint is the latest completed UTC hour
 (`(int(time.time()) // 3600) * 3600`). `--end UNIX_SECONDS` selects another
 completed UTC-hour timestamp at or after the seed snapshot (`end % 3600 == 0`).
@@ -82,10 +92,15 @@ at most seven days and 169 evaluated points, with `query_protocol.py`'s timeout,
 size, aggregate-label and warning checks. Errors and execution warnings abort
 collection; they are never converted to zero measurements.
 
-The private SQLite cache (`observations.sqlite3`) stores immutable evaluated endpoints,
-keyed by source identity, exact expression hash, step and time. An empty successful
+The private SQLite cache (`observations.sqlite3`, initialized with `PRAGMA auto_vacuum = INCREMENTAL` on new DBs) stores immutable evaluated endpoints,
+keyed by source identity, exact expression hash, step and time, alongside permanent
+compressed hourly snapshot deltas in `hourly_archive`. An empty successful
 response is recorded distinctly from a numeric zero. Existing observations are reused;
-missing endpoints are fetched in bounded contiguous batches. The configured seed snapshot
+missing endpoints are fetched in bounded contiguous batches. Multi-year `daily` (`step = 86400`)
+and `sampled_hour` (`step = 21600`) histories are retained permanently, while expired raw
+`current_hour` scrape rows (`step = 3600`, `< target_end - 35 days`) and older superseded
+`collection_completions` rows (always keeping the newest completion per source identity) are
+pruned in the commit transaction to bound database growth. The configured seed snapshot
 (via `--seed`, `SOURCE_SEED_SNAPSHOT`, or the repository fixture `inputs/snapshot.json`)
 accepts both schema-4 and legacy schema-3 (`allow_v3_seed=True`) bundles and seeds all retained daily and sampled-hour history. Already-coarsened historical observations
 (`< end`) are preserved unchanged without re-coarsening. Missing completed UTC-midnight `daily` and `21,600 s` `sampled_hour` history tails (up to 560 days when bootstrapping a v3 seed's `sampled_hour`), the 24 completed hourly `[end - 86400 + 3600 .. end]` windows, and intra-day `current24` are queried and coarsened deterministically.

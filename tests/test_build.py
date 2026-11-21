@@ -36,6 +36,7 @@ class BuildTests(unittest.TestCase):
         cls.temporary.cleanup()
 
     def test_live_build_keeps_verified_data_but_loads_only_the_live_bootstrap(self):
+        import package_previews
         with tempfile.TemporaryDirectory() as folder:
             output, cache = Path(folder) / 'live', Path(folder) / 'cache'
             builder.build(SOURCE, output, cache, live=True)
@@ -48,9 +49,16 @@ class BuildTests(unittest.TestCase):
             self.assertIn('data/manifest.json', page)
             self.assertEqual(json.loads((output / 'data.json').read_text()), self.data)
             self.assertLess((output / 'data.json').stat().st_size, (self.output / 'data.json').stat().st_size)
+            self.assertFalse((output / 'data.js').exists())
+            self.assertFalse((output / 'catalogue.json').exists())
+            with self.assertRaisesRegex(ValueError, 'Live builds cannot'):
+                package_previews.package(output)
             manifest = json.loads((output / 'build-manifest.json').read_text())
             self.assertEqual(manifest['mode'], 'live')
             self.assertEqual(manifest['schema_version'], 7)
+            self.assertNotIn('data.js', manifest['files'])
+            self.assertNotIn('catalogue.json', manifest['files'])
+            self.assertEqual(len(manifest['files']), 97)
             expected_contract_sha = hashlib.sha256((ROOT / 'catalogue/contract.json').read_bytes()).hexdigest()
             self.assertEqual(manifest['query_contract_sha256'], expected_contract_sha)
             expected_release_objects = sorted([
@@ -65,6 +73,9 @@ class BuildTests(unittest.TestCase):
             offline_manifest = json.loads((self.output / 'build-manifest.json').read_text())
             self.assertEqual(offline_manifest['mode'], 'offline')
             self.assertEqual(offline_manifest['schema_version'], 7)
+            self.assertIn('data.js', offline_manifest['files'])
+            self.assertIn('catalogue.json', offline_manifest['files'])
+            self.assertEqual(len(offline_manifest['files']), 99)
             self.assertEqual(offline_manifest['release_objects'], expected_release_objects)
             self.assertEqual(offline_manifest['query_contract_sha256'], expected_contract_sha)
 
