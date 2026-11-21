@@ -1720,7 +1720,6 @@ test('daily schema_version 7 release (86400s) validates end-to-end and rejects h
    data.end+=3600;
    data.start+=3600;
   },
-  manifestChange:m=>{m.observation_end+=3600;},
  });
  await assert.rejects(loader(server([badMidnight],badMidnight,null)).load(),/Invalid data window/);
 
