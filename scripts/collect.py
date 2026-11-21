@@ -351,24 +351,24 @@ class ObservationCache:
         try:
             row = self.db.execute('PRAGMA auto_vacuum').fetchone()
             if row is not None and row[0] == 2:
-                if pages == INCREMENTAL_VACUUM_PAGES:
-                    self.db.execute('PRAGMA incremental_vacuum(256)').fetchall()
-                    return
                 remaining = pages
-                while remaining > 0:
+                steps = 0
+                while remaining > 0 and steps < pages:
+                    steps += 1
                     free_row = self.db.execute('PRAGMA freelist_count').fetchone()
                     free = free_row[0] if free_row is not None else 0
                     if free <= 0:
                         break
                     if remaining >= INCREMENTAL_VACUUM_PAGES:
                         self.db.execute('PRAGMA incremental_vacuum(256)').fetchall()
-                        remaining -= INCREMENTAL_VACUUM_PAGES
                     else:
                         self.db.execute('PRAGMA incremental_vacuum(1)').fetchall()
-                        remaining -= 1
                     after_row = self.db.execute('PRAGMA freelist_count').fetchone()
-                    if after_row is None or after_row[0] >= free:
+                    after = after_row[0] if after_row is not None else free
+                    freed = free - after
+                    if freed <= 0:
                         break
+                    remaining -= freed
         except sqlite3.Error:
             pass
 
