@@ -144,9 +144,9 @@ def number(value, count=False):
     return int(result) if count else result
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, before_replace=None):
     atomic_text(path, json.dumps(value, allow_nan=False, separators=(',', ':')) + '\n',
-                mode=0o600, preserve_mode=False, dir_mode=0o700)
+                mode=0o600, preserve_mode=False, dir_mode=0o700, before_replace=before_replace)
 
 
 @contextmanager
@@ -242,12 +242,17 @@ def _clone_payload(payload):
     }
 
 
+def _endpoint_pairs(pairs, target_end):
+    return [list(pair) for pair in pairs if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0] == target_end]
+
+
 def _build_hourly_archive_entry(data):
-    """Extract only one hour's unique coarsened delta without duplicating multi-year histories."""
+    """Extract only the endpoint hour's unique coarsened delta without duplicating 24h windows or histories."""
+    target_end = data['end']
     return {
         'schema': HOURLY_ARCHIVE_SCHEMA,
         'start': data['start'],
-        'end': data['end'],
+        'end': target_end,
         'window_seconds': data['window_seconds'],
         'fleet': data['fleet'],
         'custom': data['custom'],
@@ -264,9 +269,9 @@ def _build_hourly_archive_entry(data):
                 'series': [
                     {
                         'key': series['key'],
-                        'values': series['values'],
-                        'hourly_relays': series['hourly_relays'],
-                        'hourly_expected_relays': series['hourly_expected_relays'],
+                        'values': _endpoint_pairs(series['values'], target_end),
+                        'hourly_relays': _endpoint_pairs(series['hourly_relays'], target_end),
+                        'hourly_expected_relays': _endpoint_pairs(series['hourly_expected_relays'], target_end),
                         'current': series['current'],
                         'relay_population_current': {
                             'hour': (series.get('relay_population') or {}).get('hour'),
@@ -1468,33 +1473,24 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                     data = Collector(source, cache, queries, routes, seed_obj).collect(target_end, ctx['seed_sha'])
                     validate_snapshot(data)
                     cache.record_hourly_archive(source_id, target_end, data)
-                    atomic_json(out, data)
+                    cache.record_completion(source_id, target_end)
+                    cache.prune_expired_hourly(target_end - HOURLY_CACHE_RETENTION_DAYS * DAY)
+                    atomic_json(out, data, before_replace=cache.commit)
                 except BaseException:
                     try:
                         cache.rollback()
                     except (sqlite3.Error, OSError):
                         pass
                     raise
+                cache_committed = True
+                cache.incremental_vacuum()
                 try:
-                    cache.record_completion(source_id, target_end)
-                    cache.prune_expired_hourly(target_end - HOURLY_CACHE_RETENTION_DAYS * DAY)
-                    cache.commit()
-                except (sqlite3.Error, OSError):
-                    try:
-                        cache.rollback()
-                    except (sqlite3.Error, OSError):
-                        pass
-                    sys.stderr.write('Collection warning: observation cache commit failed after snapshot publication.\n')
+                    atomic_json(state / 'checkpoint.json',
+                                {'source_identity_sha256': source_id, 'observation_end': target_end})
+                except OSError:
+                    sys.stderr.write('Collection warning: collector checkpoint update failed after snapshot publication.\n')
                 else:
-                    cache_committed = True
-                    cache.incremental_vacuum()
-                    try:
-                        atomic_json(state / 'checkpoint.json',
-                                    {'source_identity_sha256': source_id, 'observation_end': target_end})
-                    except OSError:
-                        sys.stderr.write('Collection warning: collector checkpoint update failed after snapshot publication.\n')
-                    else:
-                        checkpoint_updated = True
+                    checkpoint_updated = True
             finally:
                 cache.close()
     finally:

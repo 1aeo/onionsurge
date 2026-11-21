@@ -50,15 +50,19 @@ observation_end)` entry in `collection_completions`, enforces `--max-catchup-day
 prints `{snapshot_end, catchup_days, recommended_timeout_seconds}` dynamically sized from
 `catalogue/routes.json`, protocol batch bounds, and any cold `v3` `sampled_hour` backfill span.
 - Normal collection prints `{snapshot_end, charts, series, source_requests,
-cache_committed, checkpoint_updated}`. Output publication precedes a single SQLite
-transaction that commits `observations` rows, the compressed unique hourly delta in
-`hourly_archive`, the `(source_identity_sha256, observation_end)` completion proof in
-`collection_completions`, and expired raw `1h` (`step = 3600`, `< end - 35 days`) cache
-pruning (`cache_committed: true`), followed by best-effort `PRAGMA incremental_vacuum(256)`
-(when `auto_vacuum = INCREMENTAL`) and atomically updating `0600` `<state_dir>/checkpoint.json`
-(`checkpoint_updated: true`; if `cache.commit()` fails, both flags are `false` and the
-checkpoint is unchanged, while if `checkpoint.json` update fails afterwards,
-`cache_committed: true` and `checkpoint_updated: false`). `--record-checkpoint` verifies
+cache_committed, checkpoint_updated}`. The snapshot `--output` is staged and
+`fsync`ed to a private temporary file, then the single SQLite transaction commits
+`observations` rows, the endpoint-hour (`end`) compressed delta in
+`hourly_archive`, the `(source_identity_sha256, observation_end)` completion proof
+in `collection_completions`, and expired raw `1h` (`step = 3600`, `< end - 35 days`)
+cache pruning (`cache_committed: true`) immediately before `os.replace` publishes
+`--output` (so any cache commit failure rolls back SQLite cleanly, removes the
+staged temporary file, and leaves any previous `--output` and `checkpoint.json`
+untouched), followed by best-effort `PRAGMA incremental_vacuum(256)` (when
+`auto_vacuum = INCREMENTAL`) and atomically updating `0600` `<state_dir>/checkpoint.json`
+(`checkpoint_updated: true`; if updating `checkpoint.json` fails after snapshot
+publication, `cache_committed: true`, `checkpoint_updated: false`, and operators can
+recover cleanly via `--record-checkpoint`). `--record-checkpoint` verifies
 `observations.sqlite3` holds committed observation rows and a matching
 `(source_identity_sha256, --end)` entry in `collection_completions` under the collector lock
 (requiring rollback mode or an active WAL `-shm` index) before recording `checkpoint.json`
@@ -94,7 +98,12 @@ collection; they are never converted to zero measurements.
 
 The private SQLite cache (`observations.sqlite3`, initialized with `PRAGMA auto_vacuum = INCREMENTAL` on new DBs) stores immutable evaluated endpoints,
 keyed by source identity, exact expression hash, step and time, alongside permanent
-compressed hourly snapshot deltas in `hourly_archive`. An empty successful
+compressed endpoint-hour deltas in `hourly_archive` (`values`, `hourly_relays`,
+and `hourly_expected_relays` filtered strictly to `ts == end` plus `current`,
+cohorts, versions, flags, and provenance — skipped hours have no `hourly_archive`
+row unless explicitly backfilled via `scripts/collect.py --end <UNIX_SECONDS> ...`,
+which is idempotent via `INSERT OR REPLACE` while Prometheus or the 35-day raw
+`1h` cache retains that hour). An empty successful
 response is recorded distinctly from a numeric zero. Existing observations are reused;
 missing endpoints are fetched in bounded contiguous batches. Multi-year `daily` (`step = 86400`)
 and `sampled_hour` (`step = 21600`) histories are retained permanently, while expired raw

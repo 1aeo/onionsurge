@@ -800,7 +800,6 @@ class CollectorTests(unittest.TestCase):
                                     collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(out_path.read_text(), committed_before)
                         elif mode in {'record_completion', 'commit'}:
-                            stderr = io.StringIO()
                             real_cache_cls = collector.ObservationCache
                             if mode == 'record_completion':
                                 class FailingCache(real_cache_cls):
@@ -810,21 +809,18 @@ class CollectorTests(unittest.TestCase):
                                 class FailingCache(real_cache_cls):
                                     def commit(self):
                                         raise sqlite3.OperationalError('simulated lock')
-                            with mock.patch.object(collector, 'ObservationCache', FailingCache), redirect_stderr(stderr):
-                                summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
-                            self.assertEqual(summary['snapshot_end'], END)
-                            self.assertFalse(summary['cache_committed'])
-                            self.assertFalse(summary['checkpoint_updated'])
-                            self.assertEqual(json.loads(out_path.read_text())['end'], END)
-                            self.assertIn('observation cache commit failed after snapshot publication', stderr.getvalue())
-                            out_path.write_text(committed_before)
+                            with mock.patch.object(collector, 'ObservationCache', FailingCache), \
+                                    self.assertRaises(sqlite3.OperationalError):
+                                collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
+                            self.assertEqual(out_path.read_text(), committed_before)
+                            self.assertEqual(list(out_path.parent.glob('.snapshot.json.*.tmp')), [])
                         elif mode == 'checkpoint_write':
                             stderr = io.StringIO()
                             real_atomic_json = collector.atomic_json
-                            def fail_checkpoint_only(path, value):
+                            def fail_checkpoint_only(path, value, **kwargs):
                                 if Path(path).name == 'checkpoint.json':
                                     raise OSError('checkpoint disk full')
-                                return real_atomic_json(path, value)
+                                return real_atomic_json(path, value, **kwargs)
                             with mock.patch.object(collector, 'atomic_json', side_effect=fail_checkpoint_only), redirect_stderr(stderr):
                                 summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(summary['snapshot_end'], END)
@@ -836,7 +832,10 @@ class CollectorTests(unittest.TestCase):
                             with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
                                 completions = sorted(row[0] for row in db.execute(
                                     'SELECT observation_end FROM collection_completions'))
+                                archived = sorted(row[0] for row in db.execute(
+                                    'SELECT observation_end FROM hourly_archive'))
                             self.assertEqual(completions, [END - DAY, END])
+                            self.assertEqual(archived, [END - DAY, END])
                             continue
                         else:
                             with self.assertRaisesRegex(ValueError, 'simulated output validation failure'):
@@ -847,10 +846,11 @@ class CollectorTests(unittest.TestCase):
                         after_rows = db.execute('SELECT count(*) FROM observations').fetchone()[0]
                         after_end_rows = db.execute('SELECT count(*) FROM observations WHERE endpoint=?', (END,)).fetchone()[0]
                         after_completions = db.execute('SELECT observation_end FROM collection_completions').fetchall()
+                        after_archives = db.execute('SELECT count(*) FROM hourly_archive WHERE observation_end=?', (END,)).fetchone()[0]
                     self.assertEqual(after_rows, before_rows)
                     self.assertEqual(after_end_rows, 0)
                     self.assertEqual(after_completions, before_completions)
-                    self.assertEqual(after_end_rows, 0)
+                    self.assertEqual(after_archives, 0)
 
     def test_chained_collection_preserves_binary_hash_counts(self):
         fixture = CollectorFixture()
@@ -1127,13 +1127,12 @@ class CollectorTests(unittest.TestCase):
                         mock.patch.object(collector.Collector, 'collect', side_effect=RuntimeError('primary failure')):
                     with self.assertRaisesRegex(RuntimeError, 'primary failure'):
                         collector.collect({}, app_dir, root / 'state', root / 'out1.json', end=END, source=fixture.source)
-                stderr = io.StringIO()
                 with mock.patch.object(collector.ObservationCache, 'commit', side_effect=sqlite3.OperationalError('commit failed')), \
-                        mock.patch.object(collector.ObservationCache, 'rollback', side_effect=sqlite3.OperationalError('rollback failed')), \
-                        redirect_stderr(stderr):
-                    summary = collector.collect({}, app_dir, root / 'state', root / 'out2.json', end=END, source=fixture.source)
-                self.assertEqual(summary['snapshot_end'], END)
-                self.assertIn('cache commit failed', stderr.getvalue())
+                        mock.patch.object(collector.ObservationCache, 'rollback', side_effect=sqlite3.OperationalError('rollback failed')):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, 'commit failed'):
+                        collector.collect({}, app_dir, root / 'state', root / 'out2.json', end=END, source=fixture.source)
+                self.assertFalse((root / 'out2.json').exists())
+                self.assertEqual(list(root.glob('.out2.json.*.tmp')), [])
 
     def test_same_day_recollect_without_expected_relays_uses_seed_chart_relays_and_passes_validation(self):
         base_seed = json.loads((ROOT / 'inputs/snapshot.json').read_text())
@@ -1854,13 +1853,14 @@ class CollectorTests(unittest.TestCase):
                                   end=target_end, source=oversized_src, config_path=cfg_file)
             self.assertFalse((root / 'out_oversized.json').exists())
 
-            # Rollback on commit failure leaves zero orphan hourly_archive rows.
+            # Rollback on commit failure prevents snapshot publication, cleans temp files, and leaves zero orphan rows.
             fail_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
             with mock.patch.object(collector.ObservationCache, 'commit', side_effect=sqlite3.OperationalError('disk full')), \
-                    redirect_stderr(io.StringIO()):
-                fail_res = collector.collect(cfg, ROOT, state_dir, root / 'out_fail.json',
-                                             end=target_end, source=fail_src, config_path=cfg_file)
-            self.assertFalse(fail_res['cache_committed'])
+                    self.assertRaisesRegex(sqlite3.OperationalError, 'disk full'):
+                collector.collect(cfg, ROOT, state_dir, root / 'out_fail.json',
+                                  end=target_end, source=fail_src, config_path=cfg_file)
+            self.assertFalse((root / 'out_fail.json').exists())
+            self.assertEqual(list(root.glob('.out_fail.json.*.tmp')), [])
             self.assertFalse((state_dir / 'checkpoint.json').exists())
             db_path = state_dir / 'observations.sqlite3'
             with closing(sqlite3.connect(db_path)) as db:
@@ -1947,6 +1947,14 @@ class CollectorTests(unittest.TestCase):
                     'key', 'values', 'hourly_relays', 'hourly_expected_relays', 'current', 'relay_population_current',
                 })
                 self.assertEqual(set(first_series['relay_population_current']), {'hour', 'day'})
+                for field_name in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    self.assertEqual(len(first_series[field_name]), 1)
+                    self.assertEqual(first_series[field_name][0][0], target_end)
+                decoded2 = json.loads(zlib.decompress(rows[1][1]))
+                second_series = decoded2['charts'][0]['series'][0]
+                for field_name in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    self.assertEqual(len(second_series[field_name]), 1)
+                    self.assertEqual(second_series[field_name][0][0], target_end + HOUR)
 
             # Existing non-empty DB with auto_vacuum = NONE keeps NONE cleanly without VACUUM.
             legacy_db = root / 'legacy.sqlite3'
