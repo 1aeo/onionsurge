@@ -1959,6 +1959,30 @@ class CollectorTests(unittest.TestCase):
             finally:
                 cache.close()
 
+            # Populated freelist on INCREMENTAL DB consumes all requested vacuum steps and shrinks file size.
+            vac_db = root / 'vac.sqlite3'
+            vac_cache = collector.ObservationCache(vac_db, src, queries)
+            try:
+                vac_cache.db.executemany(
+                    'INSERT INTO observations VALUES (?, ?, ?, ?, ?)',
+                    [('s', f'q{i}', HOUR, target_end + i * HOUR, 'x' * 2048) for i in range(120)],
+                )
+                vac_cache.commit()
+                size_peak = vac_db.stat().st_size
+                vac_cache.db.execute('DELETE FROM observations WHERE endpoint < ?', (target_end + 100 * HOUR,))
+                vac_cache.commit()
+                freelist_before = vac_cache.db.execute('PRAGMA freelist_count').fetchone()[0]
+                self.assertGreater(freelist_before, 20)
+                vac_cache.incremental_vacuum(10)
+                freelist_mid = vac_cache.db.execute('PRAGMA freelist_count').fetchone()[0]
+                self.assertEqual(freelist_before - freelist_mid, 10)
+                vac_cache.incremental_vacuum()
+                freelist_after = vac_cache.db.execute('PRAGMA freelist_count').fetchone()[0]
+                self.assertEqual(freelist_after, 0)
+                self.assertLess(vac_db.stat().st_size, size_peak)
+            finally:
+                vac_cache.close()
+
     def test_export_hourly_archive_cli_and_validation(self):
         base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
         queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
@@ -2061,6 +2085,60 @@ class CollectorTests(unittest.TestCase):
                     self.assertEqual(sliced_path.read_bytes(), before)
                 db.execute('UPDATE hourly_archive SET payload_zlib=? WHERE observation_end=?', (orig_blob, t2))
                 db.commit()
+
+            # Concurrent export + collection commit regression: read transactions are released between batches
+            # so a concurrent commit in rollback-journal mode succeeds immediately without missing the archive endpoint.
+            t4 = t3 + HOUR
+            concurrent_out = root / 'exports/concurrent.jsonl'
+            orig_decompress = collector._decompress_archive_row
+            real_connect = collector.sqlite3.connect
+            commit_done = False
+
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                entry_source_id = db.execute(
+                    'SELECT source_identity FROM hourly_archive WHERE observation_end=?', (t1,)
+                ).fetchone()[0]
+
+            def decompress_and_race(blob):
+                nonlocal commit_done
+                raw = orig_decompress(blob)
+                if not commit_done:
+                    commit_done = True
+                    # Simulate concurrent collection commit with tiny 50ms busy timeout in rollback mode.
+                    next_data = copy.deepcopy(base_v4)
+                    next_data.update(start=t4 - DAY, end=t4)
+                    with mock.patch.object(
+                        collector.sqlite3, 'connect',
+                        side_effect=lambda p, *a, **kw: real_connect(p, timeout=0.05),
+                    ):
+                        wcache = collector.ObservationCache(state_dir / 'observations.sqlite3', src, queries)
+                        try:
+                            wcache.record_hourly_archive(entry_source_id, t4, next_data)
+                            wcache.record_completion(entry_source_id, t4)
+                            wcache.commit()
+                        finally:
+                            wcache.close()
+                return raw
+
+            with mock.patch.object(collector, 'ARCHIVE_EXPORT_BATCH_SIZE', 1), \
+                    mock.patch.object(collector, '_decompress_archive_row', side_effect=decompress_and_race):
+                race_res = collector.export_hourly_archive(
+                    cfg, ROOT, state_dir, concurrent_out, config_path=cfg_file,
+                )
+            self.assertTrue(commit_done)
+            self.assertEqual(race_res['rows'], 4)
+            self.assertEqual(
+                [json.loads(ln)['end'] for ln in concurrent_out.read_text().splitlines()],
+                [t1, t2, t3, t4],
+            )
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                self.assertEqual(
+                    db.execute(
+                        'SELECT COUNT(*) FROM hourly_archive WHERE source_identity=? AND observation_end=?',
+                        (entry_source_id, t4),
+                    ).fetchone()[0],
+                    1,
+                )
 
             # Invalid CLI flags & bounds fail closed cleanly.
             for argv in (

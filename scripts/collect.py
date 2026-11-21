@@ -61,6 +61,8 @@ HOURLY_ARCHIVE_SCHEMA = 1
 MAX_ARCHIVE_ROW_BYTES = 8 * 1024 * 1024
 HOURLY_CACHE_RETENTION_DAYS = 35
 INCREMENTAL_VACUUM_PAGES = 256
+ARCHIVE_EXPORT_BATCH_SIZE = 128
+SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 _ENV_LINE_RE = re.compile(r'(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=(.*)')
 _HOME_VAR_RE = re.compile(r'\$\{HOME\}|\$HOME(?![A-Za-z0-9_])')
 _POP_CODE_RE = re.compile(r'0|[1-9][0-9]?')
@@ -294,7 +296,7 @@ class ObservationCache:
         else:
             _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
                      'Observation cache must be a private owned regular file')
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
         try:
             if self.db.execute('PRAGMA page_count').fetchone()[0] == 0:
                 self.db.execute('PRAGMA auto_vacuum = INCREMENTAL')
@@ -349,7 +351,15 @@ class ObservationCache:
         try:
             row = self.db.execute('PRAGMA auto_vacuum').fetchone()
             if row is not None and row[0] == 2:
-                self.db.execute(f'PRAGMA incremental_vacuum({int(pages)})')
+                if pages == INCREMENTAL_VACUUM_PAGES:
+                    self.db.execute('PRAGMA incremental_vacuum(256)').fetchall()
+                else:
+                    remaining = pages
+                    while remaining > 0:
+                        step = self.db.execute('PRAGMA incremental_vacuum(1)').fetchall()
+                        if not step:
+                            break
+                        remaining -= 1
         except sqlite3.Error:
             pass
 
@@ -1043,7 +1053,8 @@ def _open_readonly_cache(db_path, *, fail_if_missing=False, fail_if_unindexed_wa
             raise CollectionError('Observation cache WAL requires an active shared-memory index or checkpointed journal')
         return None
     try:
-        return sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?mode=ro', uri=True)
+        return sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?mode=ro',
+                               uri=True, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     except sqlite3.Error as error:
         raise CollectionError('Invalid observation cache database') from error
 
@@ -1539,17 +1550,7 @@ def export_hourly_archive(config, application_dir, state_dir, output, start=None
         fail_if_unindexed_wal=True,
         missing_message='Observation cache database is missing',
     )
-    sql = ['SELECT observation_end, payload_zlib FROM hourly_archive WHERE source_identity = ?']
-    params = [source_id]
-    if start is not None:
-        sql.append('AND observation_end >= ?')
-        params.append(start)
-    if end is not None:
-        sql.append('AND observation_end <= ?')
-        params.append(end)
-    sql.append('ORDER BY observation_end ASC')
-    query = ' '.join(sql)
-
+    batch_size = max(1, int(ARCHIVE_EXPORT_BATCH_SIZE))
     rows_written = 0
     first_end = None
     last_end = None
@@ -1564,16 +1565,37 @@ def export_hourly_archive(config, application_dir, state_dir, output, start=None
             temporary = Path(handle.name)
             os.fchmod(handle.fileno(), 0o600)
             with closing(conn):
-                try:
-                    cursor = conn.execute(query, params)
-                except sqlite3.OperationalError as error:
-                    if 'no such table' not in str(error).lower():
+                last_obs = None
+                while True:
+                    sql = ['SELECT observation_end, payload_zlib FROM hourly_archive WHERE source_identity = ?']
+                    params = [source_id]
+                    if last_obs is not None:
+                        sql.append('AND observation_end > ?')
+                        params.append(last_obs)
+                    elif start is not None:
+                        sql.append('AND observation_end >= ?')
+                        params.append(start)
+                    if end is not None:
+                        sql.append('AND observation_end <= ?')
+                        params.append(end)
+                    sql.append('ORDER BY observation_end ASC LIMIT ?')
+                    params.append(batch_size)
+                    try:
+                        cursor = conn.execute(' '.join(sql), params)
+                        try:
+                            rows = cursor.fetchall()
+                        finally:
+                            cursor.close()
+                        conn.rollback()
+                    except sqlite3.OperationalError as error:
+                        if 'no such table' not in str(error).lower():
+                            raise CollectionError('Invalid observation cache database') from error
+                        rows = ()
+                    except sqlite3.Error as error:
                         raise CollectionError('Invalid observation cache database') from error
-                    cursor = ()
-                except sqlite3.Error as error:
-                    raise CollectionError('Invalid observation cache database') from error
-                try:
-                    for obs_end, blob in cursor:
+                    if not rows:
+                        break
+                    for obs_end, blob in rows:
                         raw = _decompress_archive_row(blob)
                         entry = parse_json(raw)
                         _require(
@@ -1586,8 +1608,9 @@ def export_hourly_archive(config, application_dir, state_dir, output, start=None
                             first_end = obs_end
                         last_end = obs_end
                         rows_written += 1
-                except sqlite3.Error as error:
-                    raise CollectionError('Invalid observation cache database') from error
+                    last_obs = rows[-1][0]
+                    if len(rows) < batch_size:
+                        break
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, out)
