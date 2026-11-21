@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
@@ -799,7 +800,6 @@ class CollectorTests(unittest.TestCase):
                                     collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(out_path.read_text(), committed_before)
                         elif mode in {'record_completion', 'commit'}:
-                            stderr = io.StringIO()
                             real_cache_cls = collector.ObservationCache
                             if mode == 'record_completion':
                                 class FailingCache(real_cache_cls):
@@ -809,21 +809,18 @@ class CollectorTests(unittest.TestCase):
                                 class FailingCache(real_cache_cls):
                                     def commit(self):
                                         raise sqlite3.OperationalError('simulated lock')
-                            with mock.patch.object(collector, 'ObservationCache', FailingCache), redirect_stderr(stderr):
-                                summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
-                            self.assertEqual(summary['snapshot_end'], END)
-                            self.assertFalse(summary['cache_committed'])
-                            self.assertFalse(summary['checkpoint_updated'])
-                            self.assertEqual(json.loads(out_path.read_text())['end'], END)
-                            self.assertIn('observation cache commit failed after snapshot publication', stderr.getvalue())
-                            out_path.write_text(committed_before)
+                            with mock.patch.object(collector, 'ObservationCache', FailingCache), \
+                                    self.assertRaises(sqlite3.OperationalError):
+                                collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
+                            self.assertEqual(out_path.read_text(), committed_before)
+                            self.assertEqual(list(out_path.parent.glob('.snapshot.json.*.tmp')), [])
                         elif mode == 'checkpoint_write':
                             stderr = io.StringIO()
                             real_atomic_json = collector.atomic_json
-                            def fail_checkpoint_only(path, value):
+                            def fail_checkpoint_only(path, value, **kwargs):
                                 if Path(path).name == 'checkpoint.json':
                                     raise OSError('checkpoint disk full')
-                                return real_atomic_json(path, value)
+                                return real_atomic_json(path, value, **kwargs)
                             with mock.patch.object(collector, 'atomic_json', side_effect=fail_checkpoint_only), redirect_stderr(stderr):
                                 summary = collector.collect({}, app_dir, state_dir, out_path, end=END, source=fixture.source)
                             self.assertEqual(summary['snapshot_end'], END)
@@ -835,7 +832,10 @@ class CollectorTests(unittest.TestCase):
                             with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
                                 completions = sorted(row[0] for row in db.execute(
                                     'SELECT observation_end FROM collection_completions'))
+                                archived = sorted(row[0] for row in db.execute(
+                                    'SELECT observation_end FROM hourly_archive'))
                             self.assertEqual(completions, [END - DAY, END])
+                            self.assertEqual(archived, [END - DAY, END])
                             continue
                         else:
                             with self.assertRaisesRegex(ValueError, 'simulated output validation failure'):
@@ -846,10 +846,11 @@ class CollectorTests(unittest.TestCase):
                         after_rows = db.execute('SELECT count(*) FROM observations').fetchone()[0]
                         after_end_rows = db.execute('SELECT count(*) FROM observations WHERE endpoint=?', (END,)).fetchone()[0]
                         after_completions = db.execute('SELECT observation_end FROM collection_completions').fetchall()
+                        after_archives = db.execute('SELECT count(*) FROM hourly_archive WHERE observation_end=?', (END,)).fetchone()[0]
                     self.assertEqual(after_rows, before_rows)
                     self.assertEqual(after_end_rows, 0)
                     self.assertEqual(after_completions, before_completions)
-                    self.assertEqual(after_end_rows, 0)
+                    self.assertEqual(after_archives, 0)
 
     def test_chained_collection_preserves_binary_hash_counts(self):
         fixture = CollectorFixture()
@@ -1126,13 +1127,12 @@ class CollectorTests(unittest.TestCase):
                         mock.patch.object(collector.Collector, 'collect', side_effect=RuntimeError('primary failure')):
                     with self.assertRaisesRegex(RuntimeError, 'primary failure'):
                         collector.collect({}, app_dir, root / 'state', root / 'out1.json', end=END, source=fixture.source)
-                stderr = io.StringIO()
                 with mock.patch.object(collector.ObservationCache, 'commit', side_effect=sqlite3.OperationalError('commit failed')), \
-                        mock.patch.object(collector.ObservationCache, 'rollback', side_effect=sqlite3.OperationalError('rollback failed')), \
-                        redirect_stderr(stderr):
-                    summary = collector.collect({}, app_dir, root / 'state', root / 'out2.json', end=END, source=fixture.source)
-                self.assertEqual(summary['snapshot_end'], END)
-                self.assertIn('cache commit failed', stderr.getvalue())
+                        mock.patch.object(collector.ObservationCache, 'rollback', side_effect=sqlite3.OperationalError('rollback failed')):
+                    with self.assertRaisesRegex(sqlite3.OperationalError, 'commit failed'):
+                        collector.collect({}, app_dir, root / 'state', root / 'out2.json', end=END, source=fixture.source)
+                self.assertFalse((root / 'out2.json').exists())
+                self.assertEqual(list(root.glob('.out2.json.*.tmp')), [])
 
     def test_same_day_recollect_without_expected_relays_uses_seed_chart_relays_and_passes_validation(self):
         base_seed = json.loads((ROOT / 'inputs/snapshot.json').read_text())
@@ -1831,6 +1831,349 @@ class CollectorTests(unittest.TestCase):
                 with self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
                     collector.plan_collection(cfg, ROOT, root / 'StateCase/collector', end=seed_end,
                                               config_path=cfg_file, forbid_overlap=[root / 'statecase/collector'])
+
+    def test_hourly_archive_atomic_transaction_auto_vacuum_and_pruning(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+        target_end = seed_end + HOUR
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, _, _ = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+            state_dir = root / 'state'
+
+            # Oversized hourly archive fails before snapshot publication and rolls back cache writes.
+            oversized_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            with mock.patch.object(collector, 'MAX_ARCHIVE_ROW_BYTES', 16), \
+                    self.assertRaisesRegex(collector.CollectionError, 'Archived hourly payload exceeds size limit'):
+                collector.collect(cfg, ROOT, state_dir, root / 'out_oversized.json',
+                                  end=target_end, source=oversized_src, config_path=cfg_file)
+            self.assertFalse((root / 'out_oversized.json').exists())
+
+            # Rollback on commit failure prevents snapshot publication, cleans temp files, and leaves zero orphan rows.
+            fail_src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            with mock.patch.object(collector.ObservationCache, 'commit', side_effect=sqlite3.OperationalError('disk full')), \
+                    self.assertRaisesRegex(sqlite3.OperationalError, 'disk full'):
+                collector.collect(cfg, ROOT, state_dir, root / 'out_fail.json',
+                                  end=target_end, source=fail_src, config_path=cfg_file)
+            self.assertFalse((root / 'out_fail.json').exists())
+            self.assertEqual(list(root.glob('.out_fail.json.*.tmp')), [])
+            self.assertFalse((state_dir / 'checkpoint.json').exists())
+            db_path = state_dir / 'observations.sqlite3'
+            with closing(sqlite3.connect(db_path)) as db:
+                self.assertEqual(db.execute('PRAGMA auto_vacuum').fetchone()[0], 2)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM hourly_archive').fetchone()[0], 0)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM collection_completions').fetchone()[0], 0)
+                self.assertEqual(db.execute('SELECT COUNT(*) FROM observations').fetchone()[0], 0)
+
+            # Seed expired and permanent rows directly to verify selective 35-day raw 1h pruning.
+            cutoff = target_end - collector.HOURLY_CACHE_RETENTION_DAYS * DAY
+            with closing(sqlite3.connect(db_path)) as db:
+                db.executemany(
+                    'INSERT INTO observations VALUES (?, ?, ?, ?, ?)',
+                    [
+                        ('src', 'q', HOUR, cutoff - HOUR, '{}'),
+                        ('src', 'q', HOUR, cutoff, '{}'),
+                        ('src', 'q', HOUR, cutoff + HOUR, '{}'),
+                        ('src', 'q', SAMPLED_HOUR_STEP, cutoff - 400 * DAY, '{}'),
+                        ('src', 'q', DAY, cutoff - 400 * DAY, '{}'),
+                    ],
+                )
+                db.executemany(
+                    'INSERT INTO collection_completions VALUES (?, ?)',
+                    [
+                        ('other-source', cutoff - 400 * DAY),
+                    ],
+                )
+                db.commit()
+
+            src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            res = collector.collect(cfg, ROOT, state_dir, root / 'out_ok.json',
+                                    end=target_end, source=src, config_path=cfg_file)
+            self.assertTrue(res['cache_committed'])
+            self.assertTrue(res['checkpoint_updated'])
+            source_id = json.loads((state_dir / 'checkpoint.json').read_text())['source_identity_sha256']
+            with closing(sqlite3.connect(db_path)) as db:
+                rem_first = {r[0] for r in db.execute('SELECT endpoint FROM observations WHERE query_sha=? AND step=?', ('q', HOUR))}
+                self.assertEqual(rem_first, {cutoff, cutoff + HOUR})
+
+            # Insert an older completion row for active source_id in next collect pass (cutoff advances to cutoff + HOUR).
+            with closing(sqlite3.connect(db_path)) as db:
+                db.execute('INSERT INTO collection_completions VALUES (?, ?)', (source_id, cutoff - HOUR))
+                db.commit()
+            res2 = collector.collect(cfg, ROOT, state_dir, root / 'out_ok2.json',
+                                     end=target_end + HOUR, source=src, config_path=cfg_file)
+            self.assertTrue(res2['cache_committed'])
+
+            with closing(sqlite3.connect(db_path)) as db:
+                rem_hour = {r[0] for r in db.execute('SELECT endpoint FROM observations WHERE query_sha=? AND step=?', ('q', HOUR))}
+                self.assertEqual(rem_hour, {cutoff + HOUR})
+                self.assertEqual(
+                    db.execute('SELECT COUNT(*) FROM observations WHERE query_sha=? AND step=?', ('q', SAMPLED_HOUR_STEP)).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    db.execute('SELECT COUNT(*) FROM observations WHERE query_sha=? AND step=?', ('q', DAY)).fetchone()[0],
+                    1,
+                )
+                other_comps = db.execute(
+                    'SELECT observation_end FROM collection_completions WHERE source_identity=?', ('other-source',)
+                ).fetchall()
+                self.assertEqual(other_comps, [(cutoff - 400 * DAY,)])
+                active_comps = sorted(r[0] for r in db.execute(
+                    'SELECT observation_end FROM collection_completions WHERE source_identity=?', (source_id,)
+                ).fetchall())
+                self.assertEqual(active_comps, [target_end, target_end + HOUR])
+
+                rows = db.execute(
+                    'SELECT observation_end, payload_zlib FROM hourly_archive WHERE source_identity=? ORDER BY observation_end',
+                    (source_id,),
+                ).fetchall()
+                self.assertEqual([r[0] for r in rows], [target_end, target_end + HOUR])
+                decoded = json.loads(zlib.decompress(rows[0][1]))
+                self.assertEqual(decoded['schema'], collector.HOURLY_ARCHIVE_SCHEMA)
+                self.assertEqual(decoded['end'], target_end)
+                self.assertEqual(decoded['window_seconds'], HOUR)
+                self.assertIn('dircache_cohort', decoded)
+                self.assertIn('snapshot_flags', decoded)
+                self.assertIn('versions', decoded)
+                self.assertIn('input_provenance', decoded)
+                first_series = decoded['charts'][0]['series'][0]
+                self.assertNotIn('history', first_series)
+                self.assertEqual(set(first_series), {
+                    'key', 'values', 'hourly_relays', 'hourly_expected_relays', 'current', 'relay_population_current',
+                })
+                self.assertEqual(set(first_series['relay_population_current']), {'hour', 'day'})
+                for field_name in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    self.assertEqual(len(first_series[field_name]), 1)
+                    self.assertEqual(first_series[field_name][0][0], target_end)
+                decoded2 = json.loads(zlib.decompress(rows[1][1]))
+                second_series = decoded2['charts'][0]['series'][0]
+                for field_name in ('values', 'hourly_relays', 'hourly_expected_relays'):
+                    self.assertEqual(len(second_series[field_name]), 1)
+                    self.assertEqual(second_series[field_name][0][0], target_end + HOUR)
+
+            # Existing non-empty DB with auto_vacuum = NONE keeps NONE cleanly without VACUUM.
+            legacy_db = root / 'legacy.sqlite3'
+            with closing(sqlite3.connect(legacy_db)) as db:
+                db.execute('CREATE TABLE legacy (x INTEGER)')
+                db.commit()
+                self.assertEqual(db.execute('PRAGMA auto_vacuum').fetchone()[0], 0)
+            legacy_db.chmod(0o600)
+            cache = collector.ObservationCache(legacy_db, src, queries)
+            try:
+                cache._mem[('s', 'q', HOUR, cutoff - HOUR)] = {'status': 'success', 'data': {'resultType': 'matrix', 'result': []}}
+                cache._mem[('s', 'q', HOUR, target_end)] = {'status': 'success', 'data': {'resultType': 'matrix', 'result': []}}
+                cache.prune_expired_hourly(cutoff)
+                self.assertNotIn(('s', 'q', HOUR, cutoff - HOUR), cache._mem)
+                self.assertIn(('s', 'q', HOUR, target_end), cache._mem)
+                cache.incremental_vacuum()
+                self.assertEqual(cache.db.execute('PRAGMA auto_vacuum').fetchone()[0], 0)
+            finally:
+                cache.close()
+
+            # Populated freelist on INCREMENTAL DB consumes all requested vacuum steps and shrinks file size.
+            vac_db = root / 'vac.sqlite3'
+            vac_cache = collector.ObservationCache(vac_db, src, queries)
+            try:
+                vac_cache.db.executemany(
+                    'INSERT INTO observations VALUES (?, ?, ?, ?, ?)',
+                    [('s', f'q{i}', HOUR, target_end + i * HOUR, 'x' * 2048) for i in range(120)],
+                )
+                vac_cache.commit()
+                size_peak = vac_db.stat().st_size
+                vac_cache.db.execute('DELETE FROM observations WHERE endpoint < ?', (target_end + 100 * HOUR,))
+                vac_cache.commit()
+                freelist_before = vac_cache.db.execute('PRAGMA freelist_count').fetchone()[0]
+                self.assertGreater(freelist_before, 20)
+                vac_cache.incremental_vacuum(10)
+                freelist_mid = vac_cache.db.execute('PRAGMA freelist_count').fetchone()[0]
+                self.assertEqual(freelist_before - freelist_mid, 10)
+                vac_cache.incremental_vacuum()
+                freelist_after = vac_cache.db.execute('PRAGMA freelist_count').fetchone()[0]
+                self.assertEqual(freelist_after, 0)
+                self.assertLess(vac_db.stat().st_size, size_peak)
+            finally:
+                vac_cache.close()
+
+    def test_export_hourly_archive_cli_and_validation(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+        t1, t2, t3 = seed_end + HOUR, seed_end + 2 * HOUR, seed_end + 3 * HOUR
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, _, _ = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+            state_dir = root / 'state'
+
+            # Missing state_dir must NOT be created.
+            with self.assertRaises(collector.CollectionError):
+                collector.export_hourly_archive(cfg, ROOT, state_dir, root / 'missing.jsonl', config_path=cfg_file)
+            self.assertFalse(state_dir.exists())
+
+            src = SyntheticSource(queries, _snapshot_handlers(base_v4, routes, rate_val=1.0))
+            for idx, end in enumerate((t1, t2, t3)):
+                collector.collect(cfg, ROOT, state_dir, root / f'snap_{idx}.json', end=end, source=src, config_path=cfg_file)
+
+            # Insert another source_identity row to prove filtering.
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                db.execute(
+                    'INSERT INTO hourly_archive VALUES (?, ?, ?, ?)',
+                    ('other-identity', t2, t2, sqlite3.Binary(zlib.compress(b'{"schema":1,"end":0,"charts":[]}'))),
+                )
+                db.commit()
+
+            # Read-only 0o500 state_dir succeeds via CLI without opening SSH or touching state_dir.
+            export_path = root / 'exports/archive.jsonl'
+            state_dir.chmod(0o500)
+            stdout = io.StringIO()
+            try:
+                with mock.patch.object(collector, 'SSHSource', side_effect=AssertionError('SSH must not open')), redirect_stdout(stdout):
+                    collector.main([
+                        '--config', str(cfg_file),
+                        '--state-dir', str(state_dir),
+                        '--export-hourly-archive', str(export_path),
+                    ])
+            finally:
+                state_dir.chmod(0o700)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary, {
+                'status': 'exported',
+                'rows': 3,
+                'first_observation_end': t1,
+                'last_observation_end': t3,
+            })
+            self.assertEqual(stat.S_IMODE(export_path.lstat().st_mode), 0o600)
+            exported_lines = [json.loads(ln) for ln in export_path.read_text(encoding='utf-8').splitlines()]
+            self.assertEqual([row['end'] for row in exported_lines], [t1, t2, t3])
+
+            # --start and --end slice inclusively (including endpoints before seed['end']).
+            sliced_path = root / 'exports/sliced.jsonl'
+            sliced = collector.export_hourly_archive(cfg, ROOT, state_dir, sliced_path, start=t2, end=t3, config_path=cfg_file)
+            self.assertEqual(sliced, {'status': 'exported', 'rows': 2, 'first_observation_end': t2, 'last_observation_end': t3})
+            self.assertEqual([json.loads(ln)['end'] for ln in sliced_path.read_text().splitlines()], [t2, t3])
+            pre_seed = collector.export_hourly_archive(
+                cfg, ROOT, state_dir, root / 'exports/pre_seed.jsonl',
+                start=seed_end - 10 * DAY, end=seed_end - DAY, config_path=cfg_file,
+            )
+            self.assertEqual(pre_seed['rows'], 0)
+
+            # Missing hourly_archive table exports 0 rows cleanly.
+            no_table_state = root / 'no_table_state'
+            no_table_state.mkdir(mode=0o700)
+            with closing(sqlite3.connect(no_table_state / 'observations.sqlite3')) as db:
+                db.execute('CREATE TABLE observations (source TEXT, query_sha TEXT, step INTEGER, endpoint INTEGER, payload TEXT)')
+                db.commit()
+            (no_table_state / 'observations.sqlite3').chmod(0o600)
+            empty_res = collector.export_hourly_archive(cfg, ROOT, no_table_state, root / 'empty.jsonl', config_path=cfg_file)
+            self.assertEqual(empty_res, {'status': 'exported', 'rows': 0, 'first_observation_end': None, 'last_observation_end': None})
+            self.assertEqual((root / 'empty.jsonl').read_text(), '')
+
+            # Symlink/directory target or --forbid-overlap rejected before touching output.
+            sym_out = root / 'sym-out.jsonl'
+            sym_out.symlink_to(export_path)
+            with self.assertRaisesRegex(collector.CollectionError, 'regular file'):
+                collector.export_hourly_archive(cfg, ROOT, state_dir, sym_out, config_path=cfg_file)
+            with self.assertRaisesRegex(collector.CollectionError, 'overlaps'):
+                collector.export_hourly_archive(cfg, ROOT, state_dir, root / 'blocked/out.jsonl',
+                                                config_path=cfg_file, forbid_overlap=[root / 'blocked'])
+
+            # Corrupt blob / mismatched end / oversized zip-bomb leave existing export untouched.
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                orig_blob = db.execute('SELECT payload_zlib FROM hourly_archive WHERE observation_end=?', (t2,)).fetchone()[0]
+                bomb_blob = zlib.compress(b'{' + b'"a":"' + b'x' * (collector.MAX_ARCHIVE_ROW_BYTES + 128) + b'"}', level=9)
+                for bad_label, bad_blob in (
+                    ('corrupt', b'not-zlib'),
+                    ('wrong-end', zlib.compress(b'{"schema":1,"end":0,"charts":[]}')),
+                    ('zip-bomb', bomb_blob),
+                ):
+                    db.execute('UPDATE hourly_archive SET payload_zlib=? WHERE observation_end=?', (sqlite3.Binary(bad_blob), t2))
+                    db.commit()
+                    before = sliced_path.read_bytes()
+                    with self.subTest(bad_label=bad_label), self.assertRaises(collector.CollectionError):
+                        collector.export_hourly_archive(cfg, ROOT, state_dir, sliced_path, config_path=cfg_file)
+                    self.assertEqual(sliced_path.read_bytes(), before)
+                db.execute('UPDATE hourly_archive SET payload_zlib=? WHERE observation_end=?', (orig_blob, t2))
+                db.commit()
+
+            # Concurrent export + collection commit regression: read transactions are released between batches
+            # so a concurrent commit in rollback-journal mode succeeds immediately without missing the archive endpoint.
+            t4 = t3 + HOUR
+            concurrent_out = root / 'exports/concurrent.jsonl'
+            orig_decompress = collector._decompress_archive_row
+            real_connect = collector.sqlite3.connect
+            commit_done = False
+
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                entry_source_id = db.execute(
+                    'SELECT source_identity FROM hourly_archive WHERE observation_end=?', (t1,)
+                ).fetchone()[0]
+
+            def decompress_and_race(blob):
+                nonlocal commit_done
+                raw = orig_decompress(blob)
+                if not commit_done:
+                    commit_done = True
+                    # Simulate concurrent collection commit with tiny 50ms busy timeout in rollback mode.
+                    next_data = copy.deepcopy(base_v4)
+                    next_data.update(start=t4 - DAY, end=t4)
+                    with mock.patch.object(
+                        collector.sqlite3, 'connect',
+                        side_effect=lambda p, *a, **kw: real_connect(p, timeout=0.05),
+                    ):
+                        wcache = collector.ObservationCache(state_dir / 'observations.sqlite3', src, queries)
+                        try:
+                            wcache.record_hourly_archive(entry_source_id, t4, next_data)
+                            wcache.record_completion(entry_source_id, t4)
+                            wcache.commit()
+                        finally:
+                            wcache.close()
+                return raw
+
+            with mock.patch.object(collector, 'ARCHIVE_EXPORT_BATCH_SIZE', 1), \
+                    mock.patch.object(collector, '_decompress_archive_row', side_effect=decompress_and_race):
+                race_res = collector.export_hourly_archive(
+                    cfg, ROOT, state_dir, concurrent_out, config_path=cfg_file,
+                )
+            self.assertTrue(commit_done)
+            self.assertEqual(race_res['rows'], 4)
+            self.assertEqual(
+                [json.loads(ln)['end'] for ln in concurrent_out.read_text().splitlines()],
+                [t1, t2, t3, t4],
+            )
+            with closing(sqlite3.connect(state_dir / 'observations.sqlite3')) as db:
+                self.assertEqual(
+                    db.execute(
+                        'SELECT COUNT(*) FROM hourly_archive WHERE source_identity=? AND observation_end=?',
+                        (entry_source_id, t4),
+                    ).fetchone()[0],
+                    1,
+                )
+
+            # Invalid CLI flags & bounds fail closed cleanly.
+            for argv in (
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--plan', '--export-hourly-archive', str(export_path)],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--output', str(root / 'o.json'), '--export-hourly-archive', str(export_path)],
+                ['--config', str(cfg_file), '--state-dir', str(state_dir), '--output', str(root / 'o.json'), '--start', str(t1)],
+            ):
+                with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited:
+                    collector.main(argv)
+                self.assertEqual(exited.exception.code, 2)
+
+            stderr = io.StringIO()
+            with redirect_stderr(stderr), self.assertRaises(SystemExit) as exited:
+                collector.main([
+                    '--config', str(cfg_file), '--state-dir', str(state_dir),
+                    '--export-hourly-archive', str(export_path), '--start', str(t3), '--end', str(t1),
+                ])
+            self.assertEqual(exited.exception.code, 1)
+            self.assertEqual(stderr.getvalue(), 'Hourly archive export failed.\n')
 
 
 if __name__ == '__main__':

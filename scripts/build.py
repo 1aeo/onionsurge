@@ -192,12 +192,13 @@ def write_outputs(data, reference_json, stage, *, live=False):
     (stage / data['reference_document']).write_bytes(reference_json.encode('utf-8'))
     compact_json = json_text(data, pretty=False)
     (stage / 'data.json').write_text(compact_json if live else json_text(data, pretty=True), encoding='utf-8')
-    (stage / 'data.js').write_text(javascript_data(data, compact_json=compact_json), encoding='utf-8')
-    fields = ['id', 'title', 'family_id', 'definition', 'metrics', 'metric_origin', 'kind', 'unit',
-              'display_unit', 'headline_unit', 'display_scale', 'query', 'quality_query', 'history_queries', 'builds']
-    catalogue = {'families': data['families'], 'charts': [{k: c[k] for k in fields} for c in data['charts']],
-                 'methods': data.get('history_methods')}
-    (stage / 'catalogue.json').write_text(json_text(catalogue, pretty=True), encoding='utf-8')
+    if not live:
+        (stage / 'data.js').write_text(javascript_data(data, compact_json=compact_json), encoding='utf-8')
+        fields = ['id', 'title', 'family_id', 'definition', 'metrics', 'metric_origin', 'kind', 'unit',
+                  'display_unit', 'headline_unit', 'display_scale', 'query', 'quality_query', 'history_queries', 'builds']
+        catalogue = {'families': data['families'], 'charts': [{k: c[k] for k in fields} for c in data['charts']],
+                     'methods': data.get('history_methods')}
+        (stage / 'catalogue.json').write_text(json_text(catalogue, pretty=True), encoding='utf-8')
     (stage / 'exports').mkdir(exist_ok=True)
     timestamp_labels = {}
     for chart in data['charts']:

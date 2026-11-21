@@ -2,7 +2,7 @@
 """Collect public Tor aggregates through a fixed-query SSH gateway."""
 import argparse
 from collections import OrderedDict, defaultdict, deque
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import copy
 import datetime as dt
 import json
@@ -15,7 +15,9 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -55,6 +57,12 @@ COLLECTION_OVERHEAD_SECONDS = 60
 MAX_CONFIG_BYTES = 65536
 MAX_KNOWN_HOSTS_BYTES = 65536
 MAX_SEED_BYTES = 64 * 1024 * 1024
+HOURLY_ARCHIVE_SCHEMA = 1
+MAX_ARCHIVE_ROW_BYTES = 8 * 1024 * 1024
+HOURLY_CACHE_RETENTION_DAYS = 35
+INCREMENTAL_VACUUM_PAGES = 256
+ARCHIVE_EXPORT_BATCH_SIZE = 128
+SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 _ENV_LINE_RE = re.compile(r'(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=(.*)')
 _HOME_VAR_RE = re.compile(r'\$\{HOME\}|\$HOME(?![A-Za-z0-9_])')
 _POP_CODE_RE = re.compile(r'0|[1-9][0-9]?')
@@ -136,9 +144,9 @@ def number(value, count=False):
     return int(result) if count else result
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, before_replace=None):
     atomic_text(path, json.dumps(value, allow_nan=False, separators=(',', ':')) + '\n',
-                mode=0o600, preserve_mode=False, dir_mode=0o700)
+                mode=0o600, preserve_mode=False, dir_mode=0o700, before_replace=before_replace)
 
 
 @contextmanager
@@ -234,6 +242,50 @@ def _clone_payload(payload):
     }
 
 
+def _endpoint_pairs(pairs, target_end):
+    return [list(pair) for pair in pairs if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0] == target_end]
+
+
+def _build_hourly_archive_entry(data):
+    """Extract only the endpoint hour's unique coarsened delta without duplicating 24h windows or histories."""
+    target_end = data['end']
+    return {
+        'schema': HOURLY_ARCHIVE_SCHEMA,
+        'start': data['start'],
+        'end': target_end,
+        'window_seconds': data['window_seconds'],
+        'fleet': data['fleet'],
+        'custom': data['custom'],
+        'defense': data['defense'],
+        'dircache_cohort': data['dircache_cohort'],
+        'flags': data['flags'],
+        'snapshot_flags': data['snapshot_flags'],
+        'versions': data['versions'],
+        'input_provenance': data['input_provenance'],
+        'charts': [
+            {
+                'id': chart['id'],
+                'relays': chart['relays'],
+                'series': [
+                    {
+                        'key': series['key'],
+                        'values': _endpoint_pairs(series['values'], target_end),
+                        'hourly_relays': _endpoint_pairs(series['hourly_relays'], target_end),
+                        'hourly_expected_relays': _endpoint_pairs(series['hourly_expected_relays'], target_end),
+                        'current': series['current'],
+                        'relay_population_current': {
+                            'hour': (series.get('relay_population') or {}).get('hour'),
+                            'day': (series.get('relay_population') or {}).get('day'),
+                        },
+                    }
+                    for series in chart['series']
+                ],
+            }
+            for chart in data['charts']
+        ],
+    }
+
+
 class ObservationCache:
     """Immutable evaluated endpoints; absence is cached separately from zero."""
     MAX_MEM_ENTRIES = 2048
@@ -249,18 +301,81 @@ class ObservationCache:
         else:
             _require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o077,
                      'Observation cache must be a private owned regular file')
-        self.db = sqlite3.connect(path)
+        self.db = sqlite3.connect(path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
         try:
+            if self.db.execute('PRAGMA page_count').fetchone()[0] == 0:
+                self.db.execute('PRAGMA auto_vacuum = INCREMENTAL')
             self.db.execute('CREATE TABLE IF NOT EXISTS observations '
                             '(source TEXT, query_sha TEXT, step INTEGER, endpoint INTEGER, payload TEXT, '
                             'PRIMARY KEY(source, query_sha, step, endpoint))')
             self.db.execute('CREATE TABLE IF NOT EXISTS collection_completions '
                             '(source_identity TEXT NOT NULL, observation_end INTEGER NOT NULL, '
                             'PRIMARY KEY (source_identity, observation_end))')
+            self.db.execute('CREATE TABLE IF NOT EXISTS hourly_archive '
+                            '(source_identity TEXT NOT NULL, observation_end INTEGER NOT NULL, '
+                            'archived_at INTEGER NOT NULL, payload_zlib BLOB NOT NULL, '
+                            'PRIMARY KEY (source_identity, observation_end))')
             self.db.commit()
         except BaseException:
             self.db.close()
             raise
+
+    def record_hourly_archive(self, source_identity, observation_end, data, archived_at=None):
+        """Store compressed unique hourly coarsened delta in the current transaction."""
+        _require(type(observation_end) is int and data.get('end') == observation_end,
+                 'Archive observation endpoint mismatch')
+        entry = _build_hourly_archive_entry(data)
+        raw = json.dumps(entry, allow_nan=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        _require(len(raw) <= MAX_ARCHIVE_ROW_BYTES, 'Archived hourly payload exceeds size limit')
+        payload_zlib = zlib.compress(raw, level=6)
+        ts = int(time.time()) if archived_at is None else int(archived_at)
+        self.db.execute(
+            'INSERT OR REPLACE INTO hourly_archive (source_identity, observation_end, archived_at, payload_zlib) '
+            'VALUES (?, ?, ?, ?)',
+            (source_identity, observation_end, ts, sqlite3.Binary(payload_zlib)),
+        )
+
+    def prune_expired_hourly(self, cutoff_end):
+        """Prune expired raw 1h scrape cache rows while retaining daily and sampled_hour forever."""
+        _require(type(cutoff_end) is int, 'Invalid hourly prune cutoff')
+        self.db.execute('DELETE FROM observations WHERE step = ? AND endpoint < ?', (HOUR, cutoff_end))
+        self.db.execute(
+            'DELETE FROM collection_completions '
+            'WHERE observation_end < ? AND observation_end < ('
+            'SELECT MAX(c2.observation_end) FROM collection_completions c2 '
+            'WHERE c2.source_identity = collection_completions.source_identity)',
+            (cutoff_end,),
+        )
+        for key in [k for k in self._mem if k[2] == HOUR and k[3] < cutoff_end]:
+            del self._mem[key]
+
+    def incremental_vacuum(self, pages=INCREMENTAL_VACUUM_PAGES):
+        """Return freed pages to the OS cleanly when incremental auto_vacuum is enabled."""
+        if type(pages) is not int or pages <= 0:
+            return
+        try:
+            row = self.db.execute('PRAGMA auto_vacuum').fetchone()
+            if row is not None and row[0] == 2:
+                remaining = pages
+                steps = 0
+                while remaining > 0 and steps < pages:
+                    steps += 1
+                    free_row = self.db.execute('PRAGMA freelist_count').fetchone()
+                    free = free_row[0] if free_row is not None else 0
+                    if free <= 0:
+                        break
+                    if remaining >= INCREMENTAL_VACUUM_PAGES:
+                        self.db.execute('PRAGMA incremental_vacuum(256)').fetchall()
+                    else:
+                        self.db.execute('PRAGMA incremental_vacuum(1)').fetchall()
+                    after_row = self.db.execute('PRAGMA freelist_count').fetchone()
+                    after = after_row[0] if after_row is not None else free
+                    freed = free - after
+                    if freed <= 0:
+                        break
+                    remaining -= freed
+        except sqlite3.Error:
+            pass
 
     def record_completion(self, source_identity, observation_end):
         """Record an in-transaction completion proof committed atomically with observation rows."""
@@ -903,13 +1018,14 @@ def _require_private_dir(path, missing_message, invalid_message):
     _require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not (info.st_mode & 0o077), invalid_message)
 
 
-def _cache_has_completion(db_path, source_id, obs_end, *, require_match=False):
-    missing_msg = 'Observation cache must contain a committed completion record matching this configuration and endpoint'
+def _open_readonly_cache(db_path, *, fail_if_missing=False, fail_if_unindexed_wal=False,
+                         missing_message='Observation cache database is missing'):
     try:
         fd = os.open(db_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        _require(not require_match, missing_msg)
-        return False
+    except FileNotFoundError as error:
+        if fail_if_missing:
+            raise CollectionError(missing_message) from error
+        return None
     except OSError as error:
         raise CollectionError('Observation cache must be a private owned regular file') from error
     try:
@@ -939,31 +1055,46 @@ def _cache_has_completion(db_path, source_id, obs_end, *, require_match=False):
                      'Observation cache sidecar must be a private owned regular file')
             sidecars[suffix] = True
     if info.st_size == 0:
-        _require(not require_match, missing_msg)
-        return False
+        if fail_if_missing:
+            raise CollectionError(missing_message)
+        return None
     if len(header) < 20 or header[:16] != b'SQLite format 3\x00':
         raise CollectionError('Invalid observation cache database')
-    # Never bypass locking with immutable=1; skip opening unindexed WAL caches that lack -shm so planning stays strictly non-mutating.
+    # Never bypass locking with immutable=1; skip opening unindexed WAL caches that lack -shm so inspection stays strictly non-mutating.
     is_wal = header[18] == 2 or header[19] == 2
     if is_wal and not sidecars['-shm']:
-        _require(not require_match,
-                 'Observation cache WAL requires an active shared-memory index or checkpointed journal')
+        if fail_if_unindexed_wal:
+            raise CollectionError('Observation cache WAL requires an active shared-memory index or checkpointed journal')
+        return None
+    try:
+        return sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?mode=ro',
+                               uri=True, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+    except sqlite3.Error as error:
+        raise CollectionError('Invalid observation cache database') from error
+
+
+def _cache_has_completion(db_path, source_id, obs_end, *, require_match=False):
+    missing_msg = 'Observation cache must contain a committed completion record matching this configuration and endpoint'
+    conn = _open_readonly_cache(
+        db_path,
+        fail_if_missing=require_match,
+        fail_if_unindexed_wal=require_match,
+        missing_message=missing_msg,
+    )
+    if conn is None:
         return False
     try:
-        conn = sqlite3.connect(f'{db_path.resolve(strict=True).as_uri()}?mode=ro', uri=True)
-        try:
+        with closing(conn):
             has_obs = conn.execute('SELECT 1 FROM observations LIMIT 1').fetchone() is not None
             has_comp = conn.execute(
                 'SELECT 1 FROM collection_completions WHERE source_identity=? AND observation_end=? LIMIT 1',
                 (source_id, obs_end),
             ).fetchone() is not None
             return has_obs and has_comp
-        except sqlite3.OperationalError as error:
-            if not require_match and 'no such table' in str(error).lower():
-                return False
-            raise CollectionError('Invalid observation cache database') from error
-        finally:
-            conn.close()
+    except sqlite3.OperationalError as error:
+        if not require_match and 'no such table' in str(error).lower():
+            return False
+        raise CollectionError('Invalid observation cache database') from error
     except sqlite3.Error as error:
         raise CollectionError('Invalid observation cache database') from error
 
@@ -1159,7 +1290,8 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
 
 
 def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
-                     config_path=None, config_bytes=None, forbid_overlap=(), output=None, require_ssh=False):
+                     config_path=None, config_bytes=None, forbid_overlap=(), output=None, require_ssh=False,
+                     check_end=True):
     app = Path(ROOT if application_dir is None else application_dir).resolve()
     state = Path(state_dir).absolute()
     cfg_path = expand_path(config_path) if config_path is not None else None
@@ -1215,14 +1347,16 @@ def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
         _assert_disjoint(protected, forbid_overlap, 'Collector configuration or state overlaps forbidden directory')
 
     now_hour = (int(time.time()) // HOUR) * HOUR
-    end = now_hour if end is None else end
-    _require(type(end) is int and end % HOUR == 0 and end <= now_hour,
-             'Collection end must be a completed UTC hour at or after the seed')
+    if check_end:
+        end = now_hour if end is None else end
+        _require(type(end) is int and end % HOUR == 0 and end <= now_hour,
+                 'Collection end must be a completed UTC hour at or after the seed')
     seed_bytes = _read_bounded(seed_path, MAX_SEED_BYTES, private=private_seed)
     seed_obj = parse_json(seed_bytes)
     validate_snapshot(seed_obj, allow_v3_seed=True)
-    _require(seed_obj['end'] <= end,
-             'Collection end must be a completed UTC hour at or after the seed')
+    if check_end:
+        _require(seed_obj['end'] <= end,
+                 'Collection end must be a completed UTC hour at or after the seed')
     queries_bytes = _read_bounded(queries_path, MAX_SEED_BYTES)
     routes_bytes = _read_bounded(routes_path, MAX_SEED_BYTES)
     queries, routes = parse_json(queries_bytes), parse_json(routes_bytes)
@@ -1338,31 +1472,25 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
                 try:
                     data = Collector(source, cache, queries, routes, seed_obj).collect(target_end, ctx['seed_sha'])
                     validate_snapshot(data)
-                    atomic_json(out, data)
+                    cache.record_hourly_archive(source_id, target_end, data)
+                    cache.record_completion(source_id, target_end)
+                    cache.prune_expired_hourly(target_end - HOURLY_CACHE_RETENTION_DAYS * DAY)
+                    atomic_json(out, data, before_replace=cache.commit)
                 except BaseException:
                     try:
                         cache.rollback()
                     except (sqlite3.Error, OSError):
                         pass
                     raise
+                cache_committed = True
+                cache.incremental_vacuum()
                 try:
-                    cache.record_completion(source_id, target_end)
-                    cache.commit()
-                except (sqlite3.Error, OSError):
-                    try:
-                        cache.rollback()
-                    except (sqlite3.Error, OSError):
-                        pass
-                    sys.stderr.write('Collection warning: observation cache commit failed after snapshot publication.\n')
+                    atomic_json(state / 'checkpoint.json',
+                                {'source_identity_sha256': source_id, 'observation_end': target_end})
+                except OSError:
+                    sys.stderr.write('Collection warning: collector checkpoint update failed after snapshot publication.\n')
                 else:
-                    cache_committed = True
-                    try:
-                        atomic_json(state / 'checkpoint.json',
-                                    {'source_identity_sha256': source_id, 'observation_end': target_end})
-                    except OSError:
-                        sys.stderr.write('Collection warning: collector checkpoint update failed after snapshot publication.\n')
-                    else:
-                        checkpoint_updated = True
+                    checkpoint_updated = True
             finally:
                 cache.close()
     finally:
@@ -1373,13 +1501,154 @@ def collect(config, application_dir, state_dir, output, end=None, source=None, s
             'checkpoint_updated': checkpoint_updated}
 
 
+def _decompress_archive_row(blob):
+    _require(isinstance(blob, (bytes, bytearray, memoryview)) and len(blob) <= MAX_ARCHIVE_ROW_BYTES + 65536,
+             'Invalid archived payload')
+    decomp = zlib.decompressobj()
+    try:
+        raw = decomp.decompress(bytes(blob), MAX_ARCHIVE_ROW_BYTES + 1)
+        tail = decomp.flush(MAX_ARCHIVE_ROW_BYTES + 1 - len(raw)) if len(raw) <= MAX_ARCHIVE_ROW_BYTES else b''
+    except zlib.error as error:
+        raise CollectionError('Corrupt archived hourly payload') from error
+    raw += tail
+    _require(len(raw) <= MAX_ARCHIVE_ROW_BYTES and not decomp.unconsumed_tail and decomp.eof and not decomp.unused_data,
+             'Invalid archived hourly payload')
+    return raw
+
+
+def export_hourly_archive(config, application_dir, state_dir, output, start=None, end=None, seed=None, *,
+                          config_path=None, config_bytes=None, forbid_overlap=()):
+    """Export verified compressed hourly_archive rows as ordered 0600 JSON Lines without opening SSH."""
+    if start is not None:
+        _require(type(start) is int and start >= 0 and start % HOUR == 0,
+                 'Export start must be a non-negative UTC hour')
+    if end is not None:
+        _require(type(end) is int and end >= 0 and end % HOUR == 0,
+                 'Export end must be a non-negative UTC hour')
+    if start is not None and end is not None:
+        _require(start <= end, 'Export start must not exceed export end')
+    out = expand_path(output)
+    try:
+        out_info = out.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise CollectionError('Export output must be a regular file') from error
+    else:
+        _require(not stat.S_ISLNK(out_info.st_mode) and stat.S_ISREG(out_info.st_mode),
+                 'Export output must be a regular file')
+    ctx = _prepare_context(config, application_dir, state_dir, seed=seed,
+                           config_path=config_path, config_bytes=config_bytes,
+                           forbid_overlap=forbid_overlap, output=out, require_ssh=True, check_end=False)
+    if forbid_overlap:
+        _assert_disjoint([out], forbid_overlap, 'Collector output overlaps forbidden directory')
+    state = ctx['state']
+    _require_private_dir(state, 'Collector state directory is missing',
+                         'Collector state directory must be private owned')
+    source_id = _compute_source_identity(
+        ctx['config_digest'], sha256_hex(ctx['known_hosts_bytes']),
+        ctx['seed_sha'], ctx['queries_sha'], ctx['routes_sha'],
+    )
+    conn = _open_readonly_cache(
+        state / 'observations.sqlite3',
+        fail_if_missing=True,
+        fail_if_unindexed_wal=True,
+        missing_message='Observation cache database is missing',
+    )
+    batch_size = max(1, int(ARCHIVE_EXPORT_BATCH_SIZE))
+    rows_written = 0
+    first_end = None
+    last_end = None
+    previous_umask = os.umask(0o077)
+    temporary = None
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.NamedTemporaryFile(
+            mode='w', encoding='utf-8', newline='\n', dir=out.parent,
+            prefix='.' + out.name + '.', suffix='.tmp', delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o600)
+            with closing(conn):
+                last_obs = None
+                while True:
+                    sql = ['SELECT observation_end, payload_zlib FROM hourly_archive WHERE source_identity = ?']
+                    params = [source_id]
+                    if last_obs is not None:
+                        sql.append('AND observation_end > ?')
+                        params.append(last_obs)
+                    elif start is not None:
+                        sql.append('AND observation_end >= ?')
+                        params.append(start)
+                    if end is not None:
+                        sql.append('AND observation_end <= ?')
+                        params.append(end)
+                    sql.append('ORDER BY observation_end ASC LIMIT ?')
+                    params.append(batch_size)
+                    try:
+                        cursor = conn.execute(' '.join(sql), params)
+                        try:
+                            rows = cursor.fetchall()
+                        finally:
+                            cursor.close()
+                        conn.rollback()
+                    except sqlite3.OperationalError as error:
+                        if 'no such table' not in str(error).lower():
+                            raise CollectionError('Invalid observation cache database') from error
+                        rows = ()
+                    except sqlite3.Error as error:
+                        raise CollectionError('Invalid observation cache database') from error
+                    if not rows:
+                        break
+                    for obs_end, blob in rows:
+                        raw = _decompress_archive_row(blob)
+                        entry = parse_json(raw)
+                        _require(
+                            isinstance(entry, dict) and entry.get('schema') == HOURLY_ARCHIVE_SCHEMA
+                            and entry.get('end') == obs_end and isinstance(entry.get('charts'), list),
+                            'Invalid archived hourly payload',
+                        )
+                        handle.write(json.dumps(entry, allow_nan=False, sort_keys=True, separators=(',', ':')) + '\n')
+                        if first_end is None:
+                            first_end = obs_end
+                        last_end = obs_end
+                        rows_written += 1
+                    last_obs = rows[-1][0]
+                    if len(rows) < batch_size:
+                        break
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, out)
+        temporary = None
+        dir_fd = os.open(out.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+        os.umask(previous_umask)
+    return {
+        'status': 'exported',
+        'rows': rows_written,
+        'first_observation_end': first_end,
+        'last_observation_end': last_end,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--application-dir', type=Path, default=ROOT)
     parser.add_argument('--state-dir', type=Path, required=True)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--export-hourly-archive', type=Path)
     parser.add_argument('--seed', type=Path)
+    parser.add_argument('--start', type=int)
     parser.add_argument('--end', type=int)
     parser.add_argument('--plan', action='store_true')
     parser.add_argument('--record-checkpoint', action='store_true')
@@ -1387,19 +1656,26 @@ def main(argv=None):
     parser.add_argument('--max-catchup-days', type=int)
     parser.add_argument('--forbid-overlap', action='append', type=Path, default=[])
     args = parser.parse_args(argv)
-    if args.plan and args.record_checkpoint:
-        parser.error('Cannot combine --plan and --record-checkpoint')
-    if (args.plan or args.record_checkpoint) and args.output is not None:
-        parser.error('--output cannot be used with --plan or --record-checkpoint')
-    if not args.plan and not args.record_checkpoint and args.output is None:
-        parser.error('--output is required unless using --plan or --record-checkpoint')
+    mode_count = (
+        int(args.plan)
+        + int(args.record_checkpoint)
+        + int(args.export_hourly_archive is not None)
+        + int(args.output is not None)
+    )
+    if mode_count > 1:
+        parser.error('Cannot combine --plan, --record-checkpoint, --export-hourly-archive, and --output')
+    if mode_count == 0:
+        parser.error('--output is required unless using --plan, --record-checkpoint, or --export-hourly-archive')
     if args.record_checkpoint and args.end is None:
         parser.error('--end is required with --record-checkpoint')
+    if args.start is not None and args.export_hourly_archive is None:
+        parser.error('--start requires --export-hourly-archive')
     if not args.plan and (args.previous_end is not None or args.max_catchup_days is not None):
         parser.error('--previous-end and --max-catchup-days require --plan')
     max_catchup_days = 31 if args.max_catchup_days is None else args.max_catchup_days
     failure_message = ('Collection plan failed.\n' if args.plan else
                        'Checkpoint recording failed.\n' if args.record_checkpoint else
+                       'Hourly archive export failed.\n' if args.export_hourly_archive is not None else
                        'Collection failed; previous snapshot retained.\n')
     try:
         config_path = expand_path(args.config)
@@ -1415,6 +1691,11 @@ def main(argv=None):
             result = record_checkpoint(config, app_dir, state_dir, args.end, seed=args.seed,
                                        config_path=config_path, config_bytes=config_bytes,
                                        forbid_overlap=forbidden)
+        elif args.export_hourly_archive is not None:
+            result = export_hourly_archive(config, app_dir, state_dir, expand_path(args.export_hourly_archive),
+                                           start=args.start, end=args.end, seed=args.seed,
+                                           config_path=config_path, config_bytes=config_bytes,
+                                           forbid_overlap=forbidden)
         else:
             result = collect(config, app_dir, state_dir, expand_path(args.output), args.end, seed=args.seed,
                              config_path=config_path, config_bytes=config_bytes, forbid_overlap=forbidden)

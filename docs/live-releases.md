@@ -8,11 +8,11 @@ verified immutable release.
 python3 scripts/build.py --live --input /path/to/public-snapshot.json --output dist-live
 ```
 
-`build-manifest.json` keeps the `onionsurge-build-v1` format and declares
-`mode: "live"` or `mode: "offline"`. Live output includes the normal data,
-reference and CSV artifacts for the publisher. Its `data.json` is compact JSON.
-The live HTML sets `data-mode="live"`, loads `app.js` followed by `live.js`, and
-never executes the saved `data.js`. Production frontend staging selects only
+`build-manifest.json` keeps the `onionsurge-build-v1` format (`schema_version: 7`, `release_objects`) and declares
+`mode: "live"` or `mode: "offline"`. Live output omits offline-only `data.js` and
+`catalogue.json` and emits only the compact `data.json`, reference, CSV artifacts,
+and live frontend assets. The live HTML sets `data-mode="live"`, loads `app.js` followed by `live.js`, and
+never executes `data.js`. Production frontend staging selects only
 `index.html`, `app.js`, `live.js` and `style.css`; data publication is separate.
 The offline packager rejects a live build before creating a new reservation.
 

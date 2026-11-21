@@ -100,7 +100,7 @@ def read_json(path):
     return parse_json(Path(path).read_bytes())
 
 
-def atomic_text(path, text, *, mode=None, preserve_mode=True, dir_mode=0o777):
+def atomic_text(path, text, *, mode=None, preserve_mode=True, dir_mode=0o777, before_replace=None):
     supported_writes()
     if not isinstance(text, str):
         raise TypeError('atomic_text requires str')
@@ -125,6 +125,8 @@ def atomic_text(path, text, *, mode=None, preserve_mode=True, dir_mode=0o777):
             if target_mode is not None:
                 os.chmod(temporary, target_mode)
             os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary, path)
         temporary = None
     except BaseException as error:
