@@ -2859,6 +2859,121 @@ copyCtrl.app.start();
   const validHourCov=structuredClone(v7NonMidnight.time_ranges);
   validHourCov.periods[0].minimum_coverage=0;
   assert.equal(ui.validateTimeRanges(validHourCov),validHourCov,'validateTimeRanges accepts 24h with minimum_coverage=0');
+
+  // Concurrent family alerts KPI lists all alerted families (no truncation) and links each to #family-<id>.
+  const makeAlertDataset=(src,period,states)=>{
+   const doc=structuredClone(src);
+   for(const [idx,fam]of doc.families.entries()){
+    const st=states[idx]||'neutral';
+    for(const cid of fam.children){
+     for(const s of chart(cid,doc).series){
+      s.reference[period]={n:120,current_percentile:st==='high'?99:st==='elevated'?92:25,flat_zero:false,start:doc.reference_window.start,end:doc.reference_window.end};
+      if(s.current[period])s.current[period].valid=true;
+     }
+    }
+   }
+   return doc;
+  };
+  const allNormalDaily=makeAlertDataset(v6Data,'day',Array(v6Data.families.length).fill('neutral'));
+  const zeroAlertHtml=application('?view=overview',allNormalDaily).app.markup();
+  assert.match(zeroAlertHtml,/0 of 6 <small>families ≥90th pct<\/small>.*No qualifying family alerts/);
+  assert.doesNotMatch(zeroAlertHtml,/class="hero-alert-list"|data-family-jump/);
+
+  for(const [baseDoc,period,states]of[
+   [v7NonMidnight,'hour',['elevated','high','elevated','neutral','high','elevated']],
+   [v6Data,'day',['high','neutral','elevated','elevated','high','elevated']],
+  ]){
+   const multiDoc=makeAlertDataset(baseDoc,period,states);
+   const ctrl=application('?view=overview',multiDoc);
+   ctrl.app.start();
+   const links=ctrl.browser.document.querySelectorAll('[data-family-jump]');
+   const expectedFams=multiDoc.families.filter((_,i)=>states[i]==='high'||states[i]==='elevated');
+   assert.equal(links.length,expectedFams.length,'lists every alerted family without truncation');
+   assert.doesNotMatch(ctrl.page.innerHTML,/>\+\d+</,'never truncates extra alerted families with +N');
+   assert.match(ctrl.page.innerHTML,/<ul class="hero-alert-list" aria-label="Alerted families">/);
+   const articles=ctrl.browser.document.querySelectorAll('article[tabindex]');
+   assert.equal(articles.length,multiDoc.families.length,'all family cards support programmatic focus');
+   links.forEach((link,idx)=>{
+    const fam=expectedFams[idx],sev=states[multiDoc.families.findIndex(f=>f.id===fam.id)];
+    assert.equal(link.getAttribute('href'),'#family-'+encodeURIComponent(fam.id));
+    assert.equal(link.dataset.familyJump,fam.id);
+    assert.equal(link.textContent,`${fam.icon} ${fam.title}`);
+    assert.ok(link.getAttribute('class').split(/\s+/).includes(sev));
+    assert.ok(ctrl.browser.document.getElementById('family-'+fam.id),'target family article exists');
+   });
+  }
+
+  // Clicking a hero alert link preserves query params, scrolls & focuses #family-<id>, skips duplicate history pushes, handles popstate & modifiers.
+  const navAlertDoc=makeAlertDataset(v7NonMidnight,'hour',['neutral','high','elevated','neutral','neutral','neutral']);
+  const navCtrl=application('?view=overview&range=all&hero_range=7d',navAlertDoc,'1',releaseContext(navAlertDoc,'jump-1',()=>navAlertDoc.end));
+  navCtrl.app.start();
+  const dirLink=navCtrl.browser.document.querySelector('[data-family-jump="directory"]');
+  const dirCard=navCtrl.browser.document.getElementById('family-directory');
+  assert.ok(dirLink&&dirCard);
+  const scrollCalls=[];
+  dirCard.scrollIntoView=opts=>{scrollCalls.push(opts);};
+  let prevented=0;
+  navCtrl.events.get('click')({target:dirLink,button:0,preventDefault(){prevented++;}});
+  assert.equal(prevented,1);
+  assert.equal(navCtrl.browser.location.search,'?view=overview&range=all&hero_range=7d','hash jump preserves existing query parameters');
+  assert.equal(navCtrl.browser.location.hash,'#family-directory');
+  assert.deepEqual(scrollCalls,[{block:'start'}]);
+  assert.equal(navCtrl.browser.document.activeElement,dirCard,'focus moves to target family card');
+
+  // Repeat click on the already-active hash scrolls & focuses again without pushing a duplicate history entry.
+  navCtrl.events.get('click')({target:dirLink,button:0,preventDefault(){prevented++;}});
+  assert.equal(prevented,2);
+  assert.equal(scrollCalls.length,2);
+  navCtrl.back();
+  assert.equal(navCtrl.browser.location.hash,'','single Back returns before repeated jump');
+  assert.equal(navCtrl.browser.document.activeElement,navCtrl.browser.document.querySelector('[data-view-heading]'));
+  navCtrl.forward();
+  assert.equal(navCtrl.browser.location.hash,'#family-directory');
+  assert.equal(navCtrl.browser.document.activeElement.getAttribute('id'),'family-directory');
+
+  // Live replaceRelease preserves focus both on #family-<id> cards and on [data-family-jump] links.
+  navCtrl.app.replaceRelease(structuredClone(navAlertDoc),releaseContext(navAlertDoc,'jump-2',()=>navAlertDoc.end));
+  assert.equal(navCtrl.browser.document.activeElement.getAttribute('id'),'family-directory','replaceRelease restores focus on family card');
+  navCtrl.browser.document.querySelector('[data-family-jump="circuits"]').focus({preventScroll:true});
+  navCtrl.app.replaceRelease(structuredClone(navAlertDoc),releaseContext(navAlertDoc,'jump-3',()=>navAlertDoc.end));
+  assert.equal(navCtrl.browser.document.activeElement,navCtrl.browser.document.querySelector('[data-family-jump="circuits"]'),'replaceRelease restores focus on alert jump link');
+
+  // Modified clicks let the browser open #family-<id> in a new tab/window natively.
+  for(const mod of [{metaKey:true},{ctrlKey:true},{shiftKey:true},{altKey:true},{button:1}]){
+   let modPrevented=false;
+   navCtrl.events.get('click')({target:navCtrl.browser.document.querySelector('[data-family-jump="circuits"]'),button:0,...mod,preventDefault(){modPrevented=true;}});
+   assert.equal(modPrevented,false);
+   assert.equal(navCtrl.browser.location.hash,'#family-directory');
+  }
+
+  // Hostile family id & title are safely escaped in attributes/text and click resolves getElementById safely without selector errors.
+  const hostileDoc=makeAlertDataset(v7NonMidnight,'hour',['high','neutral','neutral','neutral','neutral','neutral']);
+  const hostileId='bad"id<1>& a%b';
+  hostileDoc.families[0].id=hostileId;
+  hostileDoc.families[0].title='Conn <script> & "floods"';
+  for(const cid of hostileDoc.families[0].children)chart(cid,hostileDoc).family_id=hostileId;
+  const hostileCtrl=application('?view=overview',hostileDoc);
+  hostileCtrl.app.start();
+  const hostileHtml=hostileCtrl.page.innerHTML;
+  assert.doesNotMatch(hostileHtml,/<script>/);
+  assert.match(hostileHtml,/01 Conn &lt;script&gt; &amp; &quot;floods&quot;/);
+  const hostileLink=hostileCtrl.browser.document.querySelectorAll('[data-family-jump]')[0];
+  assert.equal(hostileLink.getAttribute('href'),'#family-'+encodeURIComponent(hostileId));
+  assert.equal(hostileLink.dataset.familyJump,hostileId);
+  const hostileCard=hostileCtrl.browser.document.getElementById('family-'+hostileId);
+  assert.ok(hostileCard);
+  hostileCtrl.events.get('click')({target:hostileLink,button:0,preventDefault(){}});
+  assert.equal(hostileCtrl.browser.location.hash,'#family-'+encodeURIComponent(hostileId));
+  assert.equal(hostileCtrl.browser.document.activeElement,hostileCard);
+
+  // Sticky-header scroll-margin, focus outline suppression for article[id], and mobile .hero-alert-link overrides.
+  assert.match(latestCss,/h3\[id\],article\[id\]\s*\{\s*scroll-margin-top:\s*var\(--header-offset,80px\);/);
+  const artFocusIdx=latestCss.indexOf('article[id]:focus { outline: none; }');
+  const artVisIdx=latestCss.indexOf('article[id]:focus-visible');
+  assert.ok(artFocusIdx>=0&&artVisIdx>artFocusIdx,'article[id]:focus outline suppression precedes :focus-visible');
+  const cssMobTail=latestCss.slice(latestCss.lastIndexOf('@media(max-width:600px)'));
+  assert.ok(cssMobTail.includes('.hero-alert-link { font-size: 11px')&&latestCss.lastIndexOf('.hero-alert-link { font-size: 11px')>latestCss.indexOf('.hero-alert-link { display:'),
+   'mobile .hero-alert-link overrides base rule');
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

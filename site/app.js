@@ -586,7 +586,7 @@ function xAxisTicks(start,end,width,left,right,win=DAY){
  }
 }
 const FOCUS_ATTRS=['id','data-focus-key','data-view-heading','data-view',
- 'data-layout','data-all-range','data-hero-range','data-hero-scale','data-hero-hsdir','data-hero-plot',
+ 'data-layout','data-all-range','data-hero-range','data-hero-scale','data-hero-hsdir','data-hero-plot','data-family-jump',
  'data-series-select','data-band-toggle','data-family','data-child','data-explore','data-copy','data-query-kind','data-methods','data-chart-plot'];
 const DISPLAY_RELAY_ROLES=[['guard','guard'],['middle_only','middle-only'],['exit','exit'],['hsdir','HSDir'],['v2dir','V2Dir']];
 
@@ -658,11 +658,16 @@ const focusDestination=(selector='[data-view-heading]')=>{
  target?.focus({preventScroll:true});
 };
 const announceStatus=message=>{const rgn=$('[data-live-status]');if(rgn)rgn.textContent=message;};
-function scrollToFragment(){
+function fragmentTarget(){
  const raw=location.hash?location.hash.slice(1):'';
- if(!raw)return;
+ if(!raw)return null;
  let id;try{id=decodeURIComponent(raw);}catch{id=raw;}
- document.getElementById?.(id)?.scrollIntoView?.({block:'start'});
+ return document.getElementById?.(id)||null;
+}
+function scrollToFragment(){
+ const target=fragmentTarget();
+ target?.scrollIntoView?.({block:'start'});
+ return target;
 }
 function updateHeaderOffset(){
  const h=$('.nav')?.getBoundingClientRect?.()?.height;
@@ -895,10 +900,12 @@ function heroCard(){
  if(last>=0)for(const f of h.families){
   const st=f.rows[last].state;
   if(st!=='missing')anyAlertMeasured=true;
-  if(st==='high'||st==='elevated'){alerts.push(f);if(st==='high')hasHighAlert=true;}
+  if(st==='high'||st==='elevated'){alerts.push({f,state:st});if(st==='high')hasHighAlert=true;}
  }
  const alertClass=!anyAlertMeasured?'unknown':hasHighAlert?'high':alerts.length?'elevated':'neutral';
- const alertSummary=alerts.length?alerts.slice(0,3).map(f=>`${f.icon} ${f.title}`).join(' · ')+(alerts.length>3?` +${alerts.length-3}`:''):anyAlertMeasured?'No qualifying family alerts':'No measured family series';
+ const alertMeta=alerts.length
+  ?`<ul class="hero-alert-list" aria-label="Alerted families">${alerts.map(({f,state})=>`<li><a class="hero-alert-link ${state}" href="#family-${escapeHtml(encodeURIComponent(f.id))}" data-family-jump="${escapeHtml(f.id)}">${escapeHtml(f.icon)} ${escapeHtml(f.title)}</a></li>`).join('')}</ul>`
+  :`<div class="hero-kpi-meta">${anyAlertMeasured?'No qualifying family alerts':'No measured family series'}</div>`;
  const endWindow=h?formatIntervalWindow(h.end-h.window,h.end,h.window):validTime(D.end)?(is24h?formatIntervalWindow(Math.floor(D.end/HOUR)*HOUR-HOUR,Math.floor(D.end/HOUR)*HOUR,HOUR):date(Math.floor(D.end/DAY)*DAY-DAY)+' UTC'):'Unavailable';
  const desktopWindow=isHourly?controlGroup('Window','Concurrent DoS left-panel window','data-hero-range',leftRange,[['24h','24 hours'],['7d','7 days']],'hero-window-desktop'):'';
  const mobileOpts=isHourly?[['24h','24 hours'],['7d','7 days'],['all','All time']]:[['7d','7 days'],['all','All time']];
@@ -906,11 +913,11 @@ function heroCard(){
  const controls=`<div class="hero-controls">${desktopWindow}${mobileWindow}${controlGroup('Flow scale','Concurrent DoS flow scale','data-hero-scale',heroScale,[['linear','Linear'],['symlog','Symlog']])}<button class="hero-toggle ${heroHsdir?'active':''}" data-hero-hsdir aria-pressed="${heroHsdir}">HSDir GET/POST ${heroHsdir?'included':'excluded'}</button></div>`;
  const kpiItems=[
   [is24h?(heroHsdir?'Latest 1h mitigated &amp; flood rate':'Latest 1h mitigated rate'):(heroHsdir?'Latest 24h mitigated &amp; flood rate':'Latest 24h mitigated rate'),total!=null?'neutral':'unknown',`${escapeHtml(total!=null?number(total):'Unavailable')} <small>events/s${latestPartial?' · partial':''}</small>`,`${endWindow} · ${heroHsdir?'incl. HSDir GET/POST':'excl. HSDir GET/POST'}${latestPartial?' · partial source coverage':''}`],
-  [is24h?'Concurrent family alerts (1h)':'Concurrent family alerts (24h)',alertClass,`${count(alerts.length)} of ${count(D.families.length)} <small>families ≥90th pct</small>`,alertSummary],
+  [is24h?'Concurrent family alerts (1h)':'Concurrent family alerts (24h)',alertClass,`${count(alerts.length)} of ${count(D.families.length)} <small>families ≥90th pct</small>`,alertMeta,true],
   [is24h?'Open circuits (1h mean)':'Open circuits (24h mean)',open!=null?'neutral':'unknown',`${escapeHtml(open!=null?number(open):'Unavailable')} <small>circuits</small>`,openShare?`${openShare} of ${axisNumber(openPeak)} peak`:'Normalized to fleet record'],
   [is24h?'Stalled BEGIN_DIR (1h mean)':'Stalled BEGIN_DIR (24h mean)',wait!=null?'neutral':'unknown',`${escapeHtml(wait!=null?number(wait):'Unavailable')} <small>connections</small>`,waitShare?`${waitShare} of ${axisNumber(waitPeak)} peak`:'command_wait state'],
  ];
- const kpis=`<div class="hero-kpi-grid">${kpiItems.map(([lbl,cls,val,meta])=>`<div class="hero-kpi"><div class="hero-kpi-label">${lbl}</div><div class="hero-kpi-value ${cls}">${val}</div><div class="hero-kpi-meta">${escapeHtml(meta)}</div></div>`).join('')}</div>`;
+ const kpis=`<div class="hero-kpi-grid">${kpiItems.map(([lbl,cls,val,meta,isHtml])=>`<div class="hero-kpi"><div class="hero-kpi-label">${lbl}</div><div class="hero-kpi-value ${cls}">${val}</div>${isHtml?meta:`<div class="hero-kpi-meta">${escapeHtml(meta)}</div>`}</div>`).join('')}</div>`;
  const hourSpan=hp=>{if(!hp?.times?.length)return '';const s=hp.start,e=hp.end,sd=date(s),ed=date(e);return sd===ed?`${sd} ${time(s)}–${time(e)}`:`${sd} ${time(s)}–${ed} ${time(e)}`;};
  const daySpan=hp=>hp?.times?.length?(hp.times.length===1?date(hp.start):`${date(hp.start)}–${date(hp.end-DAY)}`):'';
  const heroPanel=(r,title,hp,sub,unitLbl)=>{
@@ -937,7 +944,7 @@ function heroCard(){
   :'Non-overlapping 24-hour UTC intervals (00:00 UTC); desktop displays Last 7 days and All time side by side, while smaller screens switch with Window. Counter sums exclude overlapping sub-series (<code>ntor_v3</code> within <code>ntor</code>; exitward queue hits within <code>circuit_killed_max_cell</code>; HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>). Alert lanes mark families with a qualifying DoS counter at rank ≥90 with at least 20 reference days (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference days (high). Bottom resource gauges normalize to each series’ 7-day peak on Last 7 days and retained fleet record on All time; headlines compare against the retained fleet record.';
  return `<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="${escapeHtml(heroRange)}"><div class="card-heading"><div><div class="family-label">All six families · Concurrent DoS overview</div><h2>Concurrent DoS activity</h2></div>${controls}</div><p class="definition">${heroDesc}</p>${kpis}<figure>${panels}${legendHtml}<figcaption><b>Footnote.</b> ${heroFootnote}</figcaption></figure></section>`;
 }
-function card(c,f,r){const s=primary(c),relaySrc=s.current?.hour&&'relays' in s.current.hour?s.current.hour:s.current?.day,relayCount=relaySrc&&'relays' in relaySrc?relaySrc.relays:c.relays;return `<article id="family-${escapeHtml(f.id)}" class="chart-card" data-family-range="${escapeHtml(r)}"><div class="card-heading"><div><div class="family-label">Family ${escapeHtml(f.icon)} of 06</div><h2>${escapeHtml(f.title)}</h2></div></div><div class="card-summary"><div class="card-context"><div class="metric-subtitle">${metricSubtitle(c,r)}</div><p class="definition">${escapeHtml(c.definition)}</p></div><div class="reading-block">${reading(c,s)}</div></div>${figure(c,r)}<div class="card-actions"><a href="${url('explorer',r,f.id,c.id)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(c.id)}" data-range="${escapeHtml(r)}">Explore ${escapeHtml(f.title)} →</a><span>${count(relayCount)} reporting relays</span></div></article>`;}
+function card(c,f,r){const s=primary(c),relaySrc=s.current?.hour&&'relays' in s.current.hour?s.current.hour:s.current?.day,relayCount=relaySrc&&'relays' in relaySrc?relaySrc.relays:c.relays;return `<article id="family-${escapeHtml(f.id)}" class="chart-card" data-family-range="${escapeHtml(r)}" tabindex="-1"><div class="card-heading"><div><div class="family-label">Family ${escapeHtml(f.icon)} of 06</div><h2>${escapeHtml(f.title)}</h2></div></div><div class="card-summary"><div class="card-context"><div class="metric-subtitle">${metricSubtitle(c,r)}</div><p class="definition">${escapeHtml(c.definition)}</p></div><div class="reading-block">${reading(c,s)}</div></div>${figure(c,r)}<div class="card-actions"><a href="${url('explorer',r,f.id,c.id)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(c.id)}" data-range="${escapeHtml(r)}">Explore ${escapeHtml(f.title)} →</a><span>${count(relayCount)} reporting relays</span></div></article>`;}
 function chartControls(){return `<div class="overview-controls">${controlGroup('Time range','Chart time range','data-all-range',range,timeRanges.periods.map(p=>[p.id,p.label]))}${view==='overview'?controlGroup('Layout','Chart layout','data-layout',layout,[['grid','Grid'],['full','Full width']]):''}</div>`;}
 function overview(){return `<h2 class="sr-only" data-view-heading tabindex="-1">Overview</h2>${heroCard()}<div class="overview-toolbar"><div><h2>Six chart families</h2><p>A percentile shows where a value sits among reference windows. The ruler runs from 0 to 100. <a href="${url('methods')}#reference" data-methods>How it is calculated</a></p></div>${chartControls()}</div><div class="chart-stack chart-${layout}">${D.families.map(f=>card(chart(f.primary),f,range)).join('')}</div>`;}
 function explorer(){
@@ -1288,6 +1295,19 @@ document.addEventListener('click',async e=>{
  const t=targetEl(e);if(!t)return;
  const hit=s=>t.closest(s),anchor=hit('a[href]');
  if(anchor&&(e.metaKey||e.ctrlKey||e.shiftKey||e.altKey||e.button!==0))return;
+ const famJump=hit('[data-family-jump]');
+ if(famJump){
+  const fid=famJump.dataset.familyJump,target=fid&&document.getElementById?.('family-'+fid);
+  if(target){
+   e.preventDefault();
+   closeNavigation();
+   const hash='#family-'+encodeURIComponent(fid),nextUrl=(location.search||'')+hash;
+   if(location.hash!==hash){try{window.history.pushState(null,'',nextUrl);}catch{try{location.hash=hash;}catch{}}}
+   target.scrollIntoView?.({block:'start'});
+   target.focus?.({preventScroll:true});
+   return;
+  }
+ }
  const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d',prevReq=requestedHeroRange;requestedHeroRange=next;if(next!==heroRange||prevReq!==next){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
  const heroScaleToggle=hit('[data-hero-scale]');if(heroScaleToggle){const next=heroScaleToggle.dataset.heroScale==='symlog'?'symlog':'linear';if(next!==heroScale){heroScale=next;redrawControl(`[data-hero-scale="${heroScale}"]`);}return;}
  if(hit('[data-hero-hsdir]')){heroHsdir=!heroHsdir;redrawControl('[data-hero-hsdir]');return;}
@@ -1368,7 +1388,10 @@ let resizeTimer;window.addEventListener('resize',()=>{updateHeaderOffset();clear
 window.addEventListener('popstate',()=>{
  ({view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN));
  requestedHeroRange=parseRequestedHeroRange(location.search);
- render();closeNavigation();scrollToFragment();focusDestination(view==='methods'&&location.hash==='#reference'?'#reference':'[data-view-heading]');
+ render();closeNavigation();
+ const frag=scrollToFragment(),fragId=frag?.getAttribute?.('id')||'';
+ if(frag&&((view==='methods'&&fragId==='reference')||(view==='overview'&&fragId.startsWith('family-'))))frag.focus?.({preventScroll:true});
+ else focusDestination('[data-view-heading]');
 });
 }
 return {start,markup,draw,drawHero,url,replaceRelease,updateFreshness,getState:()=>({view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir})};
