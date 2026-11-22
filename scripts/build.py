@@ -13,6 +13,7 @@ from itertools import islice
 from pathlib import Path
 
 import display_numbers
+from coarsening import COARSENING_DESCRIPTION
 from historical_statistics import historical_averages_and_windows, historical_comparison
 from population_statistics import relay_counts
 from io_helpers import BUILD_FORMAT, cleanup_warning, file_sha256, filesystem_contains, javascript_data, json_text, normalized_output_path, output_lock, owned_generation, parse_json, reject_working_directory_overlap, sha256_hex, staged_generation
@@ -41,6 +42,114 @@ def scaled_display(value, scale, relays=1):
     if product == 0 and value > 0 and relays > 0 and scale > 0:
         return display_numbers.number(Decimal(str(value)) * Decimal(int(relays)) * Decimal(str(scale)))
     return display_numbers.number(product)
+
+
+_NORMALIZED_CHART_TITLES = {
+    'directory_rejections': 'Directory flood counters',
+}
+_NORMALIZED_SERIES_NAMES = {
+    ('onionskin_drops', 'fast'): 'Fast handshakes',
+    ('onionskin_drops', 'tap'): 'TAP handshakes',
+    ('onionskin_drops', 'ntor_v3'): 'ntor-v3 counter (included in ntor)',
+}
+_PRODUCT_PUBLIC_KEYS = ('name', 'application_repo', 'deployment_repo')
+
+
+def _format_period_rule(period):
+    cov = period['minimum_coverage']
+    cov_rule = (f'>={display_numbers.percentage(Decimal(str(cov)) * 100)} coverage required'
+                if cov > 0 else 'uses all available qualifying days in window')
+    return f"{period['label']} ({cov_rule})"
+
+
+def _build_history_methods(existing, is_hourly, time_ranges):
+    daily_periods = [p for p in time_ranges['periods'] if p['window']['unit'] != 'hours']
+    period_rules = '; '.join(_format_period_rule(p) for p in daily_periods)
+    methods = {
+        'row_fields': ['interval_end', 'fleet_rate_or_mean', 'eligible_relays', 'coverage', 'valid'],
+        'counter': (
+            'rate(source[1h]) (minimum 24 samples per 1h UTC hour) for the 24-hour snapshot and '
+            'rate(source[1d]) (minimum 360 samples per 24h UTC day) for multi-day history, computed per '
+            'original series before summing. Query return is rate/second, not interval total.'
+            if is_hourly else
+            'rate(source[1d]) per original series before summing; minimum 360 samples per 24h UTC day. '
+            'Query return is rate/second, not interval total.'
+        ),
+        'gauge': (
+            'avg_over_time(source[1h]) (24-sample gate) for the 24-hour snapshot and '
+            'avg_over_time(source[1d]) (360-sample gate) for daily history, then sum.'
+            if is_hourly else
+            'avg_over_time(source[1d]) then sum; same 360-sample gate.'
+        ),
+        'sampling': (
+            'Non-overlapping 1-hour UTC windows (3,600s) for the 24-hour snapshot and '
+            'daily non-overlapping 24h windows ending at 00:00:00 UTC (86,400s) for multi-day views and exports.'
+            if is_hourly else
+            'Daily non-overlapping 24h windows ending at 00:00:00 UTC (86,400s). No sub-24h windows or intra-day updates.'
+        ),
+        'coverage': existing.get(
+            'coverage',
+            'Window eligible count must be >=90% of max(endpoint available population, '
+            'largest eligible count in preceding 31 days). Missing remains null; available series absent before metric introduction.',
+        ),
+        'custom_directory': (
+            'Require all 3 previous-hop series to meet the interval sample gate (24 samples/1h or 360 samples/24h UTC) '
+            'for each relay+request type; count relays after that gate.'
+            if is_hourly else
+            'Require all 3 previous-hop series to meet 360 samples per 24h UTC day for each relay+request type; '
+            'count relays after that gate.'
+        ),
+        'baseline': existing.get(
+            'baseline',
+            'Historical per-day fleet rate/mean divided by coarsened eligible relay count. Reference mean is '
+            'unweighted mean of those normalized daily windows; normalizing avoids fleet-size multiplication but does '
+            'not remove changes in relay capacity, roles, build or traffic.',
+        ),
+        'reference_line': existing.get('reference_line', 'mean_per_relay × current relevant relay count; units match fleet chart.'),
+        'percentile': (
+            'Midrank empirical CDF: 100×(less+0.5×equal)/N, comparing current normalized window against reference windows '
+            '(sampled 1h windows for the 24h snapshot; non-overlapping 24h UTC days for daily views). '
+            'No severity inferred; all-zero reference/current reports null rank and flat_zero.'
+            if is_hourly else
+            'Midrank empirical CDF: 100×(less+0.5×equal)/N, comparing current normalized 24h UTC day against '
+            'historical 24h UTC days. No severity inferred; all-zero reference/current reports null rank and flat_zero.'
+        ),
+        'reference_exclusion': existing.get(
+            'reference_exclusion',
+            'Reference windows fit wholly inside the 18-month window; reference end is at least 24 hours (one full UTC day) before snapshot end.',
+        ),
+        'reference_refresh': (
+            'Frozen once per UTC day: prior 18 calendar months ending at 00:00 UTC on the previous day, '
+            'reused across hourly releases within that UTC day.'
+            if is_hourly else
+            'Frozen once per UTC day: prior 18 calendar months ending at snapshot start (previous UTC midnight), '
+            'matching the daily publication schedule.'
+        ),
+        'historical_averages': (
+            f'Arithmetic means of qualifying complete daily fleet values, in plot units. Equal weight per measured day; '
+            f'missing days excluded. Configured periods: {period_rules}. '
+            f'Current 24h comparison rulers normalize per reporting relay.'
+        ),
+        'coarsening': COARSENING_DESCRIPTION,
+    }
+    for key in ('first_window', 'source_scope'):
+        if isinstance(existing.get(key), str) and existing[key].strip():
+            methods[key] = existing[key]
+    return methods
+
+
+def _normalize_display_metadata(data, is_hourly, time_ranges):
+    if isinstance(data.get('product'), dict):
+        data['product'] = {k: v for k, v in data['product'].items() if k in _PRODUCT_PUBLIC_KEYS}
+    data['history_methods'] = _build_history_methods(data.get('history_methods') or {}, is_hourly, time_ranges)
+    for chart in data['charts']:
+        cid = chart['id']
+        if cid in _NORMALIZED_CHART_TITLES:
+            chart['title'] = _NORMALIZED_CHART_TITLES[cid]
+        for series in chart['series']:
+            new_name = _NORMALIZED_SERIES_NAMES.get((cid, series['key']))
+            if new_name:
+                series['name'] = new_name
 
 
 def _validated_export_periods(charts, period_bounds):
@@ -74,6 +183,7 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
     day_end, cutoff, period_bounds = resolve_period_bounds(data['end'], time_ranges)
     avg_bounds = (day_end, period_bounds)
     _validated_export_periods(data['charts'], period_bounds)
+    _normalize_display_metadata(data, is_hourly, time_ranges)
     # Raw version-collector wrappers and optional audit notes are not website inputs.
     data['versions'] = {key: value for key, value in data['versions'].items() if key in PUBLIC_VERSION_FIELDS}
     data['versions']['as_of'] = int(data['versions']['as_of'])
@@ -170,6 +280,7 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
 def live_index(page, *, hourly=True):
     replacements = {
         'data-mode="offline"': 'data-mode="live"',
+        'Loading MetricsPort charts…': 'Verifying release manifest and measurements…',
         '<script src="data.js"></script>': '',
         '<script src="app.js"></script>': '<script src="app.js"></script><script src="live.js"></script>',
         'Local preview · saved measurements': 'Hourly UTC measurements' if hourly else 'Daily UTC measurements',

@@ -22,11 +22,11 @@
     "directory_requests_current_available": "count by(type)(count by(instance,type)(tor_relay_begindir_request_total{job=\"tor_relays\"}) == 3)",
     "directory_requests_current_eligible": "count by(type)(count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) >= 24) == 3)",
     "directory_requests_current_value": "sum by(type)(rate(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) and (count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) >= 24) and on(instance,type) (count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) >= 24) == 3))",
-    "directory_requests_daily_available": "count by(type)(count by(instance,type)(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}) == 3)",
-    "directory_requests_daily_eligible": "count by(type)(count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) >= 360) == 3)",
-    "directory_requests_daily_value": "sum by(type)(rate(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) and (count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) >= 360) and on(instance,type) (count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1d]) >= 360) == 3))",
-    "directory_requests_sampled_hour_eligible": "count by(type)(count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1h]) >= 24) == 3)",
-    "directory_requests_sampled_hour_value": "sum by(type)(rate(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1h]) and (count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1h]) >= 24) and on(instance,type) (count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}[1h]) >= 24) == 3))",
+    "directory_requests_daily_available": "count by(type)(count by(instance,type)(tor_relay_begindir_request_total{job=\"tor_relays\"}) == 3)",
+    "directory_requests_daily_eligible": "count by(type)(count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1d]) >= 360) == 3)",
+    "directory_requests_daily_value": "sum by(type)(rate(tor_relay_begindir_request_total{job=\"tor_relays\"}[1d]) and (count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1d]) >= 360) and on(instance,type) (count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1d]) >= 360) == 3))",
+    "directory_requests_sampled_hour_eligible": "count by(type)(count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) >= 24) == 3)",
+    "directory_requests_sampled_hour_value": "sum by(type)(rate(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) and (count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) >= 24) and on(instance,type) (count by(instance,type)(count_over_time(tor_relay_begindir_request_total{job=\"tor_relays\"}[1h]) >= 24) == 3))",
     "directory_waiting_daily_available": "count(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"})",
     "directory_waiting_daily_eligible": "count(count_over_time(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"}[1d]) >= 360)",
     "directory_waiting_daily_value": "sum(avg_over_time(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"}[1d]) and (count_over_time(tor_relay_begindir_connections{job=\"tor_relays\",state=\"command_wait\"}[1d]) >= 360))",
@@ -299,8 +299,7 @@
       "charts": [
         "directory_requests"
       ],
-      "selector": "tor_relay_begindir_request_total{job=\"tor_relays\",type=~\"hs_get|hs_post|no_request\"}",
-      "hour_selector": "tor_relay_begindir_request_total{job=\"tor_relays\"}",
+      "selector": "tor_relay_begindir_request_total{job=\"tor_relays\"}",
       "label": "type",
       "strata": true
     },

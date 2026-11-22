@@ -39,7 +39,7 @@ class TimeRangeConfigTests(unittest.TestCase):
             cfg['legacy_aliases'],
             {'30d': '1mo', '1m': '1mo', '3m': '3mo', '6m': '6mo', '12m': '12mo'},
         )
-        self.assertEqual(cfg['card_slots'], {'fallback_dynamic': '6mo', 'fixed': ['24h', 'all']})
+        self.assertEqual(cfg['card_slots'], {'fallback_dynamic': '7d', 'fixed': ['24h', 'all']})
         self.assertEqual(
             [p['id'] for p in cfg['periods']],
             ['24h', '7d', '1mo', '3mo', '6mo', '12mo', 'all'],

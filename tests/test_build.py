@@ -262,7 +262,7 @@ class BuildTests(unittest.TestCase):
     def test_partial_period_coverage_and_explicit_threshold_override(self):
         by_id = {chart['id']: chart for chart in self.data['charts']}
         periods = self.data['time_ranges']['periods']
-        for chart_id in ('hsdir_fetches', 'directory_rejections', 'protocol_closes'):
+        for chart_id in ('hsdir_fetches', 'directory_rejections', 'protocol_closes', 'directory_requests'):
             for series in by_id[chart_id]['series']:
                 for period in periods:
                     if period['window']['unit'] == 'hours':
@@ -279,7 +279,18 @@ class BuildTests(unittest.TestCase):
 
         self.assertEqual(by_id['directory_rejections']['series'][0]['reference']['day']['n'], 19)
 
-        for series in by_id['directory_requests']['series']:
+        empty_dir_snap = clone_snapshot(self.input)
+        for c in empty_dir_snap['charts']:
+            if c['id'] == 'directory_requests':
+                for s in c['series']:
+                    if s['key'] not in {'hs_get', 'hs_post', 'no_request'}:
+                        s['history']['daily'] = []
+                        s['history']['sampled_hour'] = []
+                        s['relay_population']['daily'] = []
+        with tempfile.TemporaryDirectory() as empty_dir_folder:
+            empty_dir_data, _ = builder.prepare(empty_dir_snap, 'a' * 64, Path(empty_dir_folder) / 'cache')
+        empty_dir_chart = next(c for c in empty_dir_data['charts'] if c['id'] == 'directory_requests')
+        for series in empty_dir_chart['series']:
             if series['key'] in {'hs_get', 'hs_post', 'no_request'}:
                 continue
             for period in periods:
@@ -1078,18 +1089,57 @@ class BuildTests(unittest.TestCase):
 
     def test_subnormal_scaled_display_and_integer_window_normalization(self):
         subnormal = float.fromhex('0x0.0000000000001p-1022')
-        self.assertEqual(builder.scaled_display(subnormal, 0.1), '<1')
-        self.assertEqual(builder.scaled_display(subnormal, 0.1, relays=2), '<1')
+        self.assertEqual(builder.scaled_display(subnormal, 0.1), '<0.001')
+        self.assertEqual(builder.scaled_display(subnormal, 0.1, relays=2), '<0.001')
         self.assertEqual(builder.scaled_display(0.0, 0.1), '0')
         snapshot = copy.deepcopy(self.input)
         snapshot['start'] = float(snapshot['start'])
         snapshot['end'] = float(snapshot['end'])
         snapshot['versions']['as_of'] = float(snapshot['versions']['as_of'])
+        snapshot['product'] = {
+            'name': 'OnionSurge',
+            'application_repo': 'https://example.com/app',
+            'deployment_repo': 'https://example.com/deploy',
+            'route': 'legacy',
+            'name_status': 'legacy',
+            'alternate_url': 'https://legacy.example/',
+            'routing_status': 'legacy',
+        }
+        for c in snapshot['charts']:
+            if c['id'] == 'directory_rejections':
+                c['title'] = 'Directory defense rejections'
+            elif c['id'] == 'onionskin_drops':
+                for s in c['series']:
+                    s['name'] = s['key']
         with tempfile.TemporaryDirectory() as folder:
             built, _ = builder.prepare(snapshot, 'a'*64, Path(folder)/'cache')
         self.assertIs(type(built['start']), int)
         self.assertIs(type(built['end']), int)
         self.assertIs(type(built['versions']['as_of']), int)
+        self.assertEqual(
+            built['product'],
+            {
+                'name': 'OnionSurge',
+                'application_repo': 'https://example.com/app',
+                'deployment_repo': 'https://example.com/deploy',
+            },
+        )
+        charts_by_id = {c['id']: c for c in built['charts']}
+        self.assertEqual(charts_by_id['directory_rejections']['title'], 'Directory flood counters')
+        drop_names = {s['key']: s['name'] for s in charts_by_id['onionskin_drops']['series']}
+        self.assertEqual(drop_names['fast'], 'Fast handshakes')
+        self.assertEqual(drop_names['tap'], 'TAP handshakes')
+        self.assertEqual(drop_names['ntor_v3'], 'ntor-v3 counter (included in ntor)')
+        self.assertIn('7 days', built['history_methods']['historical_averages'])
+        self.assertIn('1 month', built['history_methods']['historical_averages'])
+        self.assertNotIn('hs_get, hs_post, no_request in daily', built['history_methods']['custom_directory'])
+        self.assertEqual(built['time_ranges']['card_slots']['fallback_dynamic'], '7d')
+        offline_html = (ROOT / 'site/index.html').read_text(encoding='utf-8')
+        self.assertIn('Loading MetricsPort charts…', offline_html)
+        self.assertNotIn('Verifying release manifest and measurements', offline_html)
+        live_html = builder.live_index(offline_html, hourly=True)
+        self.assertIn('Verifying release manifest and measurements…', live_html)
+        self.assertNotIn('Loading MetricsPort charts…', live_html)
 
     def test_duplicate_export_paths_across_chart_and_suffix_hyphens_are_rejected(self):
         colliding_ranges = {

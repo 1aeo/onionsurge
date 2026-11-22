@@ -30,8 +30,9 @@ class InputValidationTests(unittest.TestCase):
         data = self.fixture()
         chart = next(c for c in data['charts'] if any(s['key'] not in c['display_keys'] for s in c['series']))
         auxiliary = next(s for s in chart['series'] if s['key'] not in chart['display_keys'])
-        # The synthetic coverage cases exercise the metadata-absent input form.
+        # The synthetic coverage cases exercise the metadata-absent and empty-history input form.
         auxiliary.pop('relay_population', None)
+        auxiliary['history'] = {'daily': [], 'sampled_hour': []}
         expected = int(chart['relays'])
         reporting = min(expected, ((math.ceil(expected * .9) + 7) // 8) * 8)
         auxiliary['current']['day'] = {'value': 10, 'relays': reporting, 'expected_relays': expected}

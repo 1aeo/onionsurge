@@ -377,7 +377,10 @@ assert.deepEqual(selectorMarkup(application('?view=explorer&chart=transport_reje
   ['tor_relay_dos_total'],'one unknown plotted class makes the whole source selector fall back');
 
 assert.equal(ui.number(451.82), '452');
-assert.equal(ui.number(0.044), '<1');
+assert.equal(ui.number(0.044), '0.044');
+assert.equal(ui.number(0.0004), '<0.001');
+assert.equal(ui.number(-0.0004), '>−0.001');
+assert.equal(ui.number(0.996), '1');
 assert.equal(ui.number(0), '0');
 for (const value of [null, NaN, Infinity, '42']) assert.equal(ui.number(value), 'Unavailable');
 assert.equal(ui.axisNumber(2.5), '2.5');
@@ -697,7 +700,7 @@ roleV7Ctrl.app.start();
 const roleV7Rows = relayRows(roleV7Ctrl);
 assert.match(roleV7Rows[0].title,/Contributing relays in this 1-hour UTC window\./);
 assert.match(roleV7Rows[1].title,/Contributing relays in this 24-hour UTC window\./);
-assert.match(roleV7Rows[2].title,/Mean daily contributing relays across 177 measured days/);
+assert.match(roleV7Rows[2].title,/Mean daily contributing relays across 7 measured days/);
 assert.match(roleV7Rows[3].title,/Mean daily contributing relays across 517 measured days/);
 const expectedPrimaryRows = ['day', 'one_month', 'six_months', 'all_time'].map(expectedRowText);
 const unknownRoles = structuredClone(roleData), unknownSeries = chart('transport_rejections',unknownRoles).series.find(series=>series.key===roleChart.primary_series);
@@ -876,9 +879,12 @@ for (const span of v6Data.time_ranges.periods.map(p => p.id)) {
   assert.match(viewMarkup, csvPattern, 'Explorer CSV link uses active period export_suffix on ' + span);
 }
 const directory = application('?view=explorer&chart=directory_requests&range=all').app.markup();
+const directory6mo = application('?view=explorer&chart=directory_requests&range=6mo').app.markup();
 const directoryV6 = application('?view=explorer&chart=directory_requests&range=all', v6Data).app.markup();
+const sevenDays = chart('directory_requests').series.find(s => s.key === 'hs_get').historical_averages.seven_days;
 const sixMonths = chart('directory_requests').series.find(s => s.key === 'hs_get').historical_averages.six_months;
-assert.ok(directory.includes(`${sixMonths.days} / ${sixMonths.expected_days} days`));
+assert.ok(directory.includes(`${sevenDays.days} / ${sevenDays.expected_days} days`));
+assert.ok(directory6mo.includes(`${sixMonths.days} / ${sixMonths.expected_days} days`));
 assert.equal((statSections(directoryV6).slice(0, 2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
   'directory_requests 1mo partial window is ready under zero minimum_coverage alongside 24h');
 const directoryGated = structuredClone(v6Data);
@@ -889,9 +895,13 @@ const directory7d = application('?view=explorer&chart=directory_requests&range=7
 assert.equal((statSections(directory7d).slice(0, 2).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 2,
   'directory_requests 7d window is ready and displays its Current 24h ruler');
 const directoryGatedV7 = structuredClone(v7Data);
-chart('directory_requests', directoryGatedV7).series.find(s => s.key === 'hs_get').historical_averages.six_months.status = 'insufficient_data';
+chart('directory_requests', directoryGatedV7).series.find(s => s.key === 'hs_get').historical_averages.seven_days.status = 'insufficient_data';
 assert.equal((statSections(application('?view=explorer&chart=directory_requests&range=all', directoryGatedV7).app.markup()).slice(1, 3).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 1,
-  'explicit insufficient_data 6mo fallback window in v7 suppresses the Current 24h ruler');
+  'explicit insufficient_data 7d fallback window in v7 suppresses the Current 24h ruler');
+const directoryGatedV7SixMo = structuredClone(v7Data);
+chart('directory_requests', directoryGatedV7SixMo).series.find(s => s.key === 'hs_get').historical_averages.six_months.status = 'insufficient_data';
+assert.equal((statSections(application('?view=explorer&chart=directory_requests&range=6mo', directoryGatedV7SixMo).app.markup()).slice(1, 3).map(section=>section.html).join('').match(/class="rank-ruler/g) || []).length, 1,
+  'explicit insufficient_data 6mo window in v7 suppresses the Current 24h ruler when viewing 6mo');
 
 const comparisonData = structuredClone(v6Data), comparisonChart = chart('transport_rejections',comparisonData);
 const comparisonSeries = comparisonChart.series.find(series=>series.key===comparisonChart.primary_series);
@@ -1503,7 +1513,7 @@ const subnormalSeries=subnormalChart.series.find(s=>s.key===subnormalChart.prima
 subnormalChart.display_scale=0.1;
 Object.assign(subnormalSeries.current.day,{value:Number.MIN_VALUE,valid:true,relays:8});
 const subnormalMarkup=application('?view=explorer&chart=transport_rejections',subnormalFixture).app.markup();
-assert.match(subnormalMarkup,/24-hour average<\/div><div class="stat-number">&lt;1 /);
+assert.match(subnormalMarkup,/24-hour average<\/div><div class="stat-number">&lt;0\.001 /);
 
 const phantomBand=structuredClone(data),phantomChart=chart('transport_rejections',phantomBand);
 const phantomSeries=phantomChart.series.find(s=>s.key===phantomChart.primary_series);
@@ -1827,7 +1837,7 @@ const heroDefault=application('?view=overview',v6Data);
 heroDefault.app.start();
 assert.equal(heroDefault.app.getState().heroRange,'7d');
 assert.equal(heroDefault.app.getState().heroScale,'linear');
-assert.equal(heroDefault.app.getState().heroHsdir,true);
+assert.equal(heroDefault.app.getState().heroHsdir,false);
 assert.equal(heroDefault.app.getState().range,'1mo');
 const heroHtml=heroDefault.page.innerHTML;
 const heroSectionPos=heroHtml.indexOf('<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="7d">');
@@ -1860,23 +1870,23 @@ click(heroDefault,'[data-hero-scale]',{heroScale:'symlog'});
 assert.equal(heroDefault.app.getState().heroScale,'symlog');
 assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-scale="symlog"]'));
 click(heroDefault,'[data-hero-hsdir]',{});
-assert.equal(heroDefault.app.getState().heroHsdir,false);
+assert.equal(heroDefault.app.getState().heroHsdir,true);
 assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-hsdir]'));
 const heroParams=new URLSearchParams(heroDefault.app.url('overview').slice(1));
 assert.equal(heroParams.get('hero_range'),'all');
 assert.equal(heroParams.get('hero_scale'),'symlog');
-assert.equal(heroParams.get('hero_hsdir'),'0');
+assert.equal(heroParams.get('hero_hsdir'),'1');
 assert.deepEqual(ui.parseLocation(v6Data,heroDefault.browser.location.search),heroDefault.app.getState(),
  'hero state round-trips between URL and parseLocation');
 heroDefault.back();
-assert.equal(heroDefault.app.getState().heroHsdir,true);
+assert.equal(heroDefault.app.getState().heroHsdir,false);
 assert.equal(heroDefault.app.getState().heroScale,'symlog');
 heroDefault.forward();
-assert.equal(heroDefault.app.getState().heroHsdir,false);
+assert.equal(heroDefault.app.getState().heroHsdir,true);
 click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
 click(heroDefault,'[data-hero-scale]',{heroScale:'linear'});
 click(heroDefault,'[data-hero-hsdir]',{});
-assert.deepEqual([heroDefault.app.getState().heroRange,heroDefault.app.getState().heroScale,heroDefault.app.getState().heroHsdir],['7d','linear',true]);
+assert.deepEqual([heroDefault.app.getState().heroRange,heroDefault.app.getState().heroScale,heroDefault.app.getState().heroHsdir],['7d','linear',false]);
 assert.equal(new URLSearchParams(heroDefault.app.url('overview').slice(1)).get('hero_range'),'7d');
 click(heroDefault,'[data-hero-range]',{heroRange:'all'});
 click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
@@ -1918,7 +1928,7 @@ const noFalseAlert=ui.prepareHeroPlot(allNormalAlerts,'7d',true);
 assert.equal(noFalseAlert.families.find(f=>f.id==='directory').rows[6].state,'neutral','benign hsdir success counters never trigger DoS alerts');
 
 for(const heroRange of ['7d','all'])for(const heroScale of ['linear','symlog'])for(const includeHsdir of [true,false]){
- const app=application(`?view=overview&hero_range=${heroRange}&hero_scale=${heroScale}${includeHsdir?'':'&hero_hsdir=0'}`,v6Data).app;
+ const app=application(`?view=overview&hero_range=${heroRange}&hero_scale=${heroScale}${includeHsdir?'&hero_hsdir=1':''}`,v6Data).app;
  for(const width of [240,262,360,800,1680]){
   const plot=element(width);
   app.drawHero(plot,heroRange,heroScale,includeHsdir);
@@ -1945,8 +1955,8 @@ assert.match(heroEmptyPlot.innerHTML,/No retained samples available/);
 assert.equal((heroEmptyPlot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g)||[]).length,1);
 
 for(const [dataset,urlQuery,plots] of [
- [v6Data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=0',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_7d"]','[data-hero-plot="concurrent_dos_all"]']],
- [data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=0',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_24h"]','[data-hero-plot="concurrent_dos_all"]']],
+ [v6Data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=1',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_7d"]','[data-hero-plot="concurrent_dos_all"]']],
+ [data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=1',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_24h"]','[data-hero-plot="concurrent_dos_all"]']],
 ]){
  for(const selector of plots){
   const heroLive=application(urlQuery,dataset,'1',releaseContext(dataset,'hero-old',()=>dataset.end));
@@ -2106,7 +2116,7 @@ const noQualOverview=application('?view=overview',noQualData).app.markup();
 assert.match(noQualOverview,/No qualifying family alerts/);
 assert.doesNotMatch(noQualOverview,/All families below 90th pct/);
 assert.match(noQualOverview,/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
-assert.match(noQualOverview,/Alert lanes \(01→06\): 01 Connection floods/);
+assert.match(noQualOverview,/Alert strip \(01→06\)[\s\S]*01 Connection floods/);
 
 const heroAllSvg=element(800),narrowAllSvg=element(240);
 application('?view=overview',data).app.drawHero(heroAllSvg,'all','linear',true);
@@ -2650,7 +2660,8 @@ copyCtrl.app.start();
   click(visCtrl,'[data-hero-range]',{heroRange:'7d'});
   assert.equal(visCtrl.browser.document.activeElement,origVisQSA('[data-hero-range="7d"]')[1],'focus skips hidden button (offsetParent===null)');
   assert.match(v7Overview.page.innerHTML,/Hourly UTC publication planned/);
-  assert.match(v7Overview.page.innerHTML,/Latest 1h mitigated &amp; flood rate/);
+  assert.match(v7Overview.page.innerHTML,/Latest 1h mitigated rate/);
+  assert.match(application('?view=overview&hero_hsdir=1',v7NonMidnight).app.markup(),/Latest 1h mitigated &amp; flood rate/);
   assert.match(v7Overview.page.innerHTML,/Concurrent family alerts \(1h\)/);
   assert.match(v7Overview.page.innerHTML,/Open circuits \(1h mean\)/);
   assert.match(v7Overview.page.innerHTML,/Stalled BEGIN_DIR \(1h mean\)/);
@@ -2664,7 +2675,7 @@ copyCtrl.app.start();
    s.current.hour={value:null,relays:0,expected_relays:Math.max(8,c.relays),coverage:0,valid:false};
   }
   const empty24Kpi=application('?view=overview',emptyHourlyOnly).app.markup();
-  assert.match(empty24Kpi,/Latest 1h mitigated &amp; flood rate<\/div><div class="hero-kpi-value unknown">Unavailable/);
+  assert.match(empty24Kpi,/Latest 1h mitigated rate<\/div><div class="hero-kpi-value unknown">Unavailable/);
   assert.match(empty24Kpi,/No measured family series/);
 
   // Non-midnight v7 snapshot: 7d hero end cell ranks 00:00 UTC daily bar via baseline rather than rolling reference.day.
@@ -2722,7 +2733,7 @@ copyCtrl.app.start();
   const v7Exp=application('?view=explorer&chart=transport_rejections&range=24h&band=1',v7BandDoc);
   v7Exp.app.start();
   const v7Labels=statSections(v7Exp.page.innerHTML).map(s=>s.html.match(/<div class="stat-label">([^<]+)<\/div>/)?.[1]);
-  assert.deepEqual(v7Labels,['Last complete hour','24-hour average','Last 6 months average','All-time average']);
+  assert.deepEqual(v7Labels,['Last complete hour','24-hour average','Last 7 days average','All-time average']);
   assert.match(v7Exp.page.innerHTML,/Sampled 1h fleet peak:/);
   assert.match(v7Exp.page.innerHTML,/Highest sampled hourly fleet value/);
   assert.match(v7Exp.page.innerHTML,/sampled hours \/ .*? days/);
@@ -3006,6 +3017,126 @@ copyCtrl.app.start();
   const v7DailyHeaders=[...v7DailyTable.matchAll(/<th>(.*?)<\/th>/g)].map(([,h])=>decode(h));
   assert.ok(!v7DailyHeaders.includes('Last complete hour'));
   assert.match(application('?view=methods',v7DailyData,'1',v7DailyRelease).app.markup(),/Daily publication and reference updates/);
+
+  // Hero alert sibling Explorer deep link preserves [data-family-jump] text and routes directly to the alerting series.
+  const alertDeepDoc=makeAlertDataset(v7NonMidnight,'hour',['high','neutral','neutral','neutral','neutral','neutral']);
+  const alertDeepCtrl=application('?view=overview',alertDeepDoc);
+  alertDeepCtrl.app.start();
+  const famJumpEl=alertDeepCtrl.browser.document.querySelector('[data-family-jump="transport"]');
+  assert.equal(decode(famJumpEl.textContent.trim()),'01 Connection floods');
+  const detailDeepEl=alertDeepCtrl.browser.document.querySelector('.hero-alert-detail');
+  assert.ok(detailDeepEl,'hero alert includes sibling Explorer detail link');
+  assert.equal(detailDeepEl.dataset.explore,'transport');
+  assert.equal(detailDeepEl.dataset.chart,'transport_rejections');
+  assert.equal(detailDeepEl.dataset.range,'24h');
+  const expectedAlertSeries=detailDeepEl.dataset.series;
+  assert.ok(expectedAlertSeries);
+  alertDeepCtrl.events.get('click')({target:detailDeepEl,button:0,preventDefault(){}});
+  assert.equal(alertDeepCtrl.app.getState().view,'explorer');
+  assert.equal(alertDeepCtrl.app.getState().chartId,'transport_rejections');
+  assert.equal(alertDeepCtrl.app.getState().seriesKey,expectedAlertSeries);
+  assert.equal(alertDeepCtrl.app.getState().range,'24h');
+
+  // Inactive 0-exit fleet: active denominator drops to 5, .fleet-strip renders, 0-exit callout shown, and flat-zero SVG uses 140px compact height.
+  const zeroExitDoc=structuredClone(v7NonMidnight);
+  zeroExitDoc.flags={Running:240,Guard:64,Exit:0,HSDir:48,V2Dir:160};
+  const exitChartObj=chart('exit_stream_rejections',zeroExitDoc);
+  for(const s of exitChartObj.series){
+   s.values=s.values.map(([t])=>[t,0]);
+   s.history.daily=s.history.daily.map(([t,v,n,cov,ok])=>[t,0,n,cov,ok]);
+   s.current.hour.value=0;s.current.day.value=0;
+   s.reference.hour={n:100,current_percentile:null,flat_zero:true,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:s.history.daily[0][0],end:s.history.daily.at(-1)[0]};
+   s.reference.day={n:100,current_percentile:null,flat_zero:true,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:s.history.daily[0][0],end:s.history.daily.at(-1)[0]};
+  }
+  const zeroExitCtrl=application('?view=overview',zeroExitDoc);
+  zeroExitCtrl.app.start();
+  assert.match(zeroExitCtrl.page.innerHTML,/2 of 5 <small>active families ≥90th pct<\/small>/);
+  assert.ok(zeroExitCtrl.browser.document.querySelector('.fleet-strip'));
+  assert.match(zeroExitCtrl.page.innerHTML,/0 Exit \(non-exit fleet\)/);
+  assert.doesNotMatch(zeroExitCtrl.page.innerHTML,/middle-only fleet/);
+  assert.match(zeroExitCtrl.page.innerHTML,/class="card-callout"[\s\S]*0 Exit relays/);
+  const flatClasses=new Set();
+  const flatPlotEl=Object.assign(element(800),{classList:{toggle(k,v){if(v)flatClasses.add(k);else flatClasses.delete(k);},contains(k){return flatClasses.has(k);}}});
+  zeroExitCtrl.app.draw(flatPlotEl,exitChartObj,'7d',800);
+  assert.match(flatPlotEl.innerHTML,/viewBox="0 0 800 140"/);
+  assert.ok(flatPlotEl.classList.contains('plot-flat-zero'));
+
+  // Minimal fixture without flags/versions/dircache_cohort omits .fleet-strip cleanly.
+  const minimalStripDoc=structuredClone(v7NonMidnight);
+  delete minimalStripDoc.flags;delete minimalStripDoc.versions;delete minimalStripDoc.dircache_cohort;
+  const minimalStripCtrl=application('?view=overview',minimalStripDoc);
+  minimalStripCtrl.app.start();
+  assert.equal(minimalStripCtrl.browser.document.querySelector('.fleet-strip'),null);
+
+  // Multi-chart family .child-strip highlights alerting child chart + series with Explorer deep link.
+  const childStripDoc=makeAlertDataset(v7NonMidnight,'hour',['neutral','neutral','neutral','neutral','neutral','neutral']);
+  const dirRejSeries=chart('directory_rejections',childStripDoc).series[0];
+  dirRejSeries.current.hour.valid=true;
+  dirRejSeries.reference.hour={n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:1,end:2};
+  const childStripCtrl=application('?view=overview',childStripDoc);
+  childStripCtrl.app.start();
+  const dirFamilyEl=childStripCtrl.browser.document.getElementById('family-directory');
+  const highChildPill=dirFamilyEl.querySelector('.high');
+  assert.ok(highChildPill,'multi-chart directory family shows high child pill');
+  assert.ok((highChildPill.getAttribute('class')||'').split(/\s+/).includes('child-pill'));
+  assert.equal(highChildPill.dataset.chart,'directory_rejections');
+  assert.equal(highChildPill.dataset.series,dirRejSeries.key);
+
+  // Explorer auxiliary directory_requests series selection plots the selected auxiliary series and survives replaceRelease; default still plots multi-series display_keys.
+  const auxSelectCtrl=application('?view=explorer&chart=directory_requests&series=consensus&range=1mo',data,'1',releaseContext(data,'aux-1',()=>data.end));
+  auxSelectCtrl.app.start();
+  const dirReqChart=chart('directory_requests',data);
+  assert.equal(auxSelectCtrl.browser.document.querySelectorAll('option').length,dirReqChart.series.length);
+  assert.equal(auxSelectCtrl.app.getState().seriesKey,'consensus');
+  assert.match(selectorMarkup(auxSelectCtrl.page.innerHTML)[0].text,/consensus/);
+  assert.doesNotMatch(selectorMarkup(auxSelectCtrl.page.innerHTML)[0].text,/hs_get/);
+  const auxPlot=element(800);
+  auxSelectCtrl.app.draw(auxPlot,dirReqChart,'1mo',800);
+  assert.match(auxPlot.innerHTML,/class="measurement-series"/);
+  const freshAux=structuredClone(data);
+  auxSelectCtrl.app.replaceRelease(freshAux,releaseContext(freshAux,'aux-2',()=>freshAux.end));
+  assert.equal(auxSelectCtrl.app.getState().seriesKey,'consensus');
+  const defDirCtrl=application('?view=explorer&chart=directory_requests&range=1mo',data);
+  defDirCtrl.app.start();
+  assert.match(selectorMarkup(defDirCtrl.page.innerHTML)[0].text,/hs_get\|hs_post\|no_request/);
+
+  // Partial-window (Xd) badges in Explorer values table, live fleet build mix in Fixes, and bulleted coarsening list in Methods.
+  const partialBadgeDoc=structuredClone(data);
+  chart('transport_rejections',partialBadgeDoc).series[0].historical_averages.six_months={
+   status:'ready',value:1.2,display:'1.2',days:45,expected_days:180,start:1,end:2,observed_start:1,observed_end:2,
+  };
+  const partialBadgeHtml=application('?view=explorer&chart=transport_rejections&range=6mo',partialBadgeDoc).app.markup();
+  assert.match(partialBadgeHtml,/<span class="table-days"[^>]*>\(45d\)<\/span>/);
+  const fixesHtml=application('?view=fixes',data).app.markup();
+  assert.match(fixesHtml,/22 Nov 2026 UTC/);
+  assert.match(fixesHtml,/Current fleet build mix/);
+  assert.match(fixesHtml,/Patched/);
+  assert.match(fixesHtml,/0\.4\.9\.15/);
+  const methodsHtml=application('?view=methods',data).app.markup();
+  assert.match(methodsHtml,/<ul class="coarsening-list">([\s\S]*<li>){5}/);
+
+  // Explicit link series selection clears bandEnabled on same chart; neutral child-pill explicit data-series="" clears seriesKey/bandEnabled while omitting data-series preserves.
+  const sameChartBandCtrl=application('?view=explorer&chart=transport_rejections&range=24h&band=1',alertDeepDoc);
+  sameChartBandCtrl.app.start();
+  assert.equal(sameChartBandCtrl.app.getState().bandEnabled,true);
+  sameChartBandCtrl.events.get('click')({target:sameChartBandCtrl.browser.document.querySelector('[data-view="overview"]'),button:0,preventDefault(){}});
+  const sameDetailEl=sameChartBandCtrl.browser.document.querySelector('.hero-alert-detail');
+  sameChartBandCtrl.events.get('click')({target:sameDetailEl,button:0,preventDefault(){}});
+  assert.equal(sameChartBandCtrl.app.getState().chartId,'transport_rejections');
+  assert.equal(sameChartBandCtrl.app.getState().seriesKey,sameDetailEl.dataset.series);
+  assert.equal(sameChartBandCtrl.app.getState().bandEnabled,false);
+
+  const neutralResetCtrl=application('?view=explorer&chart=directory_requests&series=consensus&range=24h',childStripDoc);
+  neutralResetCtrl.app.start();
+  assert.equal(neutralResetCtrl.app.getState().seriesKey,'consensus');
+  neutralResetCtrl.events.get('click')({target:neutralResetCtrl.browser.document.querySelector('[data-view="overview"]'),button:0,preventDefault(){}});
+  const dirFamilyResetEl=neutralResetCtrl.browser.document.getElementById('family-directory');
+  const neutralChildPill=dirFamilyResetEl.querySelector('[data-chart="directory_requests"]');
+  assert.ok(neutralChildPill&&(neutralChildPill.getAttribute('class')||'').split(/\s+/).includes('neutral'));
+  assert.equal(neutralChildPill.dataset.series,'');
+  neutralResetCtrl.events.get('click')({target:neutralChildPill,button:0,preventDefault(){}});
+  assert.equal(neutralResetCtrl.app.getState().chartId,'directory_requests');
+  assert.equal(neutralResetCtrl.app.getState().seriesKey,null);
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }
