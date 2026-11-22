@@ -1,5 +1,5 @@
 """Public display precision only; never feed formatted values into analysis."""
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from fractions import Fraction
 
 from windows import require
@@ -7,6 +7,8 @@ from windows import require
 
 _MAX_EXACT = 10**1000
 _D_MAX_EXACT = Decimal(_MAX_EXACT)
+_D_SUBUNIT_FLOOR = Decimal('0.001')
+_F_SUBUNIT_FLOOR = Fraction(1, 1000)
 
 
 def _measurement(value, message='Measurement must be numeric'):
@@ -35,6 +37,39 @@ def _whole(value):
     return int(value.to_integral_value(rounding=ROUND_HALF_UP))
 
 
+_F_TENTH = Fraction(1, 10)
+_F_HUNDREDTH = Fraction(1, 100)
+
+
+def _subunit(value):
+    sign = '-' if value < 0 else ''
+    if isinstance(value, Fraction):
+        abs_frac = abs(value)
+        if abs_frac < _F_SUBUNIT_FLOOR:
+            return '<0.001' if value > 0 else '>−0.001'
+        scale = 100 if abs_frac >= _F_TENTH else (1000 if abs_frac >= _F_HUNDREDTH else 10000)
+        scaled = abs_frac * scale
+        q, r = divmod(scaled.numerator, scaled.denominator)
+        rounded = q + (2 * r >= scaled.denominator)
+        if rounded >= scale:
+            return sign + '1'
+        return sign + format((Decimal(rounded) / Decimal(scale)).normalize(), 'f')
+    abs_dec = abs(value)
+    if abs_dec < _D_SUBUNIT_FLOOR:
+        return '<0.001' if value > 0 else '>−0.001'
+    return _format_subunit_decimal(abs_dec, sign)
+
+
+def _format_subunit_decimal(abs_dec, sign):
+    with localcontext() as ctx:
+        ctx.prec = max(34, abs_dec.adjusted() + 10)
+        quantum = Decimal((0, (1,), abs_dec.adjusted() - 1))
+        rounded = abs_dec.quantize(quantum, rounding=ROUND_HALF_UP)
+        if rounded >= 1:
+            return sign + '1'
+        return sign + format(rounded.normalize(), 'f')
+
+
 def _check_boundaries(boundaries):
     validated = []
     for boundary in boundaries:
@@ -45,16 +80,14 @@ def _check_boundaries(boundaries):
 
 
 def number(value, grouping=True):
-    """Whole units, with zero distinguished from a positive sub-unit value."""
+    """Whole units >= 1, 2-significant-digit decimals in [0.001, 1), and <0.001 floor."""
     if value is None:
         return 'Unavailable'
     value = _measurement(value)
     if not value:
         return '0'
-    if 0 < value < 1:
-        return '<1'
-    if -1 < value < 0:
-        return '>−1'
+    if -1 < value < 1:
+        return _subunit(value)
     rounded = _whole(value)
     return f'{rounded:,}' if grouping else str(rounded)
 

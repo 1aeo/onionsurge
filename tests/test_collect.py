@@ -122,9 +122,6 @@ class CollectorFixture:
                     def data(t, chart=chart, statistic=statistic, period=period):
                         rows = []
                         for series in chart['series']:
-                            if series['key'] == 'circuit_dead' and not (
-                                    period == 'current_hour' or statistic == 'available'):
-                                continue
                             value = chart['relays']
                             if statistic == 'value':
                                 value = 77 if t >= END else 2
@@ -198,9 +195,6 @@ def _snapshot_handlers(seed, routes, *, live_native=None, rate_val=2.0):
                     for c in group_charts:
                         pop = pop_for_chart(c)
                         for s in c['series']:
-                            if c['id'] == 'directory_requests' and s['key'] not in c.get('display_keys', [s['key']]) and not (
-                                    period == 'current_hour' or stat_name == 'available'):
-                                continue
                             labels = _series_promql_labels(c, s)
                             canon = tuple(sorted(labels.items()))
                             if canon in seen:
@@ -497,8 +491,8 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual([row[0] for row in population['daily']],
                                  [row[0] for row in series['history']['daily'] if row[4]])
                 if series['key'] == 'circuit_dead':
-                    self.assertIsNone(population['day'])
-                    self.assertEqual(population['daily'], [])
+                    self.assertIsNotNone(population['day'])
+                    self.assertGreater(len(population['daily']), 0)
 
     def test_population_mismatch_omits_metadata_without_replacing_measurements(self):
         fixture = CollectorFixture()
@@ -594,10 +588,14 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(circuit['history']['daily'][-1], [END, 77.0, 80, 1.0, True])
         self.assertEqual(circuit['history']['sampled_hour'][-1], [END, 77.0, 80, 1.0, True])
         self.assertEqual(set(circuit['history']), {'daily', 'sampled_hour'})
-        directory = charts['directory_requests']; _, aux_s = directory['series']
+        directory = charts['directory_requests']; hs_get_s, aux_s = directory['series']
         self.assertEqual(aux_s['current']['hour']['value'], 77.0)
-        self.assertIsNone(aux_s['current']['day']['value'])
-        self.assertEqual(aux_s['history'], {'daily': [], 'sampled_hour': []})
+        self.assertEqual(aux_s['current']['day']['value'], 77.0)
+        self.assertEqual(aux_s['history']['daily'][0], [hs_get_s['history']['daily'][0][0], 2.0, 32, 1.0, True])
+        self.assertEqual(aux_s['history']['daily'][-1], [END, 77.0, 32, 1.0, True])
+        self.assertGreater(len(aux_s['history']['sampled_hour']), 0)
+        self.assertEqual(aux_s['history']['sampled_hour'][-1], [END, 77.0, 32, 1.0, True])
+        self.assertGreater(len(aux_s['relay_population']['daily']), 0)
         expected = fixture.queries[fixture.routes['directory_requests.current_hour.value']]
         self.assertEqual(directory['query'], expected)
         self.assertIn('== 3', expected)
@@ -1523,6 +1521,47 @@ class CollectorTests(unittest.TestCase):
             short_planned = (short_v3_plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
             self.assertEqual(short_src.catalogue_calls, 1)
             self.assertLessEqual(short_res['source_requests'] + short_src.catalogue_calls, short_planned)
+
+            # A seed whose directory_requests auxiliary series lack daily/sampled_hour/population rows sizes backfill requests accurately.
+            dir_full = copy.deepcopy(base_v4)
+            for c in dir_full['charts']:
+                for s in c['series']:
+                    if s['history']['daily']:
+                        s['history']['daily'] = [r for r in s['history']['daily'] if r[0] >= cutoff_5d]
+                    if s['history'].get('sampled_hour'):
+                        s['history']['sampled_hour'] = [r for r in s['history']['sampled_hour'] if r[0] >= cutoff_5d]
+                    if 'relay_population' in s and s['relay_population']['daily']:
+                        s['relay_population']['daily'] = [r for r in s['relay_population']['daily'] if r[0] >= cutoff_5d]
+            dir_empty = copy.deepcopy(dir_full)
+            for c in dir_empty['charts']:
+                if c['id'] == 'directory_requests':
+                    for s in c['series']:
+                        if s['key'] not in c['display_keys']:
+                            s['history']['daily'] = []
+                            s['history']['sampled_hour'] = []
+                            s['current']['day'] = {'value': None, 'relays': None, 'expected_relays': c['relays'],
+                                                   'coverage': None, 'valid': False}
+                            s['relay_population']['daily'] = []
+                            s['relay_population']['day'] = None
+            dir_full_app, dir_empty_app = root / 'dir_full_app', root / 'dir_empty_app'
+            (dir_full_app / 'inputs').mkdir(parents=True)
+            (dir_empty_app / 'inputs').mkdir(parents=True)
+            (dir_full_app / 'inputs/snapshot.json').write_text(json.dumps(dir_full))
+            (dir_empty_app / 'inputs/snapshot.json').write_text(json.dumps(dir_empty))
+            full_dir_plan = collector.plan_collection(cfg, dir_full_app, root / 'dir_full_s', end=end1, config_path=cfg_file)
+            empty_dir_plan = collector.plan_collection(cfg, dir_empty_app, root / 'dir_empty_s', end=end1, config_path=cfg_file)
+            self.assertGreater(empty_dir_plan['recommended_timeout_seconds'], full_dir_plan['recommended_timeout_seconds'])
+            dir_src = SyntheticSource(queries, _snapshot_handlers(dir_empty, routes, rate_val=1.0))
+            dir_res = collector.collect(cfg, dir_empty_app, root / 'dir_empty_s', root / 'dir_empty_out.json',
+                                        end=end1, source=dir_src, config_path=cfg_file)
+            dir_planned = (empty_dir_plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
+            self.assertLessEqual(dir_res['source_requests'] + dir_src.catalogue_calls, dir_planned)
+            dir_collected = json.loads((root / 'dir_empty_out.json').read_text())
+            dir_chart_after = next(c for c in dir_collected['charts'] if c['id'] == 'directory_requests')
+            aux_after = next(s for s in dir_chart_after['series'] if s['key'] not in dir_chart_after['display_keys'])
+            self.assertEqual(len(aux_after['history']['daily']), len(dir_collected['charts'][0]['series'][0]['history']['daily']))
+            self.assertGreater(len(aux_after['history']['sampled_hour']), 0)
+            self.assertGreater(len(aux_after['relay_population']['daily']), 0)
 
             # Fail closed on non-private/symlink/corrupt state artifacts during --plan.
             cp_file = missing_state / 'checkpoint.json'

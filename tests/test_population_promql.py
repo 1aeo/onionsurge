@@ -26,7 +26,7 @@ class PopulationCatalogueTests(unittest.TestCase):
         self.assertIn('[1h]', queries['relay_population_directory_requests_hour'])
         self.assertNotIn('hs_get|hs_post|no_request', queries['relay_population_directory_requests_hour'])
         self.assertIn('[1d]', queries['relay_population_directory_requests_day'])
-        self.assertIn('hs_get|hs_post|no_request', queries['relay_population_directory_requests_day'])
+        self.assertNotIn('hs_get|hs_post|no_request', queries['relay_population_directory_requests_day'])
 
 
 @unittest.skipUnless(shutil.which('promtool'), 'promtool is needed for PromQL semantic tests')

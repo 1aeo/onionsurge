@@ -9,7 +9,7 @@
     "12m": "12mo"
   },
   "card_slots": {
-    "fallback_dynamic": "6mo",
+    "fallback_dynamic": "7d",
     "fixed": [
       "24h",
       "all"

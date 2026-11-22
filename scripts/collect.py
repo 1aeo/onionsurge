@@ -757,6 +757,7 @@ class Collector:
                          for stat_name in ('value', 'eligible', 'available')}
                 for period in ('daily', 'sampled_hour', 'current24')
             }
+            chart_first_daily = min((int(s['history']['daily'][0][0]) for s in chart['series'] if s['history']['daily']), default=None)
             for series in chart['series']:
                 rows = series['history']['daily']
                 sh_rows = series['history'].setdefault('sampled_hour', [])
@@ -795,12 +796,14 @@ class Collector:
 
                 fetched_raw_n = {}
                 last_exp_c = None
-                if rows:
-                    daily_times = list(range(int(rows[-1][0]) + DAY, target_day + 1, DAY))
+                daily_start = (int(rows[-1][0]) + DAY) if rows else chart_first_daily
+                if daily_start is not None:
+                    daily_times = list(range(daily_start, target_day + 1, DAY))
                     fetched_raw_n, last_exp_c = self._fill_history_rows(
                         chart, series, 'daily', DAY, DAY, daily_times, rows,
                         chart_c=chart_c, enforce_chart_floor=True,
                     )
+                if rows:
                     if not sh_rows:
                         raw_first = max(int(rows[0][0]) - DAY + SAMPLED_HOUR_STEP,
                                         target_sh - SAMPLED_HOUR_BACKFILL_MAX_DAYS * DAY)
@@ -1197,6 +1200,10 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
         cur24_elig_q = routes[f'{cid}.current24.eligible']
         pop_day_q = routes[f'{cid}.relay_population.day']
         pop_hour_q = routes[f'{cid}.relay_population.hour']
+        chart_first_daily = min(
+            (int(s['history']['daily'][0][0]) for s in chart['series'] if s.get('history', {}).get('daily')),
+            default=None,
+        )
 
         for series in chart['series']:
             fetch(cur_hr_elig_q, HOUR, context_times)
@@ -1209,9 +1216,11 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
             fetched_raw_n = set()
             fetched_cur24 = False
             final_daily_end = int(daily_rows[-1][0]) if daily_rows else None
+            effective_first_daily = int(daily_rows[0][0]) if daily_rows else chart_first_daily
+            daily_start = (int(daily_rows[-1][0]) + DAY) if daily_rows else chart_first_daily
+            has_daily_history = bool(daily_rows or (daily_start is not None and daily_start <= target_day))
 
-            if daily_rows:
-                daily_start = int(daily_rows[-1][0]) + DAY
+            if daily_start is not None:
                 if warm_day_cutoff is not None:
                     daily_start = max(daily_start, warm_day_cutoff + DAY)
                 daily_times = list(range(daily_start, target_day + 1, DAY))
@@ -1222,12 +1231,15 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
                     fetched_raw_n.update(daily_times)
                     final_daily_end = daily_times[-1]
 
-                if not sh_rows:
-                    raw_first = max(int(daily_rows[0][0]) - DAY + SAMPLED_HOUR_STEP,
+            if has_daily_history:
+                if not sh_rows and effective_first_daily is not None:
+                    raw_first = max(effective_first_daily - DAY + SAMPLED_HOUR_STEP,
                                     target_sh - SAMPLED_HOUR_BACKFILL_MAX_DAYS * DAY)
                     first_sh = ((raw_first + SAMPLED_HOUR_STEP - 1) // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
-                else:
+                elif sh_rows:
                     first_sh = int(sh_rows[-1][0]) + SAMPLED_HOUR_STEP
+                else:
+                    first_sh = target_sh + SAMPLED_HOUR_STEP
                 if warm_sh_cutoff is not None:
                     first_sh = max(first_sh, warm_sh_cutoff + SAMPLED_HOUR_STEP)
                 sh_times = list(range(first_sh, target_sh + 1, SAMPLED_HOUR_STEP))
@@ -1262,7 +1274,7 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
                     fetch(daily_elig_q, DAY, missing_n)
                 fetch(pop_day_q, DAY, targets, population=True)
 
-            if daily_rows:
+            if has_daily_history:
                 cur_day_n = series.get('current', {}).get('day', {}).get('relays')
                 reused_day_end = (end in reused_dates)
                 reuses_seed_day = (not fetched_raw_n and not fetched_cur24 and end == seed['end']
