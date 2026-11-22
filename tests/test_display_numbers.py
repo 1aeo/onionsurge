@@ -25,6 +25,13 @@ class DisplayPrecisionTests(unittest.TestCase):
         self.assertEqual(number(Fraction(1, 1000) - Fraction(1, 10**40)), '<0.001')
         self.assertEqual(number(Fraction(995, 1000) - Fraction(1, 10**40)), '0.99')
         self.assertEqual(number(Fraction(995, 1000)), '1')
+        self.assertEqual(number(Decimal('0.994999999999999999999999999999')), '0.99')
+        self.assertEqual(number(Decimal('-0.994999999999999999999999999999')), '-0.99')
+        with localcontext() as ctx:
+            ctx.prec = 2
+            self.assertEqual(number(Decimal('0.994999999999999999999999999999')), '0.99')
+            self.assertEqual(number(Decimal('0.995')), '1')
+        self.assertEqual(number(Decimal('0.995')), '1')
         self.assertEqual(number(2.5), '3')
         self.assertEqual(number(1234.5), '1,235')
 

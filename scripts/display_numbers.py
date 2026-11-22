@@ -54,7 +54,7 @@ def _subunit(value):
         if rounded >= scale:
             return sign + '1'
         return sign + format((Decimal(rounded) / Decimal(scale)).normalize(), 'f')
-    abs_dec = abs(value)
+    abs_dec = value.copy_abs()
     if abs_dec < _D_SUBUNIT_FLOOR:
         return '<0.001' if value > 0 else '>−0.001'
     return _format_subunit_decimal(abs_dec, sign)

@@ -280,6 +280,7 @@ def prepare(snapshot, source_sha, cache, refresh=False, time_ranges_path=None):
 def live_index(page, *, hourly=True):
     replacements = {
         'data-mode="offline"': 'data-mode="live"',
+        'Loading MetricsPort charts…': 'Verifying release manifest and measurements…',
         '<script src="data.js"></script>': '',
         '<script src="app.js"></script>': '<script src="app.js"></script><script src="live.js"></script>',
         'Local preview · saved measurements': 'Hourly UTC measurements' if hourly else 'Daily UTC measurements',

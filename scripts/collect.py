@@ -1178,7 +1178,8 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
         missing = [t for t in times if t not in seen]
         if not missing:
             return
-        requests += _contiguous_run_batches(missing, step, population=population)
+        # Population requests cover only qualifying dates, so isolated dates can each need a request.
+        requests += len(missing) if population else _contiguous_run_batches(missing, step)
         seen.update(missing)
 
     charts_by_id = {c['id']: c for c in seed['charts']}

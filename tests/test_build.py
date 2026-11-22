@@ -1134,6 +1134,12 @@ class BuildTests(unittest.TestCase):
         self.assertIn('1 month', built['history_methods']['historical_averages'])
         self.assertNotIn('hs_get, hs_post, no_request in daily', built['history_methods']['custom_directory'])
         self.assertEqual(built['time_ranges']['card_slots']['fallback_dynamic'], '7d')
+        offline_html = (ROOT / 'site/index.html').read_text(encoding='utf-8')
+        self.assertIn('Loading MetricsPort charts…', offline_html)
+        self.assertNotIn('Verifying release manifest and measurements', offline_html)
+        live_html = builder.live_index(offline_html, hourly=True)
+        self.assertIn('Verifying release manifest and measurements…', live_html)
+        self.assertNotIn('Loading MetricsPort charts…', live_html)
 
     def test_duplicate_export_paths_across_chart_and_suffix_hyphens_are_rejected(self):
         colliding_ranges = {

@@ -689,8 +689,7 @@ function updateHeaderOffset(){
 }
 const closeNavigation=()=>{$('.nav-links')?.classList.remove('show');$('.nav-toggle')?.setAttribute('aria-expanded','false');updateHeaderOffset();};
 function setView(v,r=range,f=familyId,c=chartId,focusSelector,sKey){
- if(chartId!==c){seriesKey=sKey||null;bandEnabled=false;}
- else if(sKey!==undefined){seriesKey=sKey||null;}
+ if(chartId!==c||sKey!==undefined){seriesKey=sKey||null;bandEnabled=false;}
  view=v;familyId=f;chartId=c;range=r;
  if(!remember())return false;
  render();closeNavigation();window.scrollTo?.(0,0);focusDestination(focusSelector);return true;
@@ -933,7 +932,7 @@ function fleetOpsStrip(){
   const parts=[];
   if(Number.isInteger(D.flags.Running))parts.push(`${count(D.flags.Running)} Running`);
   if(Number.isInteger(D.flags.Guard))parts.push(`${count(D.flags.Guard)} Guard`);
-  if(Number.isInteger(D.flags.Exit))parts.push(D.flags.Exit===0?'0 Exit (middle-only fleet)':`${count(D.flags.Exit)} Exit`);
+  if(Number.isInteger(D.flags.Exit))parts.push(D.flags.Exit===0?'0 Exit (non-exit fleet)':`${count(D.flags.Exit)} Exit`);
   if(Number.isInteger(D.flags.HSDir))parts.push(`${count(D.flags.HSDir)} HSDir`);
   if(Number.isInteger(D.flags.V2Dir))parts.push(`${count(D.flags.V2Dir)} V2Dir`);
   if(parts.length){
@@ -1054,7 +1053,7 @@ function childStrip(f,r){
   const alerting=bestState==='elevated'||bestState==='high';
   const detail=alerting&&bestSeries?` · ${bestSeries.name} (${formatPercentileOrdinal(bestRank)} pct)`:'';
   const href=url('explorer',r,f.id,cid,alerting&&bestSeries?bestSeries.key:null);
-  const seriesAttr=alerting&&bestSeries?` data-series="${escapeHtml(bestSeries.key)}"`:'';
+  const seriesAttr=` data-series="${escapeHtml(alerting&&bestSeries?bestSeries.key:'')}"`;
   return `<a class="child-pill ${bestState}" href="${href}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(cid)}" data-range="${escapeHtml(r)}"${seriesAttr}>${escapeHtml(ch.title)}${escapeHtml(detail)}</a>`;
  }).filter(Boolean).join('');
  return `<div class="child-strip" aria-label="${escapeHtml(f.title)} child charts"><span class="child-strip-label">Family charts (${count(f.children.length)})</span><div class="child-pill-list">${pills}</div></div>`;
@@ -1456,7 +1455,7 @@ document.addEventListener('click',async e=>{
  const layoutToggle=hit('[data-layout]');if(layoutToggle){const next=layoutToggle.dataset.layout==='grid'?'grid':'full';if(next!==layout){layout=next;redrawControl(`[data-layout="${layout}"]`);}return;}
  if(hit('[data-band-toggle]')){bandEnabled=!bandEnabled;redrawControl('[data-band-toggle]');return;}
  const nav=hit('[data-view]');if(nav){e.preventDefault();if(['overview','explorer','fixes','methods'].includes(nav.dataset.view))setView(nav.dataset.view);return;}
- const ex=hit('[data-explore]');if(ex){e.preventDefault();const f=family(ex.dataset.explore),c=chart(ex.dataset.chart)||(f&&chart(f.primary)),r=periodMap.has(ex.dataset.range)?ex.dataset.range:range,sKey=ex.dataset.series||undefined;if(c)setView('explorer',r,c.family_id,c.id,undefined,sKey);return;}
+ const ex=hit('[data-explore]');if(ex){e.preventDefault();const f=family(ex.dataset.explore),c=chart(ex.dataset.chart)||(f&&chart(f.primary)),r=periodMap.has(ex.dataset.range)?ex.dataset.range:range,hasSeries=!!(ex.hasAttribute?.('data-series')||Object.hasOwn(ex.dataset,'series')),sKey=hasSeries?(ex.getAttribute?.('data-series')??ex.dataset.series??''):undefined;if(c)setView('explorer',r,c.family_id,c.id,undefined,sKey);return;}
  const child=hit('[data-child]');if(child){e.preventDefault();const c=chart(child.dataset.child);if(c)setView('explorer',range,c.family_id,c.id);return;}
  const fam=hit('[data-family]');if(fam){const f=family(fam.dataset.family);if(f)setView('explorer',range,f.id,f.primary);return;}
  if(hit('[data-methods]')){e.preventDefault();if(!setView('methods'))return;window.history.replaceState(null,'',url('methods')+'#reference');focusDestination('#reference');document.getElementById('reference')?.scrollIntoView({block:'start'});return;}

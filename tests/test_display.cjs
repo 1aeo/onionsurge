@@ -3052,7 +3052,8 @@ copyCtrl.app.start();
   zeroExitCtrl.app.start();
   assert.match(zeroExitCtrl.page.innerHTML,/2 of 5 <small>active families ≥90th pct<\/small>/);
   assert.ok(zeroExitCtrl.browser.document.querySelector('.fleet-strip'));
-  assert.match(zeroExitCtrl.page.innerHTML,/0 Exit \(middle-only fleet\)/);
+  assert.match(zeroExitCtrl.page.innerHTML,/0 Exit \(non-exit fleet\)/);
+  assert.doesNotMatch(zeroExitCtrl.page.innerHTML,/middle-only fleet/);
   assert.match(zeroExitCtrl.page.innerHTML,/class="card-callout"[\s\S]*0 Exit relays/);
   const flatClasses=new Set();
   const flatPlotEl=Object.assign(element(800),{classList:{toggle(k,v){if(v)flatClasses.add(k);else flatClasses.delete(k);},contains(k){return flatClasses.has(k);}}});
@@ -3113,6 +3114,29 @@ copyCtrl.app.start();
   assert.match(fixesHtml,/0\.4\.9\.15/);
   const methodsHtml=application('?view=methods',data).app.markup();
   assert.match(methodsHtml,/<ul class="coarsening-list">([\s\S]*<li>){5}/);
+
+  // Explicit link series selection clears bandEnabled on same chart; neutral child-pill explicit data-series="" clears seriesKey/bandEnabled while omitting data-series preserves.
+  const sameChartBandCtrl=application('?view=explorer&chart=transport_rejections&range=24h&band=1',alertDeepDoc);
+  sameChartBandCtrl.app.start();
+  assert.equal(sameChartBandCtrl.app.getState().bandEnabled,true);
+  sameChartBandCtrl.events.get('click')({target:sameChartBandCtrl.browser.document.querySelector('[data-view="overview"]'),button:0,preventDefault(){}});
+  const sameDetailEl=sameChartBandCtrl.browser.document.querySelector('.hero-alert-detail');
+  sameChartBandCtrl.events.get('click')({target:sameDetailEl,button:0,preventDefault(){}});
+  assert.equal(sameChartBandCtrl.app.getState().chartId,'transport_rejections');
+  assert.equal(sameChartBandCtrl.app.getState().seriesKey,sameDetailEl.dataset.series);
+  assert.equal(sameChartBandCtrl.app.getState().bandEnabled,false);
+
+  const neutralResetCtrl=application('?view=explorer&chart=directory_requests&series=consensus&range=24h',childStripDoc);
+  neutralResetCtrl.app.start();
+  assert.equal(neutralResetCtrl.app.getState().seriesKey,'consensus');
+  neutralResetCtrl.events.get('click')({target:neutralResetCtrl.browser.document.querySelector('[data-view="overview"]'),button:0,preventDefault(){}});
+  const dirFamilyResetEl=neutralResetCtrl.browser.document.getElementById('family-directory');
+  const neutralChildPill=dirFamilyResetEl.querySelector('[data-chart="directory_requests"]');
+  assert.ok(neutralChildPill&&(neutralChildPill.getAttribute('class')||'').split(/\s+/).includes('neutral'));
+  assert.equal(neutralChildPill.dataset.series,'');
+  neutralResetCtrl.events.get('click')({target:neutralChildPill,button:0,preventDefault(){}});
+  assert.equal(neutralResetCtrl.app.getState().chartId,'directory_requests');
+  assert.equal(neutralResetCtrl.app.getState().seriesKey,null);
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

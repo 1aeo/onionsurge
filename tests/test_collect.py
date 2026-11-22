@@ -1563,6 +1563,46 @@ class CollectorTests(unittest.TestCase):
             self.assertGreater(len(aux_after['history']['sampled_hour']), 0)
             self.assertGreater(len(aux_after['relay_population']['daily']), 0)
 
+            # Alternating qualifying population dates must count one request per target date (not contiguous batches).
+            sparse_seed = copy.deepcopy(short_v3)
+            sparse_seed_end = int(sparse_seed['end'])
+            for c in sparse_seed['charts']:
+                for s in c['series']:
+                    s['relay_population']['daily'] = []
+                    for i, row in enumerate(s['history']['daily']):
+                        if i % 2 == 1 and row[0] != sparse_seed_end:
+                            row[:] = [row[0], None, None, None, False]
+            sparse_app = root / 'sparse_pop_app'
+            (sparse_app / 'inputs').mkdir(parents=True)
+            (sparse_app / 'inputs/snapshot.json').write_text(json.dumps(sparse_seed))
+            sparse_plan = collector.plan_collection(cfg, sparse_app, root / 'sparse_pop_s', end=sparse_seed_end, config_path=cfg_file)
+            sparse_budget = (sparse_plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
+            sparse_src = SyntheticSource(queries, _snapshot_handlers(sparse_seed, routes, rate_val=1.0))
+            sparse_res = collector.collect(cfg, sparse_app, root / 'sparse_pop_s', root / 'sparse_pop_out.json',
+                                           end=sparse_seed_end, source=sparse_src, config_path=cfg_file)
+            self.assertLessEqual(sparse_res['source_requests'] + sparse_src.catalogue_calls, sparse_budget)
+            # Verify dense seed plan counts each population target individually rather than as a contiguous batch.
+            dense_seed = copy.deepcopy(short_v3)
+            for c in dense_seed['charts']:
+                for s in c['series']:
+                    s['relay_population']['daily'] = []
+            dense_reqs = collector._plan_max_requests(routes, queries, dense_seed, sparse_seed_end,
+                                                      warm_end=None, baseline_end=sparse_seed_end)
+            by_qid = {}
+            for c in dense_seed['charts']:
+                qid = routes[f'{c["id"]}.relay_population.day']
+                dates = by_qid.setdefault(qid, set())
+                for s in c['series']:
+                    dates.update(int(r[0]) for r in s['history']['daily'] if r[4])
+            unbatched_extra = sum(len(dates) for dates in by_qid.values())
+            batched_extra = sum(collector._contiguous_run_batches(dates, DAY, population=True)
+                                for dates in by_qid.values())
+            self.assertGreater(unbatched_extra, batched_extra)
+            base_with_pop = copy.deepcopy(short_v3)
+            base_reqs = collector._plan_max_requests(routes, queries, base_with_pop, sparse_seed_end,
+                                                     warm_end=None, baseline_end=sparse_seed_end)
+            self.assertGreaterEqual(dense_reqs - base_reqs, unbatched_extra)
+
             # Fail closed on non-private/symlink/corrupt state artifacts during --plan.
             cp_file = missing_state / 'checkpoint.json'
             cp_file.chmod(0o644)
