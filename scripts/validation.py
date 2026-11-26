@@ -544,7 +544,8 @@ def _validate_dos_thresholds(data, end):
     require(isinstance(dt, dict) and set(dt) == {'as_of', 'reported_relays', 'settings'},
             'Invalid DoS thresholds fields')
     require(timestamp(dt.get('as_of')) and dt['as_of'] == end, 'DoS thresholds snapshot mismatch')
-    require(is_coarsened_count(dt.get('reported_relays')), 'Invalid coarsened DoS thresholds relay count')
+    require(is_coarsened_count(dt.get('reported_relays')) and int(dt['reported_relays']) <= int(data['fleet']),
+            'Invalid coarsened DoS thresholds relay count')
     settings = dt.get('settings')
     require(isinstance(settings, list) and len(settings) == len(DOS_THRESHOLD_SETTINGS),
             'DoS thresholds must match the canonical settings list')
@@ -555,10 +556,12 @@ def _validate_dos_thresholds(data, end):
         require(setting['key'] == exp_key and setting['option'] == exp_option
                 and setting['family_id'] == exp_family and setting['unit'] == exp_unit,
                 'DoS threshold setting does not match canonical schema')
-        require(is_coarsened_count(setting['relays']) and is_coarsened_count(setting['suppressed_relays']),
+        require(is_coarsened_count(setting['relays']) and int(setting['relays']) <= int(data['fleet'])
+                and is_coarsened_count(setting['suppressed_relays']),
                 'Invalid coarsened DoS threshold relay count')
         values = setting['values']
-        require(isinstance(values, list), 'DoS threshold values must be an array')
+        require(isinstance(values, list) and len(values) <= 16,
+                'DoS threshold values must be an array of at most 16 entries')
         seen_pairs = set()
         shown_total = 0
         for entry in values:

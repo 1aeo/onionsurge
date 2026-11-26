@@ -280,7 +280,7 @@ function checkDosThresholds(dt,data,familyIds){
   exactKeys(s,['key','option','family_id','unit','relays','values','suppressed_relays'],'Invalid dos_thresholds setting');
   requireLive(matches(DOS_KEY,s.key)&&!RESERVED_JSON_KEYS.has(s.key)&&!seenKeys.has(s.key),'Invalid dos_thresholds setting key');
   seenKeys.add(s.key);
-  requireLive(textField(s.option)&&s.option.length<=64&&typeof s.family_id==='string'&&familyIds.has(s.family_id)&&textField(s.unit)&&s.unit.length<=32&&coarsenedCount(s.relays)&&coarsenedCount(s.suppressed_relays),'Invalid dos_thresholds setting metadata');
+  requireLive(textField(s.option)&&s.option.length<=64&&typeof s.family_id==='string'&&familyIds.has(s.family_id)&&textField(s.unit)&&s.unit.length<=32&&coarsenedCount(s.relays)&&(data.fleet===undefined||s.relays<=data.fleet)&&coarsenedCount(s.suppressed_relays),'Invalid dos_thresholds setting metadata');
   requireLive(Array.isArray(s.values)&&s.values.length<=16,'Invalid dos_thresholds values');
   const seenPairs=new Set();
   let sum=0;

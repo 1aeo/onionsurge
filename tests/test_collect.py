@@ -2446,24 +2446,69 @@ class CollectorTests(unittest.TestCase):
             self.assertIsNotNone(s['relay_population']['hour'])
             self.assertIsNotNone(s['relay_population']['day'])
 
-        # If a newly added series has never been observed at all, leading-null trim yields empty daily & sampled_hour.
-        worker_fixture = CollectorFixture()
+        # If newly added supplemental charts have no observed history at all, collect() omits them cleanly so validate_snapshot passes.
+        empty_handlers = copy.copy(handlers)
         for cid in ('incoming_connections', 'open_connections'):
             for period in ('daily', 'sampled_hour', 'current24'):
                 for stat_name in ('eligible', 'available', 'value'):
-                    worker_fixture.source.handlers[worker_fixture.routes[f'{cid}.{period}.{stat_name}']] = lambda t: []
+                    empty_handlers[routes[f'{cid}.{period}.{stat_name}']] = lambda t: []
         with tempfile.TemporaryDirectory() as folder:
-            worker, cache = worker_fixture.instance(Path(folder) / 'empty_new.sqlite3')
+            root = Path(folder).resolve()
+            cfg_file, _, _ = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+            app_dir = root / 'app'
+            (app_dir / 'inputs').mkdir(parents=True)
+            (app_dir / 'catalogue').mkdir(parents=True)
+            (app_dir / 'inputs/snapshot.json').write_text(json.dumps(seed13))
+            (app_dir / 'catalogue/queries.json').write_text(json.dumps(queries))
+            (app_dir / 'catalogue/routes.json').write_text(json.dumps(routes))
+            empty_src = SyntheticSource(queries, empty_handlers)
+            empty_summary = collector.collect(cfg, app_dir, root / 'state', root / 'empty_out.json',
+                                              end=target_end, source=empty_src, config_path=cfg_file)
+            self.assertEqual(empty_summary['charts'], 13)
+            empty_collected = json.loads((root / 'empty_out.json').read_text())
+            collector.validate_snapshot(empty_collected)
+            self.assertEqual(empty_collected['families'][0]['children'], ['transport_rejections'])
+
+        # If leading-null daily trim clears rows to [] (e.g., series started today), non-midnight still reads current24 while midnight stays within plan.
+        def make_trimmed_fixture():
+            fx = CollectorFixture()
+            collector._ensure_supplemental_charts(fx.seed, fx.routes)
+            for stat_name in ('eligible', 'value'):
+                for period in ('daily', 'sampled_hour'):
+                    qid = fx.routes[f'open_connections.{period}.{stat_name}']
+                    orig = fx.source.handlers[qid]
+                    fx.source.handlers[qid] = lambda t, orig=orig: [] if t <= END else orig(t)
+            return fx
+
+        trimmed_fixture = make_trimmed_fixture()
+        non_midnight_end = END + 3 * HOUR
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            trimmed_worker, trimmed_cache = trimmed_fixture.instance(root / 'trimmed.sqlite3')
             try:
-                empty_data = worker.collect(END, 'a' * 64)
+                trimmed_data = trimmed_worker.collect(non_midnight_end, 'a' * 64)
             finally:
-                cache.close()
-        empty_inc = next(c for c in empty_data['charts'] if c['id'] == 'incoming_connections')
-        for s in empty_inc['series']:
-            self.assertEqual(s['history']['daily'], [])
-            self.assertEqual(s['history']['sampled_hour'], [])
-            self.assertFalse(s['current']['day']['valid'])
-            self.assertIsNone(s['relay_population']['day'])
+                trimmed_cache.close()
+            oc_non_mid = next(c for c in trimmed_data['charts'] if c['id'] == 'open_connections')
+            self.assertEqual(oc_non_mid['series'][0]['history']['daily'], [])
+            self.assertTrue(oc_non_mid['series'][0]['current']['day']['valid'])
+            self.assertEqual(oc_non_mid['series'][0]['current']['day']['value'], 77.0)
+            self.assertIsNotNone(oc_non_mid['series'][0]['relay_population']['day'])
+
+            # On midnight (end == END), daily already queried END, so current24 is NOT queried out-of-budget when rows trimmed to [].
+            mid_fixture = make_trimmed_fixture()
+            planned_mid = collector._plan_max_requests(
+                mid_fixture.routes, mid_fixture.queries, mid_fixture.seed, END, warm_end=None, baseline_end=END,
+            )
+            mid_worker, mid_cache = mid_fixture.instance(root / 'trimmed_mid.sqlite3')
+            try:
+                mid_worker.collect(END, 'a' * 64)
+            finally:
+                mid_cache.close()
+            self.assertLessEqual(mid_fixture.source.requests, planned_mid)
+            cur24_val_qid = mid_fixture.routes['open_connections.current24.value']
+            self.assertFalse(any(call[0] == cur24_val_qid and call[3] == HOUR for call in mid_fixture.source.calls))
 
     def test_incoming_connections_label_mapping_and_open_connections_scalar(self):
         fixture = CollectorFixture()
@@ -2528,9 +2573,10 @@ class CollectorTests(unittest.TestCase):
 
         m_torrc = make_eff_metric({
             'dosconnectionenabled': '0', 'dosconnectionenabled_source': 'torrc',
-            'dosconnectionmaxconcurrentcount': '', 'dosconnectionmaxconcurrentcount_source': 'unset',
+            'dosconnectionmaxconcurrentcount_source': 'unset',
             'dosconnectionconnectrate': '25', 'dosconnectionconnectrate_source': 'torrc',
         })
+        m_torrc.pop('dosconnectionmaxconcurrentcount')
 
         m_small_a = make_eff_metric({
             'dosconnectionenabled': '1', 'dosconnectionenabled_source': 'torrc',
@@ -2574,14 +2620,6 @@ class CollectorTests(unittest.TestCase):
             state_dir = root / 'state'
             out_path = root / 'dos_out.json'
             src = SyntheticSource(queries, handlers)
-            # Bypass validate_matrix ONLY for the empty-string unset test by mocking access.aggregate_response?
-            # Wait: m_torrc has empty string '' for dosconnectionmaxconcurrentcount which validate_matrix rejects;
-            # verify direct Collector.dos_thresholds handles empty-string unset AND test real validate_matrix flow without ''.
-            m_torrc_valid = dict(m_torrc)
-            m_torrc_valid.pop('dosconnectionmaxconcurrentcount')
-            handlers[routes['dos.effective_config']] = lambda t: [
-                (m_majority, 200), (m_torrc_valid, 24), (m_small_a, 5), (m_small_b, 5),
-            ]
             collector.collect(cfg, ROOT, state_dir, out_path, end=target_end, source=src, config_path=cfg_file)
             published = json.loads(out_path.read_text())
             collector.validate_snapshot(published)
@@ -2628,23 +2666,27 @@ class CollectorTests(unittest.TestCase):
             archived_row = json.loads(export_path.read_text().splitlines()[0])
             self.assertEqual(archived_row['dos_thresholds'], dt)
 
-            # Verify empty-string value alongside source=='unset' normalizes to 'unset' in dos_thresholds().
+            # Empty dosconnectionmaxconcurrentcount label is rejected both by protocol validator (through collect()) and dos_thresholds().
+            m_empty_val = dict(m_torrc, dosconnectionmaxconcurrentcount='')
+            bad_handlers = dict(handlers)
+            bad_handlers[routes['dos.effective_config']] = lambda t: [(m_empty_val, 24)]
+            bad_src = SyntheticSource(queries, bad_handlers)
+            with self.assertRaisesRegex(collector.CollectionError, 'invalid_label_value'):
+                collector.collect(cfg, ROOT, root / 'bad_state', root / 'bad_out.json',
+                                  end=target_end + HOUR, source=bad_src, config_path=cfg_file)
             worker_fixture = CollectorFixture()
             worker, cache = worker_fixture.instance(root / 'direct.sqlite3')
             try:
                 with mock.patch.object(
                     worker, 'endpoint',
                     side_effect=lambda name, ts: (
-                        {'data': {'result': [{'metric': m_torrc, 'values': [[ts, '16']]}]}}
+                        {'data': {'result': [{'metric': m_empty_val, 'values': [[ts, '16']]}]}}
                         if name == 'dos.effective_config'
                         else {'data': {'result': []}}
                     ),
                 ):
-                    direct_dt = worker.dos_thresholds(END, 80)
-                direct_by_key = {s['key']: s for s in direct_dt['settings']}
-                self.assertEqual(direct_by_key['dosconnectionmaxconcurrentcount']['values'], [
-                    {'value': 'unset', 'source': 'unset', 'relays': 16},
-                ])
+                    with self.assertRaisesRegex(collector.CollectionError, 'Unexpected DoS config value'):
+                        worker.dos_thresholds(END, 80)
             finally:
                 cache.close()
 

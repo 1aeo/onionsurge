@@ -550,15 +550,15 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
  const tEnd=times.length?times[times.length-1]:null;
  if(tEnd!==null&&totals[times.length-1]!=null){
   const activeSources=[];
-  let curPr=0;
+  let curFleet=0;
   for(const vec of vectors){
    for(const src of vec.sources){
     const v=src.values.get(tEnd),pop=src.populations.get(tEnd),pr=Number.isInteger(pop)&&pop>0?v/pop:NaN;
-    if(v!==undefined&&isFiniteNumber(pr)){activeSources.push({src,curPop:pop});curPr+=pr;}
+    if(v!==undefined&&isFiniteNumber(pr)){activeSources.push({src,curPop:pop});curFleet+=pr*pop;}
    }
   }
-  if(activeSources.length&&isFiniteNumber(curPr)){
-   const baseSum=new Map(),fleetSum=new Map(),baseCnt=new Map();
+  if(activeSources.length&&isFiniteNumber(curFleet)){
+   const fleetSum=new Map(),baseCnt=new Map();
    for(const {src,curPop} of activeSources){
     const srcBase=new Map();
     if(win===HOUR){
@@ -575,22 +575,19 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
      }
     }
     for(const [t,pr] of srcBase){
-     baseSum.set(t,(baseSum.get(t)??0)+pr);
      fleetSum.set(t,(fleetSum.get(t)??0)+pr*curPop);
      baseCnt.set(t,(baseCnt.get(t)??0)+1);
     }
    }
-   const baseline=[],fleetBaseline=[],baselineTimes=new Set();
+   const fleetBaseline=[],baselineTimes=new Set();
    for(const [t,cnt] of baseCnt)if(cnt===activeSources.length){
-    const sumPr=baseSum.get(t),sumFl=fleetSum.get(t);
-    if(isFiniteNumber(sumPr)){baseline.push(sumPr);baselineTimes.add(t);}
-    if(isFiniteNumber(sumFl))fleetBaseline.push(sumFl);
+    const sumFl=fleetSum.get(t);
+    if(isFiniteNumber(sumFl)){fleetBaseline.push(sumFl);baselineTimes.add(t);}
    }
-   baseline.sort((a,b)=>a-b);
    fleetBaseline.sort((a,b)=>a-b);
    const p90Fleet=fleetBaseline.length>=20?quantileSorted(fleetBaseline,0.90):null;
    const p99Fleet=fleetBaseline.length>=100?quantileSorted(fleetBaseline,0.99):null;
-   rateRank={...midrankPercentile(curPr,baseline,baselineTimes.has(tEnd)),activeSources:activeSources.length,totalSources:configuredSources,p90Fleet,p99Fleet};
+   rateRank={...midrankPercentile(curFleet,fleetBaseline,baselineTimes.has(tEnd)),activeSources:activeSources.length,totalSources:configuredSources,p90Fleet,p99Fleet};
   }
  }
  if(tEnd!==null){
@@ -1286,7 +1283,7 @@ function heroCard(){
   const cls=rk.n<20?'unknown':isGauge?'neutral':alertStateFor(rk.rank,rk.n,false);
   const scope=scopeText||(isGauge
    ?`Per-relay mean ranked vs ${count(rk.n)} reference ${unitWord} (resource gauge; does not trigger family alerts).`
-   :`Per-relay sum ranked vs ${count(rk.n)} matching reference ${unitWord}${extraScope}.`);
+   :`Fleet-scaled composite rate ranked vs ${count(rk.n)} matching reference ${unitWord}${extraScope}.`);
   const shortTag=rk.n<20?` <span class="hero-kpi-pct-note">(${count(rk.n)}${is24h?'h':'d'})</span>`:'';
   return `<div class="hero-kpi-pct"><span class="percentile ${cls}" title="${escapeHtml(scope)}">${escapeHtml(label)}</span>${shortTag}</div>`;
  };

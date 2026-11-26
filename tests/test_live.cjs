@@ -1810,6 +1810,7 @@ test('dos_thresholds strict live schema validation accepts valid configs and rej
   ['blank unit',d=>{d.dos_thresholds.settings[0].unit='';}],
   ['overlong unit',d=>{d.dos_thresholds.settings[0].unit='u'.repeat(33);}],
   ['uncoarsened setting relays',d=>{d.dos_thresholds.settings[0].relays=241;}],
+  ['setting relays > fleet',d=>{d.dos_thresholds.settings[0].relays=(d.fleet??240)+8;d.dos_thresholds.settings[0].suppressed_relays=16;}],
   ['uncoarsened suppressed_relays',d=>{d.dos_thresholds.settings[0].suppressed_relays=7;}],
   ['negative zero suppressed_relays',d=>{d.dos_thresholds.settings[1].suppressed_relays=-0;}],
   ['too many buckets',d=>{

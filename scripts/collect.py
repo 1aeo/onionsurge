@@ -558,7 +558,7 @@ def _chart_routes_available(chart_id, routes):
     return all(op in routes for op in required)
 
 
-def _ensure_supplemental_charts(data, routes):
+def _ensure_supplemental_charts(data, routes, added=None):
     """Append missing supplemental charts and family memberships when routes are declared."""
     charts = data.setdefault('charts', [])
     existing = {c['id'] for c in charts}
@@ -609,6 +609,8 @@ def _ensure_supplemental_charts(data, routes):
             }
             charts.append(chart)
             existing.add(cid)
+            if added is not None:
+                added.add(cid)
         family = by_family.get(spec['family_id'])
         if family is not None and isinstance(family.get('children'), list) and cid not in family['children']:
             family['children'].append(cid)
@@ -917,9 +919,8 @@ class Collector:
                 source = metric[source_key]
                 _require(source in {'consensus', 'torrc', 'unset'}, 'Unexpected DoS config source')
                 if source == 'unset':
-                    raw_val = metric.get(key, '')
-                    val = raw_val if raw_val else 'unset'
-                    _require(val == 'unset' or _DOS_DIGITS_RE.fullmatch(val), 'Unexpected DoS config value')
+                    val = metric.get(key, 'unset')
+                    _require(val == 'unset' or (isinstance(val, str) and _DOS_DIGITS_RE.fullmatch(val)), 'Unexpected DoS config value')
                 else:
                     val = metric.get(key)
                     _require(isinstance(val, str) and _DOS_DIGITS_RE.fullmatch(val), 'Unexpected DoS config value')
@@ -966,7 +967,8 @@ class Collector:
         data.update(input_schema_version=4, start=end - DAY, end=end, window_seconds=HOUR,
                     minimum_samples=24, expected_samples=30, generated_at=iso(time.time()))
         data.setdefault('history_methods', {})['coarsening'] = COARSENING_DESCRIPTION
-        _ensure_supplemental_charts(data, self.routes)
+        added_supplemental = set()
+        _ensure_supplemental_charts(data, self.routes, added=added_supplemental)
         charts_by_id = {c['id']: c for c in data['charts']}
         raw_totals = {}
         for cohort, chart_id, key in COHORT_ANCHORS:
@@ -1044,9 +1046,13 @@ class Collector:
                 fetched_raw_n = {}
                 last_exp_c = None
                 had_empty_daily = not rows
+                final_daily_end = int(rows[-1][0]) if rows else None
                 daily_start = (int(rows[-1][0]) + DAY) if rows else chart_first_daily
+                has_daily_history = bool(rows or (daily_start is not None and daily_start <= target_day))
                 if daily_start is not None:
                     daily_times = list(range(daily_start, target_day + 1, DAY))
+                    if daily_times:
+                        final_daily_end = daily_times[-1]
                     fetched_raw_n, last_exp_c = self._fill_history_rows(
                         chart, series, 'daily', DAY, DAY, daily_times, rows,
                         chart_c=chart_c, enforce_chart_floor=True,
@@ -1068,56 +1074,55 @@ class Collector:
                     self._fill_history_rows(chart, series, 'sampled_hour', SAMPLED_HOUR_STEP, HOUR, sh_times, sh_rows)
 
                 fetched_cur24_raw_n = {}
-                if rows:
-                    if end % DAY == 0 and rows[-1][0] == end:
-                        if fetched_raw_n:
-                            last_row = rows[-1]
-                            day_current = {
-                                'value': last_row[1] if last_row[4] else None, 'relays': last_row[2],
-                                'expected_relays': last_exp_c, 'coverage': last_row[3], 'valid': last_row[4],
-                            }
-                        else:
-                            cur = series['current']['day']
-                            had_exp = 'expected_relays' in cur
-                            cur_exp = cur['expected_relays'] if had_exp else max(8, seed_chart_relays)
-                            if chart_c > cur_exp:
-                                cur_n, cur_val = cur.get('relays'), cur.get('value')
-                                new_exp = max(8, chart_c, 0 if cur_n is None else cur_n)
-                                cov = (cur_n / new_exp) if (cur_n is not None and cur_n > 0) else None
-                                cur_valid = cur.get('valid')
-                                if cur_valid is None:
-                                    cur_valid = bool(rows[-1][4])
-                                new_valid = bool(cur_valid and cur_val is not None and cur_n is not None
-                                                 and cur_n >= 8 and cov is not None
-                                                 and MINIMUM_POPULATION_COVERAGE <= cov <= 1.0)
-                                new_val = cur_val if new_valid else None
-                                day_current = {'value': new_val, 'relays': cur_n, 'expected_relays': new_exp,
-                                               'coverage': cov, 'valid': new_valid}
-                                rows[-1] = [end, new_val, cur_n, cov, new_valid]
-                            else:
-                                day_current = dict(cur)
-                                if not had_exp and max(8, chart_c) != cur_exp:
-                                    day_current['expected_relays'] = cur_exp
+                if rows and end % DAY == 0 and rows[-1][0] == end:
+                    if fetched_raw_n:
+                        last_row = rows[-1]
+                        day_current = {
+                            'value': last_row[1] if last_row[4] else None, 'relays': last_row[2],
+                            'expected_relays': last_exp_c, 'coverage': last_row[3], 'valid': last_row[4],
+                        }
                     else:
-                        n24 = self.values(chart, series, 'current24', 'eligible', HOUR, [end])
-                        a24 = self.values(chart, series, 'current24', 'available', HOUR, [end])
-                        v24 = self.values(chart, series, 'current24', 'value', HOUR, [end])
-                        fetched_cur24_raw_n = {end: n24[end]} if n24[end] is not None else {}
-                        history_n = {int(row[0]): row[2] for row in rows if row[2] is not None}
-                        if n24[end] is not None:
-                            history_n[end] = n24[end]
-                        e24 = populations([end], history_n, {end: a24[end]})[end]
-                        n_c = None if n24[end] is None else coarsen_count(n24[end])
-                        exp_c = max(8, chart_c, 0 if n_c is None else n_c, coarsen_count(e24))
-                        cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
-                        if n_c in (None, 0):
-                            v_c, valid_c = None, False
+                        cur = series['current']['day']
+                        had_exp = 'expected_relays' in cur
+                        cur_exp = cur['expected_relays'] if had_exp else max(8, seed_chart_relays)
+                        if chart_c > cur_exp:
+                            cur_n, cur_val = cur.get('relays'), cur.get('value')
+                            new_exp = max(8, chart_c, 0 if cur_n is None else cur_n)
+                            cov = (cur_n / new_exp) if (cur_n is not None and cur_n > 0) else None
+                            cur_valid = cur.get('valid')
+                            if cur_valid is None:
+                                cur_valid = bool(rows[-1][4])
+                            new_valid = bool(cur_valid and cur_val is not None and cur_n is not None
+                                             and cur_n >= 8 and cov is not None
+                                             and MINIMUM_POPULATION_COVERAGE <= cov <= 1.0)
+                            new_val = cur_val if new_valid else None
+                            day_current = {'value': new_val, 'relays': cur_n, 'expected_relays': new_exp,
+                                           'coverage': cov, 'valid': new_valid}
+                            rows[-1] = [end, new_val, cur_n, cov, new_valid]
                         else:
-                            v_c = coarsen_value(chart['id'], series['key'], kind, v24[end], window_seconds=DAY)
-                            valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
-                                           and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
-                        day_current = {'value': v_c if valid_c else None, 'relays': n_c,
-                                       'expected_relays': exp_c, 'coverage': cov_c, 'valid': valid_c}
+                            day_current = dict(cur)
+                            if not had_exp and max(8, chart_c) != cur_exp:
+                                day_current['expected_relays'] = cur_exp
+                elif has_daily_history and not (end % DAY == 0 and final_daily_end == end):
+                    n24 = self.values(chart, series, 'current24', 'eligible', HOUR, [end])
+                    a24 = self.values(chart, series, 'current24', 'available', HOUR, [end])
+                    v24 = self.values(chart, series, 'current24', 'value', HOUR, [end])
+                    fetched_cur24_raw_n = {end: n24[end]} if n24[end] is not None else {}
+                    history_n = {int(row[0]): row[2] for row in rows if row[2] is not None}
+                    if n24[end] is not None:
+                        history_n[end] = n24[end]
+                    e24 = populations([end], history_n, {end: a24[end]})[end]
+                    n_c = None if n24[end] is None else coarsen_count(n24[end])
+                    exp_c = max(8, chart_c, 0 if n_c is None else n_c, coarsen_count(e24))
+                    cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
+                    if n_c in (None, 0):
+                        v_c, valid_c = None, False
+                    else:
+                        v_c = coarsen_value(chart['id'], series['key'], kind, v24[end], window_seconds=DAY)
+                        valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
+                                       and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
+                    day_current = {'value': v_c if valid_c else None, 'relays': n_c,
+                                   'expected_relays': exp_c, 'coverage': cov_c, 'valid': valid_c}
                 else:
                     day_current = {'value': None, 'relays': None,
                                    'expected_relays': max(8, chart_c, hexp_rows[-1][1]),
@@ -1126,6 +1131,32 @@ class Collector:
                 fetched_hr_map = {t: val for t, val in hourly_n.items() if t == end and val is not None}
                 series['relay_population'] = self.relay_population(
                     chart, series, end, fetched_raw_n, fetched_hr_map, fetched_cur24_raw_n)
+        if added_supplemental:
+            families = data.get('families')
+            family_primary = {f.get('id'): f.get('primary') for f in families} if isinstance(families, list) else {}
+            keep_charts = []
+            dropped_cids = set()
+            for chart in data['charts']:
+                cid = chart['id']
+                if cid in added_supplemental and family_primary.get(chart.get('family_id')) != cid:
+                    observed = [
+                        s for s in chart['series']
+                        if s['history'].get('daily') and s['history'].get('sampled_hour')
+                    ]
+                    obs_keys = {s['key'] for s in observed}
+                    if not obs_keys or chart.get('primary_series') not in obs_keys:
+                        dropped_cids.add(cid)
+                        continue
+                    if len(observed) < len(chart['series']):
+                        chart['series'] = observed
+                        chart['display_keys'] = [k for k in chart['display_keys'] if k in obs_keys]
+                keep_charts.append(chart)
+            if dropped_cids:
+                data['charts'] = keep_charts
+                if isinstance(families, list):
+                    for fam in families:
+                        if isinstance(fam.get('children'), list):
+                            fam['children'] = [c for c in fam['children'] if c not in dropped_cids]
         data['versions'] = self.versions(end, raw_totals, cohort_totals)
         data['snapshot_flags'] = {}
         for key in METADATA_KEYS:

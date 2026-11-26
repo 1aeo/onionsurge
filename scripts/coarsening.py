@@ -238,6 +238,9 @@ def coarsen_population_row(row, coarsened_total):
     return [t, total_c, classified_c, guard_c, middle_c, exit_c, hsdir_c, v2dir_c]
 
 
+MAX_DOS_THRESHOLD_VALUES = 16
+
+
 def coarsen_threshold_buckets(buckets, raw_total, fleet_c, *, suppressed_raw=0):
     """Apply dir-spec coarsening and <8 suppression to one DoS threshold setting."""
     require(timestamp(raw_total) and timestamp(suppressed_raw) and is_coarsened_count(fleet_c),
@@ -256,6 +259,10 @@ def coarsen_threshold_buckets(buckets, raw_total, fleet_c, *, suppressed_raw=0):
             sup_raw += n
     if not eligible:
         return total_c, [], total_c
+    eligible.sort(key=lambda item: (-item[2], item[1], item[0]))
+    if len(eligible) > MAX_DOS_THRESHOLD_VALUES:
+        sup_raw += sum(r for _, _, r in eligible[MAX_DOS_THRESHOLD_VALUES:])
+        eligible = eligible[:MAX_DOS_THRESHOLD_VALUES]
     shown_c, suppressed_c = coarsen_partition(
         [sum(r for _, _, r in eligible), sup_raw],
         total_c,

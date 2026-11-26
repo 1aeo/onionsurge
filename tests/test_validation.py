@@ -66,6 +66,8 @@ class InputValidationTests(unittest.TestCase):
                 day = series['current']['day']
                 day.update(value=None, relays=0, coverage=0, valid=False)
                 day.setdefault('expected_relays', prior_relays)
+        if 'dos_thresholds' in data:
+            data['dos_thresholds'] = coarsen_dos_thresholds(data['dos_thresholds'], data['fleet'])
         with tempfile.TemporaryDirectory() as folder:
             built, _ = prepare(data, 'a'*64, Path(folder))
         for chart, prior in zip(built['charts'], original):
@@ -397,6 +399,8 @@ class InputValidationTests(unittest.TestCase):
         for chart in data['charts']:
             if chart['cohort_key'] == 'native':
                 chart['relays'] = 8
+        if 'dos_thresholds' in data:
+            data['dos_thresholds'] = coarsen_dos_thresholds(data['dos_thresholds'], data['fleet'])
         validate_snapshot(data)
         data['versions']['native_total'] = True
         with self.assertRaisesRegex(ValueError, 'native runtime count'):
@@ -1065,6 +1069,12 @@ class InputValidationTests(unittest.TestCase):
         self.assertEqual(vals, [{'value': '1', 'source': 'consensus', 'relays': 104}])
         self.assertEqual(coarsen_threshold_buckets([(('1', 'consensus'), 240)], 240, 80),
                          (80, [{'value': '1', 'source': 'consensus', 'relays': 80}], 0))
+        many_buckets = [((str(i), 'consensus'), 10) for i in range(18)]
+        many_c, many_vals, many_sup = coarsen_threshold_buckets(many_buckets, 180, 240)
+        self.assertEqual(many_c, 184)
+        self.assertEqual(len(many_vals), 16)
+        self.assertEqual(sum(v['relays'] for v in many_vals) + many_sup, 184)
+        self.assertGreaterEqual(many_sup, 16)
 
         # Full snapshot dos_thresholds coarsen_snapshot round-trip and validation rejections.
         data = self.fixture()
@@ -1091,6 +1101,7 @@ class InputValidationTests(unittest.TestCase):
             (lambda d: d['dos_thresholds'].pop('reported_relays'), 'DoS thresholds fields'),
             (lambda d: d['dos_thresholds'].update(as_of=d['end'] - 3600), 'snapshot mismatch'),
             (lambda d: d['dos_thresholds'].update(reported_relays=7), 'coarsened DoS thresholds'),
+            (lambda d: d['dos_thresholds'].update(reported_relays=d['fleet'] + 8), 'coarsened DoS thresholds'),
             (lambda d: d['dos_thresholds'].update(reported_relays=True), 'coarsened DoS thresholds'),
             (lambda d: d['dos_thresholds'].update(reported_relays=-0.0), 'coarsened DoS thresholds'),
             (lambda d: d['dos_thresholds']['settings'].pop(), 'canonical settings list'),
@@ -1098,8 +1109,15 @@ class InputValidationTests(unittest.TestCase):
             (lambda d: d['dos_thresholds']['settings'][0].update(unit='bogus'), 'canonical schema'),
             (lambda d: d['dos_thresholds']['settings'][0].update(extra=1), 'setting fields'),
             (lambda d: d['dos_thresholds']['settings'][0].update(relays=7), 'coarsened DoS threshold relay'),
+            (lambda d: (
+                d['dos_thresholds']['settings'][0].update(relays=d['fleet'] + 8, suppressed_relays=d['fleet'] + 8, values=[])
+            ), 'coarsened DoS threshold relay'),
             (lambda d: d['dos_thresholds']['settings'][0].update(suppressed_relays=5), 'coarsened DoS threshold relay'),
             (lambda d: d['dos_thresholds']['settings'][0].update(values={}), 'must be an array'),
+            (lambda d: d['dos_thresholds']['settings'][0].update(
+                relays=136, suppressed_relays=0,
+                values=[{'value': str(i), 'source': 'consensus', 'relays': 8} for i in range(17)],
+            ), 'at most 16 entries'),
             (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(extra=1), 'value fields'),
             (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(value='custom'), 'threshold value'),
             (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(value='123456789'), 'threshold value'),

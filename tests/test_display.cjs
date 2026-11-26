@@ -3491,19 +3491,24 @@ copyCtrl.app.start();
   // Window-normalized gauge scalePeak and tooltip "${range} peak" on 1mo, 6mo, 12mo + bar vs area rendering.
   const winPeakDoc=structuredClone(v7NonMidnight);
   const wpOc=chart('open_circuits',winPeakDoc).series[0];
+  const wpEndDay=Math.floor(winPeakDoc.end/86400)*86400;
   wpOc.peaks.day.fleet_peak=1e6;
-  wpOc.history.daily=wpOc.history.daily.map(row=>row[0]>=Math.floor(winPeakDoc.end/86400)*86400-400*86400?[row[0],200,104,1,true]:row);
-  for(const r of ['1mo','6mo','12mo']){
+  wpOc.history.daily=wpOc.history.daily.map(row=>{
+   if(row[0]===wpEndDay-45*86400)return [row[0],500,104,1,true];
+   if(row[0]===wpEndDay-220*86400)return [row[0],800,104,1,true];
+   return row[0]>=wpEndDay-400*86400?[row[0],200,104,1,true]:row;
+  });
+  for(const [r,expPeak,expShare] of [['1mo',200,'100%'],['6mo',500,'40%'],['12mo',800,'25%']]){
    const prep=ui.prepareHeroPlot(winPeakDoc,r,true);
    assert.equal(prep.range,r);
-   assert.equal(prep.gauges.openCircuits.windowPeak,200);
-   assert.equal(prep.gauges.openCircuits.scalePeak,200,`${r} normalizes gauge scalePeak to windowPeak`);
+   assert.equal(prep.gauges.openCircuits.windowPeak,expPeak);
+   assert.equal(prep.gauges.openCircuits.scalePeak,expPeak,`${r} normalizes gauge scalePeak to windowPeak`);
    const plotEl=element(800);
    application(`?view=overview&hero_range=${r}`,winPeakDoc).app.drawHero(plotEl,r,'linear',true);
    assert.match(plotEl.innerHTML,new RegExp(`hero-missing-${r}-l-1`));
    if(r==='1mo')assert.match(plotEl.innerHTML,/class="hero-rate-bar"/);
    else assert.match(plotEl.innerHTML,/class="hero-rate-area"/);
-   assert.match(inspectHero(winPeakDoc,r,['End']).steps[0].tooltipHtml,new RegExp(`Open circuits: 200 \\(&lt;0\\.1%, 100% of ${r} peak\\)`));
+   assert.match(inspectHero(winPeakDoc,r,['End']).steps[0].tooltipHtml,new RegExp(`Open circuits: 200 \\(&lt;0\\.1%, ${expShare} of ${r} peak\\)`));
   }
 
   // Interactive click, URL, popstate, and replaceRelease across 1mo/6mo/12mo.
@@ -3710,6 +3715,28 @@ copyCtrl.app.start();
   assert.match(fullOvHtml,/Directory \(BEGIN_DIR\)[\s\S]*DoSBeginDirRatePerSec[\s\S]*5 req\/s[\s\S]*\(observed\)/);
   assert.match(fullOvHtml,/Dashboard alert cutoffs[\s\S]*≥90th \/ ≥99th pct in events\/s[\s\S]*Composite mitigated rate[\s\S]*≥90th:[\s\S]*events\/s[\s\S]*≥99th:[\s\S]*events\/s/);
   assert.match(fullOvHtml,/01 Connection floods[\s\S]*≥90th:[\s\S]*events\/s/);
+
+  // Unequal-population rateRank & p90Fleet use the same population-weighted composite statistic.
+  const skewDoc=structuredClone(v7NonMidnight);
+  const skewDayEnd=Math.floor(skewDoc.end/86400)*86400;
+  const skewRefEnd=skewDayEnd-86400,skewRefStart=skewRefEnd-101*86400;
+  skewDoc.reference_window={...skewDoc.reference_window,start:skewRefStart,end:skewRefEnd};
+  for(const c of skewDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   if(s.key==='conn_rejected'){
+    s.history.daily=Array.from({length:101},(_,k)=>[skewRefEnd-(100-k)*86400,k<91?80:0,8,1,true]);
+    s.history.daily.push([skewDayEnd,0,8,1,true]);
+   }else if(s.key==='begindir_rejected'){
+    s.history.daily=Array.from({length:101},(_,k)=>[skewRefEnd-(100-k)*86400,k<91?0:1600,80,1,true]);
+    s.history.daily.push([skewDayEnd,160,80,1,true]);
+   }else{
+    s.history.daily=Array.from({length:101},(_,k)=>[skewRefEnd-(100-k)*86400,0,80,1,true]);
+    s.history.daily.push([skewDayEnd,0,80,1,true]);
+   }
+  }
+  const skewPrep=ui.prepareHeroPlot(skewDoc,'7d',false);
+  assert.equal(skewPrep.rateRank.p90Fleet,80,'91 samples at 80 and 10 at 1600 -> p90Fleet is 80');
+  assert.ok(skewPrep.rateRank.rank>90,'curFleet 160 > p90Fleet 80 also ranks >90th percentile under consistent weighting');
+  assert.match(application('?view=overview&hero_range=7d&hero_hsdir=0',skewDoc).app.markup(),/class="percentile elevated"[^>]*>90th percentile/);
 
   assert.ok(latestCss.includes('.hero-kpi-grid.hero-kpi-6')&&latestCss.includes('.hero-thresholds-grid')&&latestCss.includes('.incoming-context-card'),
    'stylesheet defines 6-tile KPI grid, thresholds grid, and incoming context card rules');
