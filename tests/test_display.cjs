@@ -3574,6 +3574,22 @@ copyCtrl.app.start();
   }
   const fallbackAlert12Html=application('?view=overview&hero_range=12mo',customTrAlert).app.markup();
   assert.match(fallbackAlert12Html,/class="hero-alert-detail"[^>]*data-range="7d"/,'missing 12mo period falls back to 7d');
+  const customAllIdAlert=structuredClone(makeAlertDataset(v7NonMidnight,'day',['high','neutral','neutral','neutral','neutral','neutral']));
+  const archiveAllPeriod={...customAllIdAlert.time_ranges.periods.find(p=>p.window.unit==='all_time'),id:'archive'};
+  customAllIdAlert.time_ranges={
+   version:1,default_range:'24h',legacy_aliases:{},card_slots:{fallback_dynamic:'6mo',fixed:['24h','archive']},
+   periods:[
+    customAllIdAlert.time_ranges.periods.find(p=>p.id==='24h'),
+    customAllIdAlert.time_ranges.periods.find(p=>p.id==='6mo'),
+    archiveAllPeriod,
+   ],
+  };
+  for(const c of customAllIdAlert.charts)for(const s of c.series){
+   s.historical_averages={six_months:s.historical_averages.six_months,all_time:s.historical_averages.all_time};
+   if(s.relay_counts)s.relay_counts={hour:s.relay_counts.hour,day:s.relay_counts.day,six_months:s.relay_counts.six_months,all_time:s.relay_counts.all_time};
+  }
+  const archiveAlertAllHtml=application('?view=overview&hero_range=all',customAllIdAlert).app.markup();
+  assert.match(archiveAlertAllHtml,/class="hero-alert-detail"[^>]*data-range="archive"/,'All time alert deep-link resolves noncanonical all_time period id');
 
   // 14. Incoming OR connections + open_connections + Option A / Option B thresholds.
   const buildFullHeroDoc=(src,{withThresholds=true}={})=>{

@@ -1250,7 +1250,8 @@ function heroCard(){
   return !!(pc?.series?.length&&pc.series.every(s=>s.reference?.[refP]?.flat_zero===true));
  };
  const activeFamilyCount=D.families.filter(f=>!isInactiveExitHero(f)).length;
- const alertExploreRange=periodMap.has(heroRange)?heroRange:(is24h&&periodMap.has('24h')?'24h':(periodMap.has('7d')?'7d':timeRanges.default_range));
+ const allTimePeriodId=timeRanges.periods.find(p=>p.window.unit==='all_time')?.id;
+ const alertExploreRange=isAll&&allTimePeriodId?allTimePeriodId:(periodMap.has(heroRange)?heroRange:(is24h&&periodMap.has('24h')?'24h':(periodMap.has('7d')?'7d':timeRanges.default_range)));
  const alertClass=!anyAlertMeasured?'unknown':hasHighAlert?'high':alerts.length?'elevated':'neutral';
  const endWindow=h?formatIntervalWindow(h.end-h.window,h.end,h.window):validTime(D.end)?(is24h?formatIntervalWindow(Math.floor(D.end/HOUR)*HOUR-HOUR,Math.floor(D.end/HOUR)*HOUR,HOUR):date(Math.floor(D.end/DAY)*DAY-DAY)+' UTC'):'Unavailable';
  const alertWindowLine=isNonMidnightDay?`<div class="hero-kpi-meta">${escapeHtml(endWindow)} · completed UTC day</div>`:'';
