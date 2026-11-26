@@ -282,9 +282,9 @@
     "daily": "Use step=86400 on UTC midnight boundaries (00:00:00 UTC). Expression uses a non-overlapping 1d window.",
     "current24": "Same direct 1d estimator as daily history; query [end-3600,end] with step=3600 on UTC hour boundaries and retain the final result. Never replace it with an average of hourly rate estimates.",
     "metadata": "Aggregate counts only; query [end-3600,end] step=3600 on UTC hour boundaries and retain final result.",
-    "attestations": "The four attested/proof IDs are gateway-computed descriptors, not source Prometheus metrics. They revalidate private process-epoch attestations and expose aggregate public version labels only across completed UTC hour boundaries.",
+    "attestations": "The four attested/proof IDs are gateway-computed descriptors, not source Prometheus metrics. They revalidate private process-epoch attestations excluding relays already claimed by verified_binary or stock_config and expose aggregate public version labels only across completed UTC hour boundaries.",
     "verified_binary": "Cohort binary routes require a valid fingerprint-verified recorded state hash matched to fresh CPU identity by member, PID, start ticks and boot ID. CPU source age must be in [0,180) seconds. The collector additionally accepts only approved public binary hashes.",
-    "stock_config": "Live non-custom Tor version counts from onionforge_tor_process_config_info excluding relays present in tor41339_build_info or emitting custom HSDir metrics."
+    "stock_config": "Live non-custom Tor version counts from onionforge_tor_process_config_info excluding relays present in tor41339_build_info or emitting custom HSDir metrics, pairwise disjoint with verified_binary and attested."
   },
   "postprocessing": "Collector still applies the 90% population coverage test and rolling 31-day/32-day denominator, null masking, per-relay normalization and midrank reference calculation. Fetch the required prior windows in bounded requests; the gateway only returns reviewed raw aggregates.",
   "relay_population_groups": {

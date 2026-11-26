@@ -48,6 +48,14 @@ CPU_IDENTITY = (f'(tor41339_rss_bytes{{kind="cpu"}} and on({MEMBER_KEY}) (tor413
 MANAGED_RUNTIME = (f'label_replace(label_replace(({STATE_BINARY} and on({PROCESS_KEY}) {CPU_IDENTITY}),"instance","$1","host","(.+)") '
                    '* on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,'
                    '"instance","$1","tor_metrics_instance","(.+)") and on(instance) up{job="tor_relays"}')
+ALL_TOR41339 = ('(label_replace(label_replace(tor41339_build_info{kind="state"},"instance","$1","host","(.+)") '
+                '* on(instance,unit) group_left(tor_metrics_instance) onionforge_tor_instance_info,'
+                '"instance","$1","tor_metrics_instance","(.+)"))')
+STOCK_CONFIG_RUNTIME = (f'(((label_replace(onionforge_tor_process_config_info * on(instance,unit) '
+                        'group_left(tor_metrics_instance) onionforge_tor_instance_info,"instance","$1",'
+                        '"tor_metrics_instance","(.+)") and on(instance) up{job="tor_relays"}) '
+                        f'unless on(instance) {ALL_TOR41339}) unless on(instance) '
+                        'tor_relay_hsdir_fetch_total{job="tor_relays",action="success"})')
 
 
 def require(condition, code):
@@ -205,6 +213,7 @@ def attested_responses(document, digest, begin, end, port, fetch=None):
     sources = {key: indexed(raw[key], ('instance',)) for key in ('health', 'source_time')}
     cohorts = {name: indexed(fetch(query, begin, end, port), ('instance',)) for name, query in COHORTS.items()}
     managed = indexed(fetch(MANAGED_RUNTIME, begin, end, port), ('instance',))
+    stock_config = indexed(fetch(STOCK_CONFIG_RUNTIME, begin, end, port), ('instance',))
     observations = {key: defaultdict(list) for key in VIRTUAL_QUERIES}
     for endpoint in (begin, end):
         counts = {name: defaultdict(int) for name in COHORTS}
@@ -223,7 +232,7 @@ def attested_responses(document, digest, begin, end, port, fetch=None):
                               and info[0] == 1 and info[1].get('tor_metrics_instance') == record['metrics_instance']
                               and health[0] == 1 and 0 <= timestamp - refreshed[0] < MAX_SOURCE_AGE)
             target = (endpoint, (record['metrics_instance'],))
-            if not valid or target in managed:
+            if not valid or target in managed or target in stock_config:
                 continue
             build_id = 'attested-' + record['version'].replace('.', '_')
             included = False

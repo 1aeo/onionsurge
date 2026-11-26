@@ -116,6 +116,8 @@ class QueryGatewayTests(unittest.TestCase):
         queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
         for name in ['native', 'custom', 'directory_defense']:
             self.assertIn(gateway.MANAGED_RUNTIME, queries[f'cohort_{name}_verified_binary'])
+        for name in ['native', 'directory_defense']:
+            self.assertIn(gateway.STOCK_CONFIG_RUNTIME, queries[f'cohort_{name}_stock_config'])
 
     def test_virtual_serve_uses_private_evidence_without_returning_it(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -156,11 +158,13 @@ class QueryGatewayTests(unittest.TestCase):
         self.assertNotIn('PRIVATE_', json.dumps(result))
 
     def test_restart_missing_stale_and_managed_members_become_unrecorded(self):
-        for failure in ['pid', 'start', 'info', 'health', 'source_time', 'stale', 'missing', 'managed']:
+        for failure in ['pid', 'start', 'info', 'health', 'source_time', 'stale', 'missing', 'managed', 'stock_config']:
             document = attestations(); real = fixture_fetch(document)
             def fetch(query, begin, end, port):
                 rows = real(query, begin, end, port)
                 if failure == 'managed' and query == gateway.MANAGED_RUNTIME:
+                    return [{'metric': {'instance': 'PRIVATE_TARGET_A'}, 'values': [[t, '1'] for t in (BEGIN, END)]}]
+                if failure == 'stock_config' and query == gateway.STOCK_CONFIG_RUNTIME:
                     return [{'metric': {'instance': 'PRIVATE_TARGET_A'}, 'values': [[t, '1'] for t in (BEGIN, END)]}]
                 selected = document['selectors'].get('source_time' if failure == 'stale' else failure)
                 if query == selected:
@@ -178,6 +182,17 @@ class QueryGatewayTests(unittest.TestCase):
                 self.assertEqual(end_counts['attested-0_4_9_14'], '1')
                 proofs = {r['metric']['type']: dict(r['values']).get(END) for r in result['attestation_proof_metadata']['data']['result']}
                 self.assertIsNone(proofs.get('daemon_group_a'))
+
+        document = attestations(); real = fixture_fetch(document)
+        def all_stock(query, begin, end, port):
+            if query == gateway.STOCK_CONFIG_RUNTIME:
+                return [{'metric': {'instance': name}, 'values': [[t, '1'] for t in (BEGIN, END)]}
+                        for name in ('PRIVATE_TARGET_A', 'PRIVATE_TARGET_B')]
+            return real(query, begin, end, port)
+        covered = gateway.attested_responses(document, 'c' * 64, BEGIN, END, 9090, all_stock)
+        self.assertEqual(covered['attested_native_runtime']['data']['result'], [])
+        self.assertEqual(covered['attested_directory_defense_runtime']['data']['result'], [])
+        self.assertEqual(covered['attested_custom_runtime']['data']['result'], [])
 
     def test_bad_attestation_versions_proof_epochs_and_duplicate_targets_fail_closed(self):
         for change in [lambda d: d['records'][0].update(version='PRIVATE_MARKER'),
