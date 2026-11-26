@@ -3263,6 +3263,20 @@ copyCtrl.app.start();
   const dailyDirHtml=application('?view=overview',dailyCalloutDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
   assert.match(dailyDirHtml,/24h: 1,200 requests\/s \(100th pct\)/);
   assert.doesNotMatch(dailyDirHtml,/Rolling 24h:/);
+
+  // 11. CodeRabbit review regressions: current card uses 20-window minimum (matching Hero/callout), all-unverified inventory still renders, and Methods reflects hero_range=all KPI scope.
+  const ref25Doc=structuredClone(v7NonMidnight);
+  const tr25=chart('transport_rejections',ref25Doc).series.find(s=>s.key==='conn_rejected');
+  tr25.reference.hour={n:25,current_percentile:95,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.1,p90_per_relay:0.2,start:ref25Doc.reference_window.start,end:ref25Doc.reference_window.end};
+  const ref25Html=application('?view=explorer&chart=transport_rejections&range=24h',ref25Doc).app.markup();
+  assert.match(ref25Html,/class="stat elevated"[\s\S]*?<span class="percentile elevated">95th percentile<\/span>/,'25-window current reference uses 20-window elevated threshold');
+  const allUnverifiedDoc=structuredClone(v7NonMidnight);
+  allUnverifiedDoc.versions={...allUnverifiedDoc.versions,native_total:240,runtime_verified_total:0,runtime_unverified_relays:240,verified_runtime:[]};
+  const unvOvHtml=application('?view=overview',allUnverifiedDoc).app.markup();
+  assert.match(unvOvHtml,/Fleet builds<\/span><span class="fleet-strip-value">Unverified 240<\/span>/);
+  const unvFixesHtml=application('?view=fixes',allUnverifiedDoc).app.markup();
+  assert.match(unvFixesHtml,/240 relays total · 0 verified · 240 unverified[\s\S]*?Version not recorded[\s\S]*?Unverified[\s\S]*?240/);
+  assert.match(application('?view=methods',v7NonMidnight).app.markup(),/selecting <b>Last 7 days<\/b> updates Hero KPIs/);
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

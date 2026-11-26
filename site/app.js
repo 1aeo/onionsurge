@@ -832,7 +832,7 @@ function historicalStat(c,s,period){
 function statPair(c,s){
  const currentCard=(period,label)=>{
   const isHour=period==='hour',current=s.current?.[period]||{},ref=s.reference?.[period],peak=s.peaks?.[period],curVal=currentValue(s,c,period),currentReady=curVal!==null;
-  const state=!currentReady?unavailableRank(coverageUnavailableReason(current)):percentile(ref);
+  const state=!currentReady?unavailableRank(coverageUnavailableReason(current)):percentile(ref,20);
   const referenceText=scaledText(c,ref?.mean_per_relay,current.relays??null);
   const shortRef=isShortReference(ref),hasN=Number.isInteger(ref?.n)&&ref.n>0;
   const refAvgLabel=!shortRef?'18-month average':hasN?(isHour?`Reference average (${count(ref.n)}h)`:`Reference average (${count(ref.n)}d)`):'Available reference average';
@@ -963,8 +963,9 @@ function summarizeFleetBuilds(){
 function fleetOpsStrip(){
  const hasFlags=isPlainRecord(D.flags)&&Object.keys(D.flags).length>0;
  const builds=summarizeFleetBuilds();
+ const hasBuildSummary=builds.list.length>0||(Number.isInteger(builds.unverifiedTotal)&&builds.unverifiedTotal>0);
  const hasDircache=isPlainRecord(D.dircache_cohort)&&Number.isInteger(D.dircache_cohort.configured_nonexit_zero);
- if(!hasFlags&&!builds.list.length&&!hasDircache)return '';
+ if(!hasFlags&&!hasBuildSummary&&!hasDircache)return '';
  const chips=[];
  if(hasFlags){
   const parts=[];
@@ -977,14 +978,14 @@ function fleetOpsStrip(){
    chips.push(`<div class="fleet-strip-item"><span class="fleet-strip-label">Fleet roles</span><span class="fleet-strip-value">${parts.map(p=>p.startsWith('0 Exit')?`<span class="fleet-pill-note">${escapeHtml(p)}</span>`:escapeHtml(p)).join(' · ')}</span></div>`);
   }
  }
- if(builds.list.length){
+ if(hasBuildSummary){
   const mixParts=[];
   if(builds.patchedRelays)mixParts.push(`Patched ${count(builds.patchedRelays)}`);
   if(builds.stockRelays)mixParts.push(`Stock ${count(builds.stockRelays)}`);
   if(builds.attestedRelays)mixParts.push(`Attested ${count(builds.attestedRelays)}`);
   if(Number.isInteger(builds.unverifiedTotal)&&builds.unverifiedTotal>0)mixParts.push(`Unverified ${count(builds.unverifiedTotal)}`);
   const breakdown=builds.list.map(b=>`${escapeHtml(b.version)}${b.buildClass==='patched'?' (patched)':b.buildClass==='attested'?' (daemon)':''}: ${count(b.relays)}`).join(' · ');
-  const mix=mixParts.length?`${mixParts.join(' · ')} (${breakdown})`:breakdown;
+  const mix=mixParts.length?(breakdown?`${mixParts.join(' · ')} (${breakdown})`:mixParts.join(' · ')):breakdown;
   chips.push(`<div class="fleet-strip-item"><span class="fleet-strip-label">Fleet builds</span><span class="fleet-strip-value">${mix}</span></div>`);
  }
  if(hasDircache){
@@ -1211,7 +1212,7 @@ function fixes(){
   return `<span class="status-badge status-muted"${title}>Daemon-attested</span>`;
  };
  const unverifiedRow=unverified?`<tr><td>Version not recorded</td><td><span class="status-badge status-muted">Unverified</span></td><td>${count(unverified)}</td></tr>`:'';
- const buildMix=builds.list.length
+ const buildMix=(builds.list.length||unverified)
   ?`<h3>Current fleet build mix</h3><p>${validTime(builds.asOf)?`Snapshot as of <b>${date(builds.asOf)} ${time(builds.asOf)} UTC</b>`:'Current runtime inventory'}${scopeBits.length?` · ${scopeBits.join(' · ')}`:''}.</p><div class="table-scroll"><table><thead><tr><th>Tor runtime build</th><th>Class</th><th>Relays</th></tr></thead><tbody>${builds.list.map(b=>`<tr><td>${b.sourceUrl?`<a href="${escapeHtml(b.sourceUrl)}" rel="noopener noreferrer">${escapeHtml(b.version)}</a>`:escapeHtml(b.version)}</td><td>${badgeFor(b)}</td><td>${count(b.relays)}</td></tr>`).join('')}${unverifiedRow}</tbody></table></div>`
   :'';
  const issueRows=TOR_FIXES.map(item=>`<tr><td>${escapeHtml(item.issue)}</td><td><span class="status-badge status-${item.statusClass}">${escapeHtml(item.status)}</span></td><td>${escapeHtml(item.release)}</td><td>${item.links.map(([label,href])=>`<a href="${escapeHtml(href)}" rel="noopener noreferrer">${escapeHtml(label)}</a>`).join(' · ')}</td></tr>`).join('');
@@ -1254,7 +1255,7 @@ function methods(){
   ?'The top Overview chart aligns three vertical tiers across non-overlapping <code>3,600s</code> UTC hours (for 24 hours) or <code>86,400s</code> UTC days (for 7 days and All time) on either a stacked linear or per-vector symlog rate scale: (1) additive source-unit rates excluding overlapping subsets (<code>ntor_v3</code> within <code>ntor</code>, exitward queue hits within <code>circuit_killed_max_cell</code>, and HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>, with optional <code>HSDir GET/POST</code> exclusion), (2) a six-family alert strip marking intervals where a qualifying DoS counter reaches rank ≥90 with at least 20 reference windows (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference windows (high), and (3) hourly or daily fleet means for open circuits and stalled <code>BEGIN_DIR</code> connections normalized to each series’ window peak on Last 24 hours and Last 7 days and retained fleet record on All time.'
   :'The top Overview chart aligns three vertical tiers across non-overlapping <code>86,400s</code> UTC days on either a stacked linear or per-vector symlog rate scale: (1) additive source-unit rates excluding overlapping subsets (<code>ntor_v3</code> within <code>ntor</code>, exitward queue hits within <code>circuit_killed_max_cell</code>, and HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>, with optional <code>HSDir GET/POST</code> exclusion), (2) a six-family alert strip marking days where a qualifying DoS counter reaches rank ≥90 with at least 20 reference days (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference days (high), and (3) daily fleet means for open circuits and stalled <code>BEGIN_DIR</code> connections normalized to each series’ 7-day peak on Last 7 days and retained fleet record on All time.';
  const hourHeadlineRow=hasHour?'<tr><th>Last complete hour</th><td>Latest completed 1-hour UTC window (<code>3,600s</code>): per-source <code>rate(metric[1h])</code> before summing (<code>avg_over_time(metric[1h])</code> for gauges).</td></tr>':'';
- const headlineDayDesc=hasHour?'Rolling 24-hour UTC window ending at snapshot end (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges). On non-midnight hourly releases, Hero <b>Last 7 days</b> and <b>All time</b> KPIs evaluate the latest completed 00:00 UTC calendar day so their bars match the daily chart axis.':'Latest completed UTC day (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges).';
+ const headlineDayDesc=hasHour?'Rolling 24-hour UTC window ending at snapshot end (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges). On non-midnight hourly releases, selecting <b>Last 7 days</b> updates Hero KPIs to the latest completed 00:00 UTC calendar day so their figures match the daily bars (while <b>All time</b> keeps the 1h KPIs).':'Latest completed UTC day (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges).';
  const refSentence=hasHour?'One-hour references sample one window every six hours. Daily references use complete 24-hour windows. Equal values share the middle percentile rank. The rank marker is omitted when both the reference values and the current measurement are zero.':'Daily references use complete non-overlapping 24-hour UTC windows. Equal values share the middle percentile rank. The rank marker is omitted when both the reference values and the current measurement are zero.';
  const peakSentence=hasHour?'Hourly peaks are labeled <b>Sampled 1h fleet peak</b>: older hourly data is sampled four times per day. <b>Recorded 24h fleet peak</b> uses retained daily observations plus the current 24-hour measurement. The reporting-relay count at each peak is included in its tooltip and data export.':'<b>Recorded 24h fleet peak</b> uses retained daily observations plus the current 24-hour measurement. The reporting-relay count at each peak is included in its tooltip and data export.';
  const bandSentence=hasHour?'The explorer band focuses on the selected series. Shading covers its 10th-90th percentile range, with a dashed median. The 24-hour plot uses sampled one-hour reference windows; daily ranges use 24-hour reference days.':'The explorer band focuses on the selected series. Shading covers its 10th-90th percentile range across 24-hour reference days, with a dashed median, across every configured time range.';
