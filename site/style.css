@@ -55,6 +55,19 @@ p { color: var(--muted); }
 .metric-selector { display: block; min-width: 0; white-space: normal; word-break: normal; hyphens: none; }
 .card-context .definition { max-width: 78ch; }
 .card-callout { margin: 0 0 14px; padding: 9px 12px; border-left: 3px solid var(--mint); background: #14221b; border-radius: 0 4px 4px 0; font-size: 13px; color: var(--muted); }
+.card-alert-callout { margin: 0 0 14px; padding: 10px 12px; border: 1px solid #6e5b31; border-left: 3px solid var(--gold); background: #211d14; border-radius: 0 4px 4px 0; font-size: 13px; }
+.card-alert-callout.callout-high { border-color: #7c4936; border-left-color: var(--coral); background: #261915; }
+.card-alert-title { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--gold); margin-bottom: 6px; font-weight: bold; }
+.card-alert-callout.callout-high .card-alert-title { color: var(--coral); }
+.card-alert-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 7px; }
+.card-alert-item { display: flex; flex-direction: column; gap: 3px; }
+.card-alert-link { font-size: 13px; font-weight: bold; color: var(--mint); line-height: 1.35; overflow-wrap: anywhere; }
+.card-alert-chips { display: flex; flex-wrap: wrap; gap: 4px 8px; }
+.card-alert-chip { display: inline-block; font-size: 11.5px; padding: 2px 6px; border-radius: 3px; background: #222929; color: var(--muted); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.card-alert-chip.chip-elevated { background: #3b3421; color: var(--gold); }
+.card-alert-chip.chip-high { background: #472d23; color: var(--coral); }
+.card-alert-chip.chip-neutral { background: #22342c; color: #9de2bb; }
+.card-alert-chip.chip-unknown { background: #2b3131; color: var(--muted); }
 .child-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 12px 0 6px; padding: 10px 12px; background: #141a1b; border: 1px solid #2b3532; border-radius: 4px; }
 .child-strip-label { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: #9caeaa; }
 .child-pill-list { display: flex; flex-wrap: wrap; gap: 6px 8px; }
@@ -72,6 +85,7 @@ p { color: var(--muted); }
 .stat-number small,.hero-kpi-value small { display: block; font-size: 12px; font-weight: normal; color: var(--muted); letter-spacing: 0; margin-top: 3px; }
 .hero-kpi-value small { margin-top: 2px; }
 .long-term-stat .stat-number { color: var(--mint); }
+.stat-window { font-size: 11px; color: #9caeaa; margin-top: 4px; font-variant-numeric: tabular-nums; }
 .stat-reference,.stat-peak,.average-coverage,.average-dates,.relay-population { font-size: 12px; color: var(--muted); }
 .stat-reference,.average-coverage { margin-top: 8px; }
 .stat-peak,.average-dates,.relay-population { margin-top: 4px; }
@@ -79,9 +93,11 @@ p { color: var(--muted); }
 .stat.high .stat-number,.rank-ruler.high,.hero-kpi-value.high,.record-note { color: var(--coral); }
 .stat.elevated .stat-number,.rank-ruler.elevated,.hero-kpi-value.elevated { color: var(--gold); }
 .stat.neutral .stat-number,.rank-ruler.neutral,.hero-kpi-value.neutral { color: #9de2bb; }
+.rank-ruler.short { color: #9fc4cc; }
 .stat.flat .stat-number,.stat.unknown .stat-number,.rank-ruler.unknown,.hero-kpi-value.unknown,.rank-empty,.rank-note { color: var(--muted); }
 .percentile { display: inline-block; border-radius: 3px; padding: 3px 6px; font-size: 11px; margin-top: 9px; line-height: 1.4; }
 .percentile.neutral { background: #22342c; color: #9de2bb; }
+.percentile.short { background: #223034; color: #9fc4cc; }
 .percentile.elevated { background: #3b3421; color: var(--gold); }
 .percentile.high { background: #472d23; color: var(--coral); }
 .percentile.unknown,.percentile.flat { color: var(--muted); }
@@ -169,6 +185,8 @@ tr:last-child td,tr:last-child th { border-bottom: 0; }
 .status-badge { display: inline-block; border-radius: 3px; padding: 2px 7px; font-size: 12px; line-height: 1.4; white-space: nowrap; }
 .status-open { background: #3b3421; color: var(--gold); }
 .status-released { background: #203c2b; color: var(--mint); }
+.status-neutral { background: #233032; color: #b7cccb; }
+.status-muted { background: #292f30; color: var(--muted); }
 .text-page { max-width: 900px; margin: auto; }
 .text-page h3 { margin-top: 28px; }
 .text-page p { font-size: 16px; }

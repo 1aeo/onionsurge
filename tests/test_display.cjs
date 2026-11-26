@@ -3137,6 +3137,132 @@ copyCtrl.app.start();
   neutralResetCtrl.events.get('click')({target:neutralChildPill,button:0,preventDefault(){}});
   assert.equal(neutralResetCtrl.app.getState().chartId,'directory_requests');
   assert.equal(neutralResetCtrl.app.getState().seriesKey,null);
+
+  // 1. Non-midnight hourly Hero 7d KPI labels clarify completed UTC day vs rolling 24h; midnight keeps (24h).
+  const nonMidHero7Html=application('?view=overview&hero_range=7d',v7NonMidnight).app.markup();
+  assert.match(nonMidHero7Html,/Latest UTC day mitigated rate/);
+  assert.match(nonMidHero7Html,/Concurrent family alerts \(UTC day\)/);
+  assert.match(nonMidHero7Html,/Open circuits \(UTC day mean\)/);
+  assert.match(nonMidHero7Html,/Stalled BEGIN_DIR \(UTC day mean\)/);
+  assert.match(nonMidHero7Html,/completed UTC day/);
+  assert.match(nonMidHero7Html,/Rolling 24h · /);
+  const midHero7Doc=structuredClone(v7NonMidnight);
+  const midEnd=Math.floor(midHero7Doc.end/86400)*86400;
+  midHero7Doc.end=midEnd;midHero7Doc.start=midEnd-86400;
+  const midHero7Html=application('?view=overview&hero_range=7d',midHero7Doc).app.markup();
+  assert.match(midHero7Html,/Latest 24h mitigated rate/);
+  assert.match(midHero7Html,/Concurrent family alerts \(24h\)/);
+
+  // 2. Hero alert detail & tooltip name non-primary alerting child charts and (+N more), keeping [data-family-jump] text clean.
+  const childHeroDoc=makeAlertDataset(v7NonMidnight,'hour',['neutral','neutral','neutral','neutral','neutral','neutral']);
+  const hsNotFound=chart('hsdir_fetches',childHeroDoc).series.find(s=>s.key==='not_found');
+  const dirRejSer=chart('directory_rejections',childHeroDoc).series.find(s=>s.key==='begindir_rejected');
+  hsNotFound.current.hour={value:2400,relays:240,expected_relays:240,coverage:1,valid:true};
+  hsNotFound.values[23][1]=2400;
+  hsNotFound.reference.hour={n:120,current_percentile:100,flat_zero:false,mean_per_relay:1,p10_per_relay:0.5,p50_per_relay:1,p90_per_relay:2,start:childHeroDoc.reference_window.start,end:childHeroDoc.reference_window.end};
+  dirRejSer.current.hour={value:120,relays:240,expected_relays:240,coverage:1,valid:true};
+  dirRejSer.values[23][1]=120;
+  dirRejSer.reference.hour={n:100,current_percentile:95,flat_zero:false,mean_per_relay:0.2,p10_per_relay:0,p50_per_relay:0.1,p90_per_relay:0.5,start:childHeroDoc.reference_window.start,end:childHeroDoc.reference_window.end};
+  const childHeroCtrl=application('?view=overview',childHeroDoc);
+  childHeroCtrl.app.start();
+  assert.equal(decode(childHeroCtrl.browser.document.querySelector('[data-family-jump="directory"]').textContent.trim()),'03 Directory floods');
+  const dirDetailEl=childHeroCtrl.browser.document.querySelector('.hero-alert-detail');
+  assert.match(decode(dirDetailEl.textContent),/^HSDir GET request handling: Descriptor not found · 100th pct \(\+1 more\)$/);
+  assert.match(inspectHero(childHeroDoc,'24h',['End']).steps[0].tooltipHtml,/03 Directory floods \(high, 100th\) — HSDir GET request handling: Descriptor not found/);
+
+  // 3. Hero gauge legend accurately displays left-panel window peak alongside All-time record.
+  const dualGaugeDoc=structuredClone(v7NonMidnight);
+  chart('open_circuits',dualGaugeDoc).series[0].peaks.hour={fleet_peak:174e6,fleet_peak_at:dualGaugeDoc.end-3600,fleet_peak_relays:240,current_is_record:false};
+  chart('open_circuits',dualGaugeDoc).series[0].peaks.day={fleet_peak:128e6,fleet_peak_at:dualGaugeDoc.end-86400,fleet_peak_relays:240,current_is_record:false};
+  chart('open_circuits',dualGaugeDoc).series[0].values=chart('open_circuits',dualGaugeDoc).series[0].values.map(([t],i)=>[t,i===23?18.6e6:10e6]);
+  chart('open_circuits',dualGaugeDoc).series[0].history.daily=chart('open_circuits',dualGaugeDoc).series[0].history.daily.map(([t],i)=>[t,i===0?128e6:12e6,240,1,true]);
+  const dualGaugeHtml=application('?view=overview',dualGaugeDoc).app.markup();
+  assert.match(dualGaugeHtml,/Open circuits \(100% = 18\.6M \(24h\) · 128M \(all-time\)\)/);
+
+  // 4 & 5. Multi-chart card surfaces .card-alert-callout inside .card-context, prefixes .primary-label, and excludes hidden/gauge series from .child-strip.
+  const hiddenPolluteDoc=makeAlertDataset(childHeroDoc,'day',['neutral','neutral','neutral','neutral','neutral','neutral']);
+  const otherPost=chart('directory_requests',hiddenPolluteDoc).series.find(s=>s.key==='other_post');
+  const ocGauge=chart('open_circuits',hiddenPolluteDoc).series[0];
+  otherPost.current.day={value:0.001,relays:240,expected_relays:240,coverage:1,valid:true};
+  otherPost.reference.day={n:31,current_percentile:97,flat_zero:false,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:hiddenPolluteDoc.reference_window.start,end:hiddenPolluteDoc.reference_window.end};
+  ocGauge.current.day={value:1.5e7,relays:240,expected_relays:240,coverage:1,valid:true};
+  ocGauge.reference.day={n:120,current_percentile:100,flat_zero:false,mean_per_relay:1,p10_per_relay:0.5,p50_per_relay:1,p90_per_relay:2,start:hiddenPolluteDoc.reference_window.start,end:hiddenPolluteDoc.reference_window.end};
+  const hiddenPolluteCtrl=application('?view=overview&range=7d',hiddenPolluteDoc);
+  hiddenPolluteCtrl.app.start();
+  const dirArtEl=hiddenPolluteCtrl.browser.document.getElementById('family-directory');
+  const dirArtHtml=hiddenPolluteCtrl.page.innerHTML.match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  assert.match(dirArtHtml,/class="primary-label">Primary chart: Directory request mix — HSDir GET requests</);
+  const calloutEl=dirArtEl.querySelector('.card-alert-callout');
+  assert.ok(calloutEl&&calloutEl.getAttribute('class').includes('callout-high'));
+  const calloutHtml=dirArtHtml.match(/<div class="card-alert-callout[\s\S]*?<\/ul><\/div>/)[0];
+  assert.match(calloutHtml,/HSDir GET request handling: Descriptor not found →/);
+  assert.match(calloutHtml,/1h: .* \(100th pct\)/);
+  assert.match(calloutHtml,/Directory flood counters: BEGIN_DIR lifetime-limit refusals →/);
+  assert.match(dirArtHtml,/Family charts \(5 · rolling 24h status\)/);
+  assert.equal(dirArtEl.querySelector('[data-chart="directory_requests"]').getAttribute('class'),'child-pill neutral','hidden other_post never turns primary child pill gold');
+  assert.equal(hiddenPolluteCtrl.browser.document.getElementById('family-circuits').querySelector('[data-chart="open_circuits"]').getAttribute('class'),'child-pill neutral','gauge open_circuits never turns child pill gold');
+
+  // 6, 7, 8. Short-history reference labels, neutral short-window 7d comparison badge, and informative invalid coverage reason.
+  const dirReqOvHtml=application('?view=overview&range=7d',v7NonMidnight).app.markup();
+  const dirCardChunk=dirReqOvHtml.match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  const dirPrimRef=chart('directory_requests',v7NonMidnight).series.find(s=>s.key==='hs_get').reference;
+  assert.match(dirCardChunk,new RegExp(`Reference average \\(${dirPrimRef.hour.n}h\\):`));
+  assert.match(dirCardChunk,new RegExp(`Reference average \\(${dirPrimRef.day.n}d\\):`));
+  assert.match(dirCardChunk,/Available reference:/);
+  assert.doesNotMatch(dirCardChunk,/18-month average:|18-month reference:/);
+  const short7dDoc=structuredClone(v7NonMidnight);
+  const short7dTr=chart('transport_rejections',short7dDoc);
+  short7dTr.series.find(s=>s.key===short7dTr.primary_series).historical_averages.seven_days.comparison=comparison(7,100);
+  const short7dHtml=application('?view=explorer&chart=transport_rejections&range=7d',short7dDoc).app.markup();
+  assert.match(short7dHtml,/class="percentile short">Current 24h: 100th percentile/);
+  assert.match(short7dHtml,/vs prior 7 days \(short window\)/);
+  const lowCovDoc=structuredClone(v7NonMidnight);
+  const lowCovDr=chart('directory_rejections',lowCovDoc);
+  lowCovDr.series.find(s=>s.key===lowCovDr.primary_series).current.day={value:null,relays:920,expected_relays:1088,coverage:920/1088,valid:false};
+  const lowCovHtml=application('?view=explorer&chart=directory_rejections&range=7d',lowCovDoc).app.markup();
+  assert.match(lowCovHtml,/Insufficient current coverage \(84\.6% · 920\/1,088 relays; ≥90% required\)/);
+
+  // 9. Fleet build classification distinguishes Patched, Stock, Daemon-attested, and Unverified summing cleanly to native_total.
+  const fleetMixDoc=structuredClone(v7NonMidnight);
+  fleetMixDoc.versions={
+   ...fleetMixDoc.versions,
+   native_total:1088,runtime_verified_total:912,runtime_unverified_relays:176,
+   verified_runtime:[
+    {build_id:'attested-0_4_9_17',version:'0.4.9.17',base_version:'0.4.9.17',relays:136,verification:'Daemon version attested'},
+    {build_id:'tor41339.9',version:'0.4.9.15 + tor41339.9',base_version:'0.4.9.15',patched:true,relays:384},
+    {build_id:'stock.15',version:'0.4.9.15',base_version:'0.4.9.15',patched:false,relays:392},
+   ],
+  };
+  const fleetOvHtml=application('?view=overview',fleetMixDoc).app.markup();
+  assert.match(fleetOvHtml,/Patched 384 · Stock 392 · Attested 136 · Unverified 176/);
+  const fleetFixesHtml=application('?view=fixes',fleetMixDoc).app.markup();
+  assert.match(fleetFixesHtml,/1,088 relays total · 912 verified · 176 unverified/);
+  assert.match(fleetFixesHtml,/0\.4\.9\.17[\s\S]*?Daemon-attested[\s\S]*?136/);
+  assert.match(fleetFixesHtml,/Version not recorded[\s\S]*?Unverified[\s\S]*?176/);
+  assert.ok(fleetFixesHtml.indexOf('Current fleet build mix')<fleetFixesHtml.indexOf('22 Nov 2026 UTC'),
+   'live build mix precedes static 22 Nov 2026 UTC known-issues timestamp');
+  assert.ok(latestCss.includes('.callout-high')&&latestCss.includes('.percentile.short')&&latestCss.includes('.status-neutral'),
+   'stylesheet defines callout, short-window comparison, and build-badge rules');
+
+  // 10. Alert callout avoids 0th pct on flat-zero non-alerting hours, labels other primary-chart series honestly, and uses 24h on daily-only bundles.
+  const flatHrCalloutDoc=makeAlertDataset(v7NonMidnight,'hour',['neutral','neutral','neutral','neutral','neutral','neutral']);
+  for(const c of flatHrCalloutDoc.charts)for(const ser of c.series)ser.reference.day={n:120,current_percentile:25,flat_zero:false,start:flatHrCalloutDoc.reference_window.start,end:flatHrCalloutDoc.reference_window.end};
+  const noReq=chart('directory_requests',flatHrCalloutDoc).series.find(s=>s.key==='no_request');
+  noReq.current.hour={value:0,relays:240,expected_relays:240,coverage:1,valid:true};
+  noReq.reference.hour={n:100,current_percentile:null,flat_zero:true,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:flatHrCalloutDoc.reference_window.start,end:flatHrCalloutDoc.reference_window.end};
+  noReq.current.day={value:5,relays:240,expected_relays:240,coverage:1,valid:true};
+  noReq.reference.day={n:100,current_percentile:95,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:flatHrCalloutDoc.reference_window.start,end:flatHrCalloutDoc.reference_window.end};
+  const flatHrDirHtml=application('?view=overview',flatHrCalloutDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  assert.match(flatHrDirHtml,/Active alert in other series/);
+  assert.match(flatHrDirHtml,/1h: 0 streams\/s \(flat zero\)/);
+  assert.doesNotMatch(flatHrDirHtml,/\b0th pct/);
+  const dailyCalloutDoc=makeAlertDataset(v6Data,'day',['neutral','neutral','neutral','neutral','neutral','neutral']);
+  const dailyNotFound=chart('hsdir_fetches',dailyCalloutDoc).series.find(s=>s.key==='not_found');
+  dailyNotFound.current.day={value:1200,relays:100,expected_relays:100,coverage:1,valid:true};
+  dailyNotFound.reference.day={n:120,current_percentile:100,flat_zero:false,mean_per_relay:1,p10_per_relay:0.5,p50_per_relay:1,p90_per_relay:2,start:dailyCalloutDoc.reference_window.start,end:dailyCalloutDoc.reference_window.end};
+  const dailyDirHtml=application('?view=overview',dailyCalloutDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  assert.match(dailyDirHtml,/24h: 1,200 requests\/s \(100th pct\)/);
+  assert.doesNotMatch(dailyDirHtml,/Rolling 24h:/);
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }
