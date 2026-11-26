@@ -6,6 +6,7 @@ const {HOUR,DAY,RESERVED_JSON_KEYS,FORBIDDEN_HOURLY_KEYS,LEGACY_V5_TIME_RANGES,v
 const LIVE_LIMITS=Object.freeze({rootBytes:65536,manifestBytes:131072,objectBytes:8388608,totalBytes:33554432,concurrency:6,requestMs:25000,candidateMs:60000});
 const MAX_JSON_DEPTH=256,MINIMUM_POPULATION_COVERAGE=0.9,SAMPLED_HOUR_STEP=21600;
 const RELEASE_ID=/^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$/,CHART_ID=/^[a-z][a-z0-9_-]{0,95}$/,SHA256=/^[a-f0-9]{64}$/,COMMIT=/^[a-f0-9]{40}$/,REFERENCE_ID=/^reference-\d{4}-\d{2}-\d{2}-[a-f0-9]{12}$/,HEX_COLOR=/^#[0-9a-f]{6}$/i,ISO_DATE=/^\d{4}-\d{2}-\d{2}$/;
+const DOS_KEY=/^[a-z][a-z0-9_]{0,63}$/,DOS_VALUE=/^(?:auto|unset|[0-9]{1,8})$/,DOS_SOURCES=new Set(['consensus','torrc','unset','observed']);
 const RELAY_ROLES=Object.freeze(['guard','middle_only','exit','hsdir','v2dir']);
 const RELAY_SUMMARY_KEYS=Object.freeze(['total',...RELAY_ROLES,'role_bounds','measured_windows','classified_windows','relay_windows','classified_relay_windows','coverage']);
 const timestamp=v=>Number.isSafeInteger(v)&&!Object.is(v,-0)&&v>=0&&v<=8.64e12;
@@ -269,6 +270,31 @@ function checkHistoricalSeries(series,periodBounds,data){
   requireLive((comparison.current_percentile===null||!Object.is(comparison.current_percentile,-0))&&comparison.current_percentile===rank&&comparison.flat_zero===flatZero,'Historical comparison rank or zero-state mismatch');
  }
 }
+function checkDosThresholds(dt,data,familyIds){
+ exactKeys(dt,['as_of','reported_relays','settings'],'Invalid dos_thresholds');
+ requireLive(!Object.is(dt.as_of,-0)&&dt.as_of===data.end,'Invalid dos_thresholds timestamp');
+ requireLive(coarsenedCount(dt.reported_relays)&&(data.fleet===undefined||dt.reported_relays<=data.fleet),'Invalid dos_thresholds population');
+ requireLive(Array.isArray(dt.settings)&&dt.settings.length>0&&dt.settings.length<=32,'Invalid dos_thresholds settings');
+ const seenKeys=new Set();
+ for(const s of dt.settings){
+  exactKeys(s,['key','option','family_id','unit','relays','values','suppressed_relays'],'Invalid dos_thresholds setting');
+  requireLive(matches(DOS_KEY,s.key)&&!RESERVED_JSON_KEYS.has(s.key)&&!seenKeys.has(s.key),'Invalid dos_thresholds setting key');
+  seenKeys.add(s.key);
+  requireLive(textField(s.option)&&s.option.length<=64&&typeof s.family_id==='string'&&familyIds.has(s.family_id)&&textField(s.unit)&&s.unit.length<=32&&coarsenedCount(s.relays)&&coarsenedCount(s.suppressed_relays),'Invalid dos_thresholds setting metadata');
+  requireLive(Array.isArray(s.values)&&s.values.length<=16,'Invalid dos_thresholds values');
+  const seenPairs=new Set();
+  let sum=0;
+  for(const item of s.values){
+   exactKeys(item,['value','source','relays'],'Invalid dos_thresholds bucket');
+   requireLive(matches(DOS_VALUE,item.value)&&typeof item.source==='string'&&DOS_SOURCES.has(item.source)&&coarsenedCount(item.relays)&&item.relays>0,'Invalid dos_thresholds bucket');
+   const pair=item.value+'\0'+item.source;
+   requireLive(!seenPairs.has(pair),'Duplicate dos_thresholds bucket');
+   seenPairs.add(pair);
+   sum+=item.relays;
+  }
+  requireLive(sum+s.suppressed_relays===s.relays,'Invalid dos_thresholds bucket total');
+ }
+}
 function checkData(data,manifest){
  requireLive(record(data),'Invalid data window');
  const isV7=data.schema_version===7;
@@ -348,6 +374,7 @@ function checkData(data,manifest){
   for(const id of family.children){requireLive(chartsById.has(id)&&!children.has(id)&&chartsById.get(id).family_id===family.id,'Invalid family membership');children.add(id);}
  }
  requireLive(children.size===chartsById.size,'Incomplete families');
+ if(data.dos_thresholds!==undefined)checkDosThresholds(data.dos_thresholds,data,familyIds);
  const exportSuffixes=data.schema_version===5?['30d','all-time']:timeRanges.periods.map(p=>p.export_suffix),required=new Set(['data.json',data.reference_document]);
  for(const c of data.charts)for(const suffix of exportSuffixes){const p=`exports/${c.id}-${suffix}.csv`;requireLive(!required.has(p),'Incomplete release object set');required.add(p);}
  requireLive(required.size===Object.keys(manifest.objects).length,'Incomplete release object set');

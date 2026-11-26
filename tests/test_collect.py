@@ -114,8 +114,9 @@ class CollectorFixture:
                      'history_methods': {'coarsening': collector.COARSENING_DESCRIPTION},
                      'dircache_cohort': {'method': 'synthetic aggregate', 'source': 'synthetic aggregate'}}
         self.attested = True
+        all_charts = collector._ensure_supplemental_charts(copy.deepcopy(self.seed), self.routes)['charts']
         handlers = {}
-        for chart in self.seed['charts']:
+        for chart in all_charts:
             for period in ['current_hour', 'sampled_hour', 'daily', 'current24']:
                 for statistic in ['value', 'eligible', 'available']:
                     query_id = self.routes[f'{chart["id"]}.{period}.{statistic}']
@@ -127,9 +128,7 @@ class CollectorFixture:
                                 value = 77 if t >= END else 2
                             elif statistic == 'eligible' and chart['id'] == 'circuit_rejections' and t == END - DAY:
                                 value = 64
-                            labels = ({'type': 'circuit_rejected'} if chart['id'] == 'circuit_rejections'
-                                      else {'action': series['key']} if chart['id'] == 'hsdir_fetches'
-                                      else {'type': series['key']})
+                            labels = collector.series_labels(chart, series)
                             rows.append((labels, value))
                         return rows
                     handlers.setdefault(query_id, data)
@@ -150,16 +149,23 @@ class CollectorFixture:
             handlers[self.routes['metadata.' + name]] = lambda t: [({}, 80)]
         for name in ['combined_zero_nonexit', 'observed_zero', 'file_fallback_zero', 'file0_observed1_conflicts']:
             handlers[self.routes['dircache.' + name]] = lambda t: [({}, 0)]
+        if 'dos.effective_config' in self.routes:
+            handlers[self.routes['dos.effective_config']] = lambda t: []
+        if 'dos.begindir_config' in self.routes:
+            handlers[self.routes['dos.begindir_config']] = lambda t: []
         for period in ('hour', 'day'):
-            for key in {self.routes[f'{chart["id"]}.relay_population.{period}'] for chart in self.seed['charts']}:
-                def roles(t, key=key, period=period):
+            for key in {self.routes[f'{chart["id"]}.relay_population.{period}'] for chart in all_charts}:
+                def roles(t, key=key, period=period, all_charts=all_charts):
                     rows = []
-                    for chart in self.seed['charts']:
+                    seen_types = set()
+                    for chart in all_charts:
                         if self.routes[f'{chart["id"]}.relay_population.{period}'] != key:
                             continue
                         for series in chart['series']:
-                            metric_type = ('circuit_rejected' if chart['id'] == 'circuit_rejections'
-                                           else series['key'])
+                            metric_type = next(iter(collector.series_labels(chart, series).values()), 'scalar')
+                            if metric_type in seen_types:
+                                continue
+                            seen_types.add(metric_type)
                             n = 64 if chart['id'] == 'circuit_rejections' and t == END - DAY else chart['relays']
                             rows.append(({'type': metric_type, 'action': '59'}, n))
                     return rows
@@ -172,17 +178,13 @@ class CollectorFixture:
 
 
 def _series_promql_labels(chart, series):
-    if chart['id'] in collector.SCALARS:
-        return {}
-    if chart['id'] in collector.ALIASES:
-        return {'type': collector.ALIASES[chart['id']]}
-    return {('action' if chart['id'] in {'hsdir_fetches', 'hsdir_uploads'} else 'type'): series['key']}
+    return collector.series_labels(chart, series)
 
 
 def _snapshot_handlers(seed, routes, *, live_native=None, rate_val=2.0):
     native_pop = seed['fleet'] if live_native is None else live_native
     handlers = {}
-    all_charts = seed['charts']
+    all_charts = collector._ensure_supplemental_charts(copy.deepcopy(seed), routes)['charts']
     pop_for_chart = lambda c: native_pop if c['cohort_key'] == 'native' else c['relays']
 
     for period in ('current_hour', 'sampled_hour', 'daily', 'current24'):
@@ -241,6 +243,17 @@ def _snapshot_handlers(seed, routes, *, live_native=None, rate_val=2.0):
         handlers[routes[f'cohort.{cohort}_attested']] = lambda t: []
     for name in ('combined_zero_nonexit', 'observed_zero', 'file_fallback_zero', 'file0_observed1_conflicts'):
         handlers[routes['dircache.' + name]] = lambda t: [({}, 0)]
+    if 'dos.effective_config' in routes:
+        eff_labels = {}
+        for key, _, _, _ in collector.DOS_EFFECTIVE_CONFIG_SETTINGS:
+            eff_labels[f'{key}_source'] = 'consensus'
+            eff_labels[key] = '1'
+        handlers[routes['dos.effective_config']] = lambda t, lbl=eff_labels: [(dict(lbl), native_pop)]
+    if 'dos.begindir_config' in routes:
+        handlers[routes['dos.begindir_config']] = lambda t: [
+            ({'option': opt, 'value': 'auto' if opt.endswith('Enabled') else '10'}, seed['defense'])
+            for _, opt, _, _ in collector.DOS_BEGINDIR_CONFIG_SETTINGS
+        ]
     return handlers
 
 
@@ -2364,6 +2377,297 @@ class CollectorTests(unittest.TestCase):
                 ])
             self.assertEqual(exited.exception.code, 1)
             self.assertEqual(stderr.getvalue(), 'Hourly archive export failed.\n')
+
+    def test_thirteen_chart_seed_backfills_supplemental_charts_trims_leading_nulls_and_plans_budget(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed13 = copy.deepcopy(base_v4)
+        seed13.pop('dos_thresholds', None)
+        seed13['families'][0]['children'] = ['transport_rejections']
+        seed13['charts'] = [c for c in seed13['charts'] if c['id'] not in ('incoming_connections', 'open_connections')]
+        seed13_snapshot = copy.deepcopy(seed13)
+        seed_end = int(seed13['end'])
+        target_end = seed_end + 3 * HOUR
+        first_observed_day = seed_end - 4 * DAY
+        seed_first_daily = min(
+            int(s['history']['daily'][0][0])
+            for c in seed13['charts'] for s in c['series'] if s['history']['daily']
+        )
+
+        handlers = _snapshot_handlers(base_v4, routes, rate_val=10.0)
+        # Simulate incoming_connections & open_connections starting only 5 days before target_end.
+        for cid in ('incoming_connections', 'open_connections'):
+            for period, stat_name in (
+                ('daily', 'eligible'), ('daily', 'available'), ('daily', 'value'),
+                ('sampled_hour', 'eligible'), ('sampled_hour', 'available'), ('sampled_hour', 'value'),
+            ):
+                qid = routes[f'{cid}.{period}.{stat_name}']
+                orig = handlers[qid]
+                cutoff = first_observed_day if period == 'daily' else (first_observed_day - DAY + SAMPLED_HOUR_STEP)
+                handlers[qid] = lambda t, orig=orig, cutoff=cutoff: [] if t < cutoff else orig(t)
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, _, _ = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+            app_dir = root / 'app'
+            (app_dir / 'inputs').mkdir(parents=True)
+            (app_dir / 'catalogue').mkdir(parents=True)
+            (app_dir / 'inputs/snapshot.json').write_text(json.dumps(seed13))
+            (app_dir / 'catalogue/queries.json').write_text(json.dumps(queries))
+            (app_dir / 'catalogue/routes.json').write_text(json.dumps(routes))
+
+            plan = collector.plan_collection(cfg, app_dir, root / 'state', end=target_end, config_path=cfg_file)
+            self.assertEqual(seed13, seed13_snapshot)
+            planned_reqs = (plan['recommended_timeout_seconds'] - collector.COLLECTION_OVERHEAD_SECONDS) // collector.SOURCE_REQUEST_TIMEOUT
+
+            src = SyntheticSource(queries, handlers)
+            summary = collector.collect(cfg, app_dir, root / 'state', root / 'out.json',
+                                        end=target_end, source=src, config_path=cfg_file)
+            self.assertEqual(summary['charts'], 15)
+            self.assertLessEqual(summary['source_requests'] + src.catalogue_calls, planned_reqs)
+            collected = json.loads((root / 'out.json').read_text())
+            collector.validate_snapshot(collected)
+
+        self.assertEqual(collected['families'][0]['children'],
+                         ['transport_rejections', 'incoming_connections', 'open_connections'])
+        by_id = {c['id']: c for c in collected['charts']}
+        inc = by_id['incoming_connections']
+        oc = by_id['open_connections']
+        self.assertEqual(inc['display_keys'], ['total', 'accepted', 'rejected'])
+        self.assertEqual([s['key'] for s in inc['series']], ['total', 'accepted', 'rejected'])
+        for s in (*inc['series'], *oc['series']):
+            self.assertEqual(s['history']['daily'][0][0], first_observed_day)
+            self.assertGreater(s['history']['daily'][0][0], seed_first_daily)
+            self.assertEqual(s['history']['daily'][-1][0], seed_end)
+            self.assertEqual(s['history']['sampled_hour'][0][0], first_observed_day - DAY + SAMPLED_HOUR_STEP)
+            self.assertEqual(len(s['relay_population']['daily']), 5)
+            self.assertIsNotNone(s['relay_population']['hour'])
+            self.assertIsNotNone(s['relay_population']['day'])
+
+        # If a newly added series has never been observed at all, leading-null trim yields empty daily & sampled_hour.
+        worker_fixture = CollectorFixture()
+        for cid in ('incoming_connections', 'open_connections'):
+            for period in ('daily', 'sampled_hour', 'current24'):
+                for stat_name in ('eligible', 'available', 'value'):
+                    worker_fixture.source.handlers[worker_fixture.routes[f'{cid}.{period}.{stat_name}']] = lambda t: []
+        with tempfile.TemporaryDirectory() as folder:
+            worker, cache = worker_fixture.instance(Path(folder) / 'empty_new.sqlite3')
+            try:
+                empty_data = worker.collect(END, 'a' * 64)
+            finally:
+                cache.close()
+        empty_inc = next(c for c in empty_data['charts'] if c['id'] == 'incoming_connections')
+        for s in empty_inc['series']:
+            self.assertEqual(s['history']['daily'], [])
+            self.assertEqual(s['history']['sampled_hour'], [])
+            self.assertFalse(s['current']['day']['valid'])
+            self.assertIsNone(s['relay_population']['day'])
+
+    def test_incoming_connections_label_mapping_and_open_connections_scalar(self):
+        fixture = CollectorFixture()
+        for period in ('current_hour', 'sampled_hour', 'daily', 'current24'):
+            fixture.source.handlers[fixture.routes[f'incoming_connections.{period}.value']] = lambda t: [
+                ({'state': 'total'}, 120.0),
+                ({'state': 'created'}, 100.0),
+                ({'state': 'rejected'}, 20.0),
+            ]
+        for period in ('hour', 'day'):
+            fixture.source.handlers[fixture.routes[f'incoming_connections.relay_population.{period}']] = lambda t: [
+                ({'type': 'total', 'action': '59'}, 80),
+                ({'type': 'created', 'action': '59'}, 80),
+                ({'type': 'rejected', 'action': '59'}, 80),
+            ]
+            fixture.source.handlers[fixture.routes[f'open_connections.relay_population.{period}']] = lambda t: [
+                ({'type': 'scalar', 'action': '59'}, 80),
+            ]
+        with tempfile.TemporaryDirectory() as folder:
+            worker, cache = fixture.instance(Path(folder) / 'labels.sqlite3')
+            try:
+                data = worker.collect(END, 'a' * 64)
+            finally:
+                cache.close()
+        by_id = {c['id']: c for c in data['charts']}
+        inc_by_key = {s['key']: s for s in by_id['incoming_connections']['series']}
+        self.assertEqual(inc_by_key['total']['current']['hour']['value'], 120.0)
+        self.assertEqual(inc_by_key['accepted']['current']['hour']['value'], 100.0)
+        self.assertEqual(inc_by_key['rejected']['current']['hour']['value'], 20.0)
+        for key in ('total', 'accepted', 'rejected'):
+            self.assertEqual(inc_by_key[key]['relay_population']['hour'], [END, 80, 80, 80, 0, 0, 80, 80])
+        oc_series = by_id['open_connections']['series'][0]
+        self.assertEqual(oc_series['current']['hour']['value'], 77.0)
+        self.assertEqual(oc_series['relay_population']['hour'], [END, 80, 80, 80, 0, 0, 80, 80])
+
+    def test_dos_thresholds_collection_unset_suppression_archive_and_route_guards(self):
+        base_v4 = json.loads((ROOT / 'inputs/snapshot.json').read_text())
+        queries = json.loads((ROOT / 'catalogue/queries.json').read_text())
+        routes = json.loads((ROOT / 'catalogue/routes.json').read_text())
+        seed_end = int(base_v4['end'])
+        target_end = seed_end + HOUR
+
+        def make_eff_metric(overrides):
+            m = {}
+            for key, _, _, _ in collector.DOS_EFFECTIVE_CONFIG_SETTINGS:
+                m[f'{key}_source'] = 'consensus'
+                m[key] = '1'
+            m.update(overrides)
+            return m
+
+        # 240 total effective relays:
+        # - dosconnectionenabled: 200 ('1', consensus), 24 ('0', torrc), 6 ('1', torrc) + 4 ('0', consensus) -> 10 suppressed -> 8/16 partitioned
+        # - dosconnectionmaxconcurrentcount: 224 ('unset' omitted), 16 ('unset' with empty string '') -> 240 ('unset', unset)
+        # - dosconnectionconnectrate: 232 ('unset' with numeric '0' kept), 8 ('25', torrc)
+        # - dos_num_circ_max_outq: two small <8 buckets totaling 10 -> suppressed
+        m_majority = make_eff_metric({
+            'dosconnectionenabled': '1', 'dosconnectionenabled_source': 'consensus',
+            'dosconnectionmaxconcurrentcount_source': 'unset',
+            'dosconnectionconnectrate': '0', 'dosconnectionconnectrate_source': 'unset',
+        })
+        m_majority.pop('dosconnectionmaxconcurrentcount')
+
+        m_torrc = make_eff_metric({
+            'dosconnectionenabled': '0', 'dosconnectionenabled_source': 'torrc',
+            'dosconnectionmaxconcurrentcount': '', 'dosconnectionmaxconcurrentcount_source': 'unset',
+            'dosconnectionconnectrate': '25', 'dosconnectionconnectrate_source': 'torrc',
+        })
+
+        m_small_a = make_eff_metric({
+            'dosconnectionenabled': '1', 'dosconnectionenabled_source': 'torrc',
+            'dosconnectionmaxconcurrentcount_source': 'unset',
+            'dosconnectionconnectrate': '0', 'dosconnectionconnectrate_source': 'unset',
+            'dos_num_circ_max_outq': '2048', 'dos_num_circ_max_outq_source': 'torrc',
+        })
+        m_small_a.pop('dosconnectionmaxconcurrentcount')
+
+        m_small_b = make_eff_metric({
+            'dosconnectionenabled': '0', 'dosconnectionenabled_source': 'consensus',
+            'dosconnectionmaxconcurrentcount_source': 'unset',
+            'dosconnectionconnectrate': '0', 'dosconnectionconnectrate_source': 'unset',
+            'dos_num_circ_max_outq': '1024', 'dos_num_circ_max_outq_source': 'torrc',
+        })
+        m_small_b.pop('dosconnectionmaxconcurrentcount')
+
+        handlers = _snapshot_handlers(base_v4, routes, live_native=240, rate_val=5.0)
+        handlers[routes['dos.effective_config']] = lambda t: [
+            (m_majority, 200),
+            (m_torrc, 24),
+            (m_small_a, 5),
+            (m_small_b, 5),
+        ]
+        # Total = 234 -> coarsen_count(234) = 232!
+        handlers[routes['dos.begindir_config']] = lambda t: [
+            ({'option': 'DoSBeginDirRateEnabled', 'value': 'auto'}, 72),
+            ({'option': 'DoSBeginDirRateEnabled', 'value': '1'}, 5),
+            ({'option': 'DoSBeginDirRateEnabled', 'value': '0'}, 3),
+            ({'option': 'DoSBeginDirRate', 'value': '10'}, 64),
+            ({'option': 'DoSBeginDirRate', 'value': '20'}, 16),
+            # DoSBeginDirBurst omitted -> 0 relays, [], 0
+            ({'option': 'DoSBeginDirDefenseType', 'value': '2'}, 4),
+            ({'option': 'DoSBeginDirDefenseType', 'value': '1'}, 4),
+        ]
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            cfg_file, _, _ = self._private_source_env(root)
+            cfg = collector.load_source_config(cfg_file)
+            state_dir = root / 'state'
+            out_path = root / 'dos_out.json'
+            src = SyntheticSource(queries, handlers)
+            # Bypass validate_matrix ONLY for the empty-string unset test by mocking access.aggregate_response?
+            # Wait: m_torrc has empty string '' for dosconnectionmaxconcurrentcount which validate_matrix rejects;
+            # verify direct Collector.dos_thresholds handles empty-string unset AND test real validate_matrix flow without ''.
+            m_torrc_valid = dict(m_torrc)
+            m_torrc_valid.pop('dosconnectionmaxconcurrentcount')
+            handlers[routes['dos.effective_config']] = lambda t: [
+                (m_majority, 200), (m_torrc_valid, 24), (m_small_a, 5), (m_small_b, 5),
+            ]
+            collector.collect(cfg, ROOT, state_dir, out_path, end=target_end, source=src, config_path=cfg_file)
+            published = json.loads(out_path.read_text())
+            collector.validate_snapshot(published)
+
+            dt = published['dos_thresholds']
+            self.assertEqual(dt['as_of'], target_end)
+            self.assertEqual(dt['reported_relays'], 232)
+            by_key = {s['key']: s for s in dt['settings']}
+            self.assertEqual(by_key['dosconnectionenabled']['values'], [
+                {'value': '1', 'source': 'consensus', 'relays': 200},
+                {'value': '0', 'source': 'torrc', 'relays': 24},
+            ])
+            self.assertEqual(by_key['dosconnectionenabled']['suppressed_relays'], 8)
+            self.assertEqual(by_key['dosconnectionmaxconcurrentcount']['values'], [
+                {'value': 'unset', 'source': 'unset', 'relays': 232},
+            ])
+            self.assertEqual(by_key['dosconnectionconnectrate']['values'], [
+                {'value': '0', 'source': 'unset', 'relays': 208},
+                {'value': '25', 'source': 'torrc', 'relays': 24},
+            ])
+            self.assertEqual(by_key['dos_num_circ_max_outq']['values'], [
+                {'value': '1', 'source': 'consensus', 'relays': 224},
+            ])
+            self.assertEqual(by_key['dos_num_circ_max_outq']['suppressed_relays'], 8)
+            self.assertEqual(by_key['dosbegindirrateenabled']['relays'], 80)
+            self.assertEqual(by_key['dosbegindirrateenabled']['values'], [
+                {'value': 'auto', 'source': 'observed', 'relays': 72},
+            ])
+            self.assertEqual(by_key['dosbegindirrateenabled']['suppressed_relays'], 8)
+            self.assertEqual(by_key['dosbegindirburst'], {
+                'key': 'dosbegindirburst', 'option': 'DoSBeginDirBurst',
+                'family_id': 'directory', 'unit': 'requests',
+                'relays': 0, 'values': [], 'suppressed_relays': 0,
+            })
+            self.assertEqual(by_key['dosbegindirdefensetype'], {
+                'key': 'dosbegindirdefensetype', 'option': 'DoSBeginDirDefenseType',
+                'family_id': 'directory', 'unit': 'mode',
+                'relays': 8, 'values': [], 'suppressed_relays': 8,
+            })
+
+            # Verify hourly_archive stores and exports dos_thresholds.
+            export_path = root / 'archive.jsonl'
+            collector.export_hourly_archive(cfg, ROOT, state_dir, export_path, config_path=cfg_file)
+            archived_row = json.loads(export_path.read_text().splitlines()[0])
+            self.assertEqual(archived_row['dos_thresholds'], dt)
+
+            # Verify empty-string value alongside source=='unset' normalizes to 'unset' in dos_thresholds().
+            worker_fixture = CollectorFixture()
+            worker, cache = worker_fixture.instance(root / 'direct.sqlite3')
+            try:
+                with mock.patch.object(
+                    worker, 'endpoint',
+                    side_effect=lambda name, ts: (
+                        {'data': {'result': [{'metric': m_torrc, 'values': [[ts, '16']]}]}}
+                        if name == 'dos.effective_config'
+                        else {'data': {'result': []}}
+                    ),
+                ):
+                    direct_dt = worker.dos_thresholds(END, 80)
+                direct_by_key = {s['key']: s for s in direct_dt['settings']}
+                self.assertEqual(direct_by_key['dosconnectionmaxconcurrentcount']['values'], [
+                    {'value': 'unset', 'source': 'unset', 'relays': 16},
+                ])
+            finally:
+                cache.close()
+
+            # Verify custom subset of routes omits supplemental charts and dos_thresholds cleanly.
+            subset_fixture = CollectorFixture()
+            subset_routes = {
+                k: v for k, v in subset_fixture.routes.items()
+                if not k.startswith(('incoming_connections.', 'open_connections.', 'dos.'))
+            }
+            subset_queries = {v: subset_fixture.queries[v] for v in set(subset_routes.values())}
+            subset_src = SyntheticSource(subset_queries, subset_fixture.source.handlers)
+            subset_cache = collector.ObservationCache(root / 'subset.sqlite3', subset_src, subset_queries)
+            try:
+                subset_worker = collector.Collector(subset_src, subset_cache, subset_queries, subset_routes, subset_fixture.seed)
+                subset_data = subset_worker.collect(END, 'a' * 64)
+            finally:
+                subset_cache.close()
+            self.assertEqual(len(subset_data['charts']), 4)
+            self.assertNotIn('dos_thresholds', subset_data)
+            self.assertGreater(
+                collector._plan_max_requests(subset_routes, subset_queries, subset_fixture.seed, END, warm_end=None, baseline_end=END),
+                0,
+            )
 
 
 if __name__ == '__main__':

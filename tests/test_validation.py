@@ -12,9 +12,9 @@ from helpers import clone_snapshot, load_source, set_path
 import windows
 from validation import _promql_ranges, validate_snapshot
 from coarsening import (
-    _coarsen_count_string, coarsen_cohort_mapping, coarsen_count, coarsen_partition,
-    coarsen_population_row, coarsen_snapshot, coarsen_value, is_coarsened_count,
-    is_coarsened_value, sigfigs3,
+    _coarsen_count_string, coarsen_cohort_mapping, coarsen_count, coarsen_dos_thresholds,
+    coarsen_partition, coarsen_population_row, coarsen_snapshot, coarsen_threshold_buckets,
+    coarsen_value, is_coarsened_count, is_coarsened_value, sigfigs3,
 )
 from io_helpers import parse_json, javascript_data, json_text
 
@@ -718,6 +718,8 @@ class InputValidationTests(unittest.TestCase):
         hourly['input_provenance']['snapshot_end'] = hourly['end']
         hourly['sources']['current_observation_end'] = hourly['end']
         hourly['versions']['as_of'] = hourly['end']
+        if 'dos_thresholds' in hourly:
+            hourly['dos_thresholds']['as_of'] = hourly['end']
         if 'runtime_resolution' in hourly['versions']:
             hourly['versions']['runtime_resolution'].update(snapshot_start=hourly['end'] - 3600, snapshot_end=hourly['end'])
         for chart in hourly['charts']:
@@ -1042,6 +1044,78 @@ class InputValidationTests(unittest.TestCase):
             field_update(data['versions'])
             with self.assertRaises(ValueError):
                 coarsen_snapshot(data)
+
+    def test_incoming_and_open_connections_coarsening_and_dos_thresholds_validation(self):
+        # open_connections uses non-sensitive gauge mean rules; incoming_connections uses counter rules.
+        self.assertEqual(coarsen_value('open_connections', 'open_connections', 'gauge_hour_mean', 0.04), 0.0)
+        self.assertEqual(coarsen_value('open_connections', 'open_connections', 'gauge_hour_mean', 0.34), 0.3)
+        self.assertEqual(coarsen_value('open_connections', 'open_connections', 'gauge_hour_mean', 22149.0), 22100.0)
+        self.assertEqual(coarsen_value('incoming_connections', 'total', 'counter_hour_rate', 7 / 3600, window_seconds=3600), 0.0)
+        self.assertEqual(coarsen_value('incoming_connections', 'total', 'counter_hour_rate', 8 / 3600, window_seconds=3600), 0.00222)
+        self.assertTrue(is_coarsened_value('open_connections', 'open_connections', 'gauge_hour_mean', 0.3, window_seconds=3600))
+        self.assertFalse(is_coarsened_value('open_connections', 'open_connections', 'gauge_hour_mean', 0.34, window_seconds=3600))
+
+        # Threshold bucket coarsening: <8 suppression, partition conservation, all-<8 suppression, zero, fleet cap.
+        self.assertEqual(coarsen_threshold_buckets([], 0, 240), (0, [], 0))
+        self.assertEqual(coarsen_threshold_buckets([(('1', 'torrc'), 5), (('0', 'torrc'), 5)], 10, 240), (8, [], 8))
+        relays_c, vals, sup_c = coarsen_threshold_buckets(
+            [(('1', 'consensus'), 100), (('2', 'torrc'), 5), (('3', 'torrc'), 5)], 110, 112,
+        )
+        self.assertEqual((relays_c, sup_c), (112, 8))
+        self.assertEqual(vals, [{'value': '1', 'source': 'consensus', 'relays': 104}])
+        self.assertEqual(coarsen_threshold_buckets([(('1', 'consensus'), 240)], 240, 80),
+                         (80, [{'value': '1', 'source': 'consensus', 'relays': 80}], 0))
+
+        # Full snapshot dos_thresholds coarsen_snapshot round-trip and validation rejections.
+        data = self.fixture()
+        validate_snapshot(data)
+        self.assertEqual(coarsen_dos_thresholds(data['dos_thresholds'], data['fleet']), data['dos_thresholds'])
+
+        # Uncoarsened input in dos_thresholds gets coarsened by coarsen_snapshot and then passes validation.
+        raw = self.fixture()
+        raw['dos_thresholds']['reported_relays'] = 239
+        raw['dos_thresholds']['settings'][0]['relays'] = 238
+        raw['dos_thresholds']['settings'][0]['values'] = [
+            {'value': '1', 'source': 'consensus', 'relays': 200},
+            {'value': '0', 'source': 'torrc', 'relays': 31},
+        ]
+        raw['dos_thresholds']['settings'][0]['suppressed_relays'] = 7
+        coarsened_raw = coarsen_snapshot(raw)
+        validate_snapshot(coarsened_raw)
+        self.assertEqual(coarsened_raw['dos_thresholds']['reported_relays'], 240)
+        self.assertEqual(coarsened_raw['dos_thresholds']['settings'][0]['relays'], 240)
+
+        bad_mutations = [
+            (lambda d: d.update(dos_thresholds=None), 'DoS thresholds fields'),
+            (lambda d: d['dos_thresholds'].update(extra=1), 'DoS thresholds fields'),
+            (lambda d: d['dos_thresholds'].pop('reported_relays'), 'DoS thresholds fields'),
+            (lambda d: d['dos_thresholds'].update(as_of=d['end'] - 3600), 'snapshot mismatch'),
+            (lambda d: d['dos_thresholds'].update(reported_relays=7), 'coarsened DoS thresholds'),
+            (lambda d: d['dos_thresholds'].update(reported_relays=True), 'coarsened DoS thresholds'),
+            (lambda d: d['dos_thresholds'].update(reported_relays=-0.0), 'coarsened DoS thresholds'),
+            (lambda d: d['dos_thresholds']['settings'].pop(), 'canonical settings list'),
+            (lambda d: d['dos_thresholds']['settings'].__setitem__(0, d['dos_thresholds']['settings'][1]), 'canonical schema'),
+            (lambda d: d['dos_thresholds']['settings'][0].update(unit='bogus'), 'canonical schema'),
+            (lambda d: d['dos_thresholds']['settings'][0].update(extra=1), 'setting fields'),
+            (lambda d: d['dos_thresholds']['settings'][0].update(relays=7), 'coarsened DoS threshold relay'),
+            (lambda d: d['dos_thresholds']['settings'][0].update(suppressed_relays=5), 'coarsened DoS threshold relay'),
+            (lambda d: d['dos_thresholds']['settings'][0].update(values={}), 'must be an array'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(extra=1), 'value fields'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(value='custom'), 'threshold value'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(value='123456789'), 'threshold value'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(value='1\n'), 'threshold value'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(source='default'), 'threshold source'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(relays=0), 'bucket count'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'][0].update(relays=7), 'bucket count'),
+            (lambda d: d['dos_thresholds']['settings'][0]['values'].append(
+                dict(d['dos_thresholds']['settings'][0]['values'][0])), 'Duplicate DoS threshold'),
+            (lambda d: d['dos_thresholds']['settings'][0].update(suppressed_relays=16), 'sum to setting relays'),
+        ]
+        for mutate, pattern in bad_mutations:
+            bad = self.fixture()
+            mutate(bad)
+            with self.subTest(pattern=pattern), self.assertRaisesRegex(ValueError, pattern):
+                validate_snapshot(bad)
 
 
 if __name__ == '__main__':

@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 import math
 import re
 import unicodedata
-from coarsening import is_coarsened_count, is_coarsened_value
+from coarsening import DOS_THRESHOLD_SETTINGS, is_coarsened_count, is_coarsened_value
 from population_statistics import METHOD as POPULATION_METHOD
 from windows import (DAY, HOUR, MAX_SAFE_INT, MINIMUM_POPULATION_COVERAGE, RESERVED_JSON_KEYS,
                      SAMPLED_HOUR_STEP, finite_number, hourly_observations, is_sha256, non_negative,
@@ -19,13 +19,15 @@ PROMQL_RANGE = re.compile(r'\[([^\]]*)\]')
 _COUNT_STR_RE = re.compile(r'[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
 _HEX40 = re.compile(r'[0-9a-f]{40}')
 _SAFE_FILENAME = re.compile(r'[A-Za-z0-9._-]+')
+_DOS_THRESHOLD_VALUE_RE = re.compile(r'(?:auto|unset|[0-9]{1,8})\Z')
+_DOS_THRESHOLD_SOURCES = frozenset({'consensus', 'torrc', 'unset', 'observed'})
 _D_MAX_SAFE_INT = Decimal(MAX_SAFE_INT)
 PRIVATE_KEYS = {'host', 'hostname', 'instance', 'relay_fingerprint', 'member_id',
                 'pid', 'boot_id', 'start_ticks', 'cookie_file', 'password',
                 'private_key', 'token', 'credentials', 'addr', 'ip', 'target',
                 'tor_metrics_instance', 'secret', 'ssh_key'}
 BAD_KEYS = RESERVED_JSON_KEYS | PRIVATE_KEYS
-TOP_FIELDS = set('generated_at start end window_seconds minimum_samples expected_samples fleet custom defense flags families product history_methods versions snapshot_flags dircache_cohort sources charts input_schema_version input_provenance'.split())
+TOP_FIELDS = set('generated_at start end window_seconds minimum_samples expected_samples fleet custom defense flags families product history_methods versions snapshot_flags dircache_cohort dos_thresholds sources charts input_schema_version input_provenance'.split())
 CHART_FIELDS = set('id family title unit note relays kind query quality_query series display_keys start end definition metrics metric_origin family_id display_scale display_unit headline_unit primary_series introduced_note history_status history_queries cohort_key'.split())
 SERIES_FIELDS = set('name key color values history history_status current hourly_relays hourly_expected_relays relay_population'.split())
 SERIES_FIELDS_V3 = set('name key color history history_status current relay_population'.split())
@@ -532,4 +534,46 @@ def validate_snapshot(data, *, allow_v3_seed=False):
         require(cohort_totals[ckey] == chart['relays'], 'Chart build population mismatch')
         for series in chart['series']:
             _validate_series(series, chart, end, schema_version=schema_version)
+    if 'dos_thresholds' in data:
+        _validate_dos_thresholds(data, end)
     return data
+
+
+def _validate_dos_thresholds(data, end):
+    dt = data['dos_thresholds']
+    require(isinstance(dt, dict) and set(dt) == {'as_of', 'reported_relays', 'settings'},
+            'Invalid DoS thresholds fields')
+    require(timestamp(dt.get('as_of')) and dt['as_of'] == end, 'DoS thresholds snapshot mismatch')
+    require(is_coarsened_count(dt.get('reported_relays')), 'Invalid coarsened DoS thresholds relay count')
+    settings = dt.get('settings')
+    require(isinstance(settings, list) and len(settings) == len(DOS_THRESHOLD_SETTINGS),
+            'DoS thresholds must match the canonical settings list')
+    for (exp_key, exp_option, exp_family, exp_unit), setting in zip(DOS_THRESHOLD_SETTINGS, settings, strict=True):
+        require(isinstance(setting, dict)
+                and set(setting) == {'key', 'option', 'family_id', 'unit', 'relays', 'values', 'suppressed_relays'},
+                'Invalid DoS threshold setting fields')
+        require(setting['key'] == exp_key and setting['option'] == exp_option
+                and setting['family_id'] == exp_family and setting['unit'] == exp_unit,
+                'DoS threshold setting does not match canonical schema')
+        require(is_coarsened_count(setting['relays']) and is_coarsened_count(setting['suppressed_relays']),
+                'Invalid coarsened DoS threshold relay count')
+        values = setting['values']
+        require(isinstance(values, list), 'DoS threshold values must be an array')
+        seen_pairs = set()
+        shown_total = 0
+        for entry in values:
+            require(isinstance(entry, dict) and set(entry) == {'value', 'source', 'relays'},
+                    'Invalid DoS threshold value fields')
+            val, src, relays = entry['value'], entry['source'], entry['relays']
+            require(isinstance(val, str) and bool(_DOS_THRESHOLD_VALUE_RE.fullmatch(val)),
+                    'Invalid DoS threshold value')
+            require(isinstance(src, str) and src in _DOS_THRESHOLD_SOURCES,
+                    'Invalid DoS threshold source')
+            require(is_coarsened_count(relays) and relays > 0,
+                    'Invalid coarsened DoS threshold bucket count')
+            pair = (val, src)
+            require(pair not in seen_pairs, 'Duplicate DoS threshold value/source entry')
+            seen_pairs.add(pair)
+            shown_total += int(relays)
+        require(shown_total + int(setting['suppressed_relays']) == int(setting['relays']),
+                'DoS threshold bucket counts do not sum to setting relays')

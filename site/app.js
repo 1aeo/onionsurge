@@ -22,6 +22,8 @@ const SOURCE_SERIES_ALIASES=new Map([
 // Chart ID, expected metric, series label, accepted UI keys, fixed matchers.
 const SELECTOR_SOURCES=new Map([
  ['transport_rejections',DOS_METRIC,'type','concurrent_conn_rejected conn_rejected'],
+ ['incoming_connections','tor_relay_connections_total','state','total accepted rejected',[['type','OR'],['direction','received']]],
+ ['open_connections','tor_relay_connections',null,'open_connections',[['type','OR'],['direction','received'],['state','opened']]],
  ['circuit_rejections',DOS_METRIC,'type','circuit_rejections'],
  ['directory_requests','tor_relay_begindir_request_total','type','circuit_dead consensus descriptor hs_get hs_post microdesc no_request other_get other_post unparsed'],
  ['introduction_rejections',DOS_METRIC,'type','introduction_rejections'],
@@ -36,12 +38,23 @@ const SELECTOR_SOURCES=new Map([
  ['exit_stream_rejections',DOS_METRIC,'type','exit_stream_rejections'],
 ].map(([id,metric,label,keys,fixed=[]])=>[id,{metric,label,keys:new Set(keys.split(' ')),fixed}]));
 
+function expandSelectorValues(chartId,series){
+ const out=[],seen=new Set();
+ for(const s of series){
+  const mapped=chartId==='incoming_connections'
+   ?(s.key==='total'?['created','rejected']:s.key==='accepted'?['created']:[s.key])
+   :[SOURCE_SERIES_ALIASES.get(s.key)||s.key];
+  for(const v of mapped)if(!seen.has(v)){seen.add(v);out.push(v);}
+ }
+ return out;
+}
+
 function metricSelectorTokens(c,series){
  const source=SELECTOR_SOURCES.get(c.id);
  const known=source&&c.metrics.length===1&&c.metrics[0]===source.metric
   &&Array.isArray(series)&&series.length>0&&series.every(s=>source.keys.has(s?.key));
  const matchers=known?source.fixed.map(([label,value])=>[label,[value]]):[];
- if(known&&source.label)matchers.push([source.label,[...new Set(series.map(s=>SOURCE_SERIES_ALIASES.get(s.key)||s.key))]]);
+ if(known&&source.label)matchers.push([source.label,expandSelectorValues(c.id,series)]);
  return c.metrics.map(metric=>{
   const tokens=[{text:metric,breakAfter:matchers.length>0}];
   if(!matchers.length)return tokens;
@@ -245,10 +258,22 @@ function validateDataGraph(D){
  }
  req(assigned.size===chartsById.size,'Families must partition charts');
 }
+const HERO_RANGE_META=Object.freeze({
+ '24h':Object.freeze({label:'24 hours',title:'Last 24 hours',months:null}),
+ '7d':Object.freeze({label:'7 days',title:'Last 7 days',months:null}),
+ '1mo':Object.freeze({label:'1 month',title:'Last 1 month',months:1}),
+ '6mo':Object.freeze({label:'6 months',title:'Last 6 months',months:6}),
+ '12mo':Object.freeze({label:'12 months',title:'Last 12 months',months:12}),
+ all:Object.freeze({label:'All time',title:'All time',months:null}),
+});
+const HERO_HOURLY_LEFT_RANGES=Object.freeze(['24h','7d','1mo','6mo','12mo']);
+const HERO_DAILY_LEFT_RANGES=Object.freeze(['7d','1mo','6mo','12mo']);
+const isHeroRange=r=>typeof r==='string'&&Object.hasOwn(HERO_RANGE_META,r);
+const normalizeHeroRange=(r,hasHours)=>isHeroRange(r)?(r==='24h'&&!hasHours?'7d':r):(hasHours?'24h':'7d');
 function parseLocation(data,search='',hash='',defaultDesign='1'){
  const timeRanges=resolveTimeRanges(data),periodIds=new Set(timeRanges.periods.map(p=>p.id));
  const allTimeId=timeRanges.periods.find(p=>p.window.unit==='all_time').id,params=new URLSearchParams(search);
- const hasHours=hasHourPayload(data),defaultHeroRange=hasHours?'24h':'7d',reqHero=params.get('hero_range');
+ const hasHours=hasHourPayload(data),reqHero=params.get('hero_range');
  const fragment=hash.startsWith('#')?hash.slice(1):hash;
  const chartFragment=!params.has('view')&&fragment&&!fragment.startsWith('family-')&&fragment!=='reference'&&data.charts.some(c=>c.id===fragment);
  const requested=params.get('view')||(defaultDesign==='3'||chartFragment?'explorer':'overview');
@@ -269,7 +294,7 @@ function parseLocation(data,search='',hash='',defaultDesign='1'){
   layout:params.get('layout')==='grid'?'grid':'full',
   familyId:selectedFamily.id,chartId:selectedChart.id,seriesKey:selectedSeries?.key||null,
   bandEnabled:params.get('band')==='1',
-  heroRange:reqHero==='all'?'all':reqHero==='7d'?'7d':reqHero==='24h'&&hasHours?'24h':defaultHeroRange,
+  heroRange:normalizeHeroRange(reqHero,hasHours),
   heroScale:params.get('hero_scale')==='symlog'?'symlog':'linear',heroHsdir:params.get('hero_hsdir')==='1',
  };
 }
@@ -286,9 +311,17 @@ const HERO_VECTORS=Object.freeze([
 const HERO_ALERT_EXCLUDE=new Set([
  'hsdir_fetches:success','hsdir_uploads:success',
  'onionskin_drops:ntor_v3','queue_limit_circuits:circuit_killed_max_cell_outq',
+ 'incoming_connections:total','incoming_connections:accepted','incoming_connections:rejected',
 ]);
+const HERO_CONTEXT_CHARTS=new Set(['incoming_connections']);
 const isAlertEligibleSeries=(c,s)=>!!(c&&!isGaugeKind(c)&&Array.isArray(c.display_keys)&&s&&c.display_keys.includes(s.key)&&!HERO_ALERT_EXCLUDE.has(c.id+':'+s.key));
 const alertStateFor=(rank,n,flatZero)=>flatZero||!isFiniteNumber(rank)?'neutral':n>=100&&rank>=99?'high':n>=20&&rank>=90?'elevated':'neutral';
+function quantileSorted(sorted,fraction){
+ if(!Array.isArray(sorted)||!sorted.length||!isFiniteNumber(fraction)||fraction<0||fraction>1)return null;
+ const pos=(sorted.length-1)*fraction,lo=Math.floor(pos),hi=Math.ceil(pos);
+ const val=sorted[lo]+(sorted[hi]-sorted[lo])*(pos-lo);
+ return isFiniteNumber(val)?val:null;
+}
 function midrankPercentile(val,sorted,inBase=false){
  const denom=inBase?sorted.length-1:sorted.length;
  if(denom<=0)return {rank:null,n:0,flatZero:false};
@@ -302,8 +335,7 @@ function midrankPercentile(val,sorted,inBase=false){
 
 function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
  if(!D||!Array.isArray(D.charts)||!Array.isArray(D.families))return null;
- const defaultR=hasHourPayload(D)?'24h':'7d';
- const r=heroRange==='all'?'all':heroRange==='7d'?'7d':heroRange==='24h'?'24h':defaultR;
+ const r=normalizeHeroRange(heroRange,hasHourPayload(D)),meta=HERO_RANGE_META[r];
  const win=r==='24h'?HOUR:DAY,modePrefix=win===HOUR?'h:':'d:';
  const chartsById=new Map();
  for(const c of D.charts)if(c&&typeof c.id==='string')chartsById.set(c.id,c);
@@ -404,8 +436,24 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
  };
  const openCircuits=resolveGauge('open_circuits','open_circuits','circuits');
  const directoryWaiting=resolveGauge('directory_waiting','directory_waiting','connections');
+ const openConnections=chartsById.has('open_connections')?resolveGauge('open_connections','open_connections','connections'):null;
+ const incChart=chartsById.get('incoming_connections');
+ let incomingConnections=null;
+ if(incChart){
+  const resolveInc=key=>{
+   const s=incChart.series?.find(item=>item&&item.key===key);
+   const idx=s?indexSeries('incoming_connections',s,key==='total'):null;
+   if(idx&&idx.minTs<earliestTs)earliestTs=idx.minTs;
+   let maxHist=0;
+   if(idx)for(const v of idx.values.values())if(v>maxHist)maxHist=v;
+   const peak=win===HOUR?(s?.peaks?.hour?.fleet_peak??s?.peaks?.day?.fleet_peak):s?.peaks?.day?.fleet_peak;
+   const rawPeak=Math.max(isFiniteNumber(peak)&&peak>0?peak:0,maxHist);
+   return {key,idx,rawPeak,values:[],latestRank:null};
+  };
+  incomingConnections={total:resolveInc('total'),accepted:resolveInc('accepted'),rejected:resolveInc('rejected')};
+ }
  if(!Number.isFinite(earliestTs))return null;
- const start=r==='all'?earliestTs-DAY:end-(r==='24h'?DAY:7*DAY);
+ const start=r==='all'?earliestTs-DAY:meta.months!==null?calendarWindowStart(end,meta.months):end-(r==='24h'?DAY:7*DAY);
  if(!validTime(start)||!validTime(end)||end<=start||(end-start)/win>MAX_PLOT_INTERVALS)return null;
  const times=[];
  for(let t=start+win;t<=end;t+=win)times.push(t);
@@ -445,12 +493,24 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
    if(v!=null){hasAnyMeasured=true;notePop(t,g.idx.populations.get(t));}
    else hasMissingGauge=true;
   }
+  if(openConnections){
+   const v=openConnections.idx?openConnections.idx.values.get(t)??null:null;
+   openConnections.values.push(v);openConnections.missing.push(v==null);
+   if(v!=null)hasAnyMeasured=true;
+  }
+  if(incomingConnections){
+   for(const item of [incomingConnections.total,incomingConnections.accepted,incomingConnections.rejected]){
+    const v=item.idx?item.idx.values.get(t)??null:null;
+    item.values.push(v);
+    if(v!=null)hasAnyMeasured=true;
+   }
+  }
  }
- for(const g of gaugeList){
+ for(const g of openConnections?[...gaugeList,openConnections]:gaugeList){
   let winPeak=0;
   for(const v of g.values)if(v!=null&&v>winPeak)winPeak=v;
   g.windowPeak=winPeak;
-  g.scalePeak=(r==='24h'||r==='7d')?(winPeak>0?winPeak:1):(g.rawPeak>0?g.rawPeak:1);
+  g.scalePeak=r!=='all'?(winPeak>0?winPeak:1):(g.rawPeak>0?g.rawPeak:1);
  }
  const sevOrder={neutral:1,elevated:2,high:3},refPeriod=win===HOUR?'hour':'day';
  const rankSeriesAt=(s,idx,t)=>{
@@ -494,12 +554,12 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
   for(const vec of vectors){
    for(const src of vec.sources){
     const v=src.values.get(tEnd),pop=src.populations.get(tEnd),pr=Number.isInteger(pop)&&pop>0?v/pop:NaN;
-    if(v!==undefined&&isFiniteNumber(pr)){activeSources.push(src);curPr+=pr;}
+    if(v!==undefined&&isFiniteNumber(pr)){activeSources.push({src,curPop:pop});curPr+=pr;}
    }
   }
   if(activeSources.length&&isFiniteNumber(curPr)){
-   const baseSum=new Map(),baseCnt=new Map();
-   for(const src of activeSources){
+   const baseSum=new Map(),fleetSum=new Map(),baseCnt=new Map();
+   for(const {src,curPop} of activeSources){
     const srcBase=new Map();
     if(win===HOUR){
      const scale=src.c?displayScale(src.c):1;
@@ -516,25 +576,67 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
     }
     for(const [t,pr] of srcBase){
      baseSum.set(t,(baseSum.get(t)??0)+pr);
+     fleetSum.set(t,(fleetSum.get(t)??0)+pr*curPop);
      baseCnt.set(t,(baseCnt.get(t)??0)+1);
     }
    }
-   const baseline=[],baselineTimes=new Set();
+   const baseline=[],fleetBaseline=[],baselineTimes=new Set();
    for(const [t,cnt] of baseCnt)if(cnt===activeSources.length){
-    const sumPr=baseSum.get(t);
+    const sumPr=baseSum.get(t),sumFl=fleetSum.get(t);
     if(isFiniteNumber(sumPr)){baseline.push(sumPr);baselineTimes.add(t);}
+    if(isFiniteNumber(sumFl))fleetBaseline.push(sumFl);
    }
    baseline.sort((a,b)=>a-b);
-   rateRank={...midrankPercentile(curPr,baseline,baselineTimes.has(tEnd)),activeSources:activeSources.length,totalSources:configuredSources};
+   fleetBaseline.sort((a,b)=>a-b);
+   const p90Fleet=fleetBaseline.length>=20?quantileSorted(fleetBaseline,0.90):null;
+   const p99Fleet=fleetBaseline.length>=100?quantileSorted(fleetBaseline,0.99):null;
+   rateRank={...midrankPercentile(curPr,baseline,baselineTimes.has(tEnd)),activeSources:activeSources.length,totalSources:configuredSources,p90Fleet,p99Fleet};
   }
  }
  if(tEnd!==null){
-  for(const g of gaugeList){
+  for(const g of openConnections?[...gaugeList,openConnections]:gaugeList){
    if(g.idx&&g.values[times.length-1]!=null){
     const ranked=rankSeriesAt(g.idx.s,g.idx,tEnd);
     if(ranked)g.latestRank={rank:ranked.rank,n:ranked.n,flatZero:ranked.flatZero};
    }
   }
+  if(incomingConnections?.total?.idx&&incomingConnections.total.values[times.length-1]!=null){
+   const ranked=rankSeriesAt(incomingConnections.total.idx.s,incomingConnections.total.idx,tEnd);
+   if(ranked)incomingConnections.total.latestRank={rank:ranked.rank,n:ranked.n,flatZero:ranked.flatZero};
+  }
+ }
+ const familyThresholds=[];
+ for(const fam of familySpecs){
+  if(!fam.members.length)continue;
+  const pc=chartsById.get(fam.primary);
+  if(fam.id==='exit'&&D.flags?.Exit===0&&pc?.series?.length&&pc.series.every(s=>s.reference?.[refPeriod]?.flat_zero===true))continue;
+  const famPrimaryKey=pc?.primary_series||pc?.series?.[0]?.key;
+  const cands=fam.members.map(({c,s,idx})=>{
+   const rawPop=tEnd!==null?idx.populations.get(tEnd):null;
+   const pop=(Number.isInteger(rawPop)&&rawPop>0)?rawPop
+    :(Number.isInteger(s.current?.[refPeriod]?.relays)&&s.current[refPeriod].relays>0)?s.current[refPeriod].relays
+    :(Number.isInteger(c.relays)&&c.relays>0?c.relays:null);
+   const ref=s.reference?.[refPeriod];
+   let n=0,p90Per=null,p99Per=null;
+   if((refPeriod==='hour'||rawEnd===end)&&ref&&Number.isInteger(ref.n)&&ref.n>0&&(isFiniteNumber(ref.p90_per_relay)||isFiniteNumber(ref.p99_per_relay))){
+    n=ref.n;
+    p90Per=n>=20&&isFiniteNumber(ref.p90_per_relay)?ref.p90_per_relay:(idx.baseline.length>=20?quantileSorted(idx.baseline,0.90):null);
+    p99Per=n>=100&&isFiniteNumber(ref.p99_per_relay)?ref.p99_per_relay:(idx.baseline.length>=100?quantileSorted(idx.baseline,0.99):null);
+   }else if(idx.baseline.length>0){
+    n=idx.baseline.length;
+    p90Per=n>=20?quantileSorted(idx.baseline,0.90):null;
+    p99Per=n>=100?quantileSorted(idx.baseline,0.99):null;
+   }else if(ref&&Number.isInteger(ref.n)&&ref.n>0){
+    n=ref.n;
+    p90Per=n>=20&&isFiniteNumber(ref.p90_per_relay)?ref.p90_per_relay:null;
+    p99Per=n>=100&&isFiniteNumber(ref.p99_per_relay)?ref.p99_per_relay:null;
+   }
+   const p90=p90Per!==null&&pop>0&&isFiniteNumber(p90Per*pop)?p90Per*pop:null;
+   const p99=p99Per!==null&&pop>0&&isFiniteNumber(p99Per*pop)?p99Per*pop:null;
+   return {id:fam.id,icon:fam.icon,title:fam.title,chartId:c.id,chartTitle:c.title,seriesKey:s.key,seriesName:s.name,n,pop,p90,p99,isPrimary:c.id===fam.primary&&s.key===famPrimaryKey};
+  });
+  const chosen=cands.find(x=>x.isPrimary)||cands.slice().sort((a,b)=>((b.p90??-1)-(a.p90??-1))||(b.n-a.n))[0];
+  if(chosen)familyThresholds.push(chosen);
  }
  let hasMissingAlerts=false;
  const families=familySpecs.map(fam=>({
@@ -558,8 +660,8 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
   }),
  }));
  if(!hasAnyMeasured)return null;
- return {start,end,window:win,times,vectors,totals,maxTotal,maxSeries,ratePeak,rateRank,missingRates,partialRates,families,
-  gauges:{openCircuits,directoryWaiting},relayRangeByTime,
+ return {range:r,start,end,window:win,times,vectors,totals,maxTotal,maxSeries,ratePeak,rateRank,missingRates,partialRates,families,familyThresholds,
+  gauges:{openCircuits,directoryWaiting},openConnections,incomingConnections,relayRangeByTime,
   hasPartialRate,hasAnyMissing:hasMissingRate||hasMissingAlerts||hasMissingGauge};
 }
 
@@ -693,7 +795,7 @@ function createObservatory(data,browser,initialRelease=null){
  let families=new Map(D.families.map(f=>[f.id,f]));
  const chart=id=>charts.get(id),family=id=>families.get(id);
  let {view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN);
- const parseRequestedHeroRange=search=>{const reqHero=new URLSearchParams(search).get('hero_range');return reqHero==='24h'||reqHero==='7d'||reqHero==='all'?reqHero:null;};
+ const parseRequestedHeroRange=search=>{const reqHero=new URLSearchParams(search).get('hero_range');return isHeroRange(reqHero)?reqHero:null;};
  let requestedHeroRange=parseRequestedHeroRange(location.search);
  let plotCache=new WeakMap(),heroCache=new Map(),urlCache=null,lastHeaderH=null,touchPlot=null;
  const plotMeta=new WeakMap(),copyTimers=new WeakMap(),copyRequests=new WeakMap();
@@ -702,7 +804,7 @@ const shown=c=>{const cc=chartCache(c);let out=cc.get('shown');if(!out){out=c.se
 const primary=c=>{const cc=chartCache(c);let def=cc.get('primary');if(!def){def=c.series.find(s=>s.key===c.primary_series)||c.series[0];cc.set('primary',def);}return (view==='explorer'&&c.id===chartId&&seriesKey&&c.series.find(s=>s.key===seriesKey))||def;};
 const isHourlyRelease=()=>hasHourPayload(D);
 const defaultHeroRange=()=>isHourlyRelease()?'24h':'7d';
-const resolveHeroRange=()=>requestedHeroRange==='24h'&&!isHourlyRelease()?'7d':(requestedHeroRange||defaultHeroRange());
+const resolveHeroRange=()=>normalizeHeroRange(requestedHeroRange,isHourlyRelease());
 const currentValue=(s,c,period='day')=>{
  const current=s.current?.[period],value=current?.value;
  return current?.valid===false||!isFiniteNumber(value)||value<0||!isFiniteNumber(value*displayScale(c))?null:value;
@@ -1013,7 +1115,7 @@ function heroPlotData(r=heroRange,includeHsdir=heroHsdir){
  return result;
 }
 function heroPlotLabel(r=heroRange,hasData=true,scaleMode=heroScale){
- const label=r==='all'?'All time':r==='24h'?'Last 24 hours':'Last 7 days';
+ const label=HERO_RANGE_META[r]?.title||'Last 7 days';
  return `Concurrent DoS activity; ${label}; ${scaleMode==='symlog'?'symlog':'linear'} scale`+(hasData?'. Use arrow keys to inspect intervals.':'; No retained samples available for this chart.');
 }
 function summarizeFleetBuilds(){
@@ -1064,16 +1166,79 @@ function fleetOpsStrip(){
  if(!chips.length)return '';
  return `<section class="fleet-strip" aria-label="Measured fleet summary"><div class="fleet-strip-items">${chips.join('')}</div><a class="fleet-strip-link" href="${url('fixes')}" data-view="fixes">Tor builds &amp; fixes →</a></section>`;
 }
+const DOS_THRESHOLD_GROUPS=[
+ ['Connection limits',new Set(['transport'])],
+ ['Circuit creation',new Set(['circuits'])],
+ ['Queues & Intro',new Set(['queues','introduction'])],
+ ['Directory (BEGIN_DIR)',new Set(['directory'])],
+ ['Exit streams',new Set(['exit'])],
+];
+function heroThresholdsSection(h,is24h,isNonMidnightDay){
+ const dt=isPlainRecord(D.dos_thresholds)&&Array.isArray(D.dos_thresholds.settings)&&D.dos_thresholds.settings.length?D.dos_thresholds:null;
+ const fams=h?.familyThresholds||[];
+ const hasComposite=!!(h?.rateRank&&(h.rateRank.p90Fleet!=null||h.rateRank.p99Fleet!=null||h.rateRank.n>0));
+ const hasOptionB=hasComposite||fams.length>0;
+ if(!dt&&!hasOptionB)return '';
+ const unitChar=is24h?'h':'d';
+ const fmtVal=(v,unit)=>v==='unset'?'Tor default (unset)':v==='auto'?'auto':(/^\d+$/.test(v)&&unit&&!/^(bool|boolean|flag|mode|enum|none|-|—)$/i.test(unit)?`${v} ${unit}`:v);
+ let optionAHtml='';
+ if(dt){
+  const groupedHtml=DOS_THRESHOLD_GROUPS.map(([title,famSet])=>{
+   const items=dt.settings.filter(item=>famSet.has(item.family_id));
+   if(!items.length)return '';
+   const rows=items.map(item=>{
+    const vals=Array.isArray(item.values)?item.values:[],sup=Number.isInteger(item.suppressed_relays)&&item.suppressed_relays>0?item.suppressed_relays:0;
+    const split=vals.length>1||sup>0;
+    let valHtml;
+    if(split){
+     const parts=vals.map(b=>`${escapeHtml(fmtVal(b.value,item.unit))} <span class="threshold-source">(${escapeHtml(b.source)}: ${count(b.relays)})</span>`);
+     if(sup)parts.push(`<span class="threshold-source">+${count(sup)} other</span>`);
+     valHtml=parts.join(' · ');
+    }else if(vals.length===1){
+     const b=vals[0];
+     valHtml=`${escapeHtml(fmtVal(b.value,item.unit))}`+(b.value!=='unset'||b.source!=='unset'?` <span class="threshold-source">(${escapeHtml(b.source)})</span>`:'');
+    }else{
+     valHtml='Unavailable';
+    }
+    return `<div class="hero-threshold-row"><span class="hero-threshold-key">${escapeHtml(item.option)}</span><span class="hero-threshold-val">${valHtml}</span></div>`;
+   }).join('');
+   return `<div class="hero-threshold-group"><div class="hero-threshold-group-title">${escapeHtml(title)}</div>${rows}</div>`;
+  }).filter(Boolean).join('');
+  optionAHtml=`<div class="hero-threshold-col"><div class="hero-threshold-head"><h3>Tor trigger thresholds</h3><span class="hero-threshold-sub">consensus / torrc · ${count(dt.reported_relays)} relays</span></div>${groupedHtml}</div>`;
+ }
+ let optionBHtml='';
+ if(hasOptionB){
+  const winSub=is24h?'1h window':isNonMidnightDay?'UTC day':'24h window';
+  const fmtCut=(val,n,minN)=>isFiniteNumber(val)?`${number(val)} events/s`:`— (<${count(minN)}${unitChar})`;
+  const bRows=[];
+  if(hasComposite){
+   bRows.push(`<div class="hero-threshold-row"><span class="hero-threshold-key">${heroHsdir?'Composite mitigated &amp; flood rate':'Composite mitigated rate'}</span><span class="hero-threshold-val"><span class="cutoff-elevated">≥90th: ${escapeHtml(fmtCut(h.rateRank.p90Fleet,h.rateRank.n,20))}</span> · <span class="cutoff-high">≥99th: ${escapeHtml(fmtCut(h.rateRank.p99Fleet,h.rateRank.n,100))}</span> <span class="threshold-n">(${count(h.rateRank.n)}${unitChar})</span></span></div>`);
+  }
+  for(const fam of fams){
+   bRows.push(`<div class="hero-threshold-row"><span class="hero-threshold-key">${escapeHtml(fam.icon)} ${escapeHtml(fam.title)}</span><span class="hero-threshold-val"><span class="cutoff-elevated">≥90th: ${escapeHtml(fmtCut(fam.p90,fam.n,20))}</span> · <span class="cutoff-high">≥99th: ${escapeHtml(fmtCut(fam.p99,fam.n,100))}</span> <span class="threshold-n">(${count(fam.n)}${unitChar})</span></span></div>`);
+  }
+  optionBHtml=`<div class="hero-threshold-col"><div class="hero-threshold-head"><h3>Dashboard alert cutoffs</h3><span class="hero-threshold-sub">${winSub} · ≥90th / ≥99th pct in events/s</span></div><div class="hero-threshold-list">${bRows.join('')}</div></div>`;
+ }
+ return `<div class="hero-thresholds" aria-label="DoS thresholds and alert cutoffs"><div class="hero-thresholds-grid${optionAHtml&&optionBHtml?'':' single-col'}">${optionAHtml}${optionBHtml}</div></div>`;
+}
 function heroCard(){
- const isHourly=isHourlyRelease(),leftRange=heroRange==='7d'?'7d':(isHourly?'24h':'7d'),is24h=leftRange==='24h';
- const h24=isHourly?heroPlotData('24h',heroHsdir):null,h7=heroPlotData('7d',heroHsdir),hAll=heroPlotData('all',heroHsdir);
- const h=is24h?h24:(h7||hAll),last=h?h.times.length-1:-1;
+ const isHourly=isHourlyRelease(),defaultLeft=isHourly?'24h':'7d';
+ const leftRange=heroRange==='all'?defaultLeft:normalizeHeroRange(heroRange,isHourly),is24h=leftRange==='24h';
+ const hLeft=heroPlotData(leftRange,heroHsdir),hAll=heroPlotData('all',heroHsdir);
+ const h=is24h?hLeft:(hLeft||hAll),last=h?h.times.length-1:-1;
  const isNonMidnightDay=!is24h&&isHourly&&validTime(D.end)&&(h?h.end!==D.end:D.end%DAY!==0);
  const total=last>=0?h.totals[last]:null,latestPartial=last>=0&&h.partialRates[last];
  const ratePeak=h?.ratePeak??0,rateShare=peakShare(total,ratePeak);
  const open=last>=0?h.gauges.openCircuits.values[last]:null,wait=last>=0?h.gauges.directoryWaiting.values[last]:null;
  const openPeak=h?.gauges.openCircuits.rawPeak??0,waitPeak=h?.gauges.directoryWaiting.rawPeak??0;
  const openShare=peakShare(open,openPeak),waitShare=peakShare(wait,waitPeak);
+ const hasIncomingHero=!!(h?.incomingConnections?.total?.idx||h?.openConnections?.idx||chart('incoming_connections')||chart('open_connections'));
+ const incTotal=last>=0?h.incomingConnections?.total?.values?.[last]??null:null;
+ const incAcc=last>=0?h.incomingConnections?.accepted?.values?.[last]??null:null;
+ const incRej=last>=0?h.incomingConnections?.rejected?.values?.[last]??null:null;
+ const incPeak=h?.incomingConnections?.total?.rawPeak??0,incShare=peakShare(incTotal,incPeak);
+ const openConn=last>=0?h.openConnections?.values?.[last]??null:null;
+ const openConnPeak=h?.openConnections?.rawPeak??0,openConnShare=peakShare(openConn,openConnPeak);
  const alerts=[];
  let anyAlertMeasured=false,hasHighAlert=false;
  if(last>=0)for(const f of h.families){
@@ -1088,7 +1253,7 @@ function heroCard(){
   return !!(pc?.series?.length&&pc.series.every(s=>s.reference?.[refP]?.flat_zero===true));
  };
  const activeFamilyCount=D.families.filter(f=>!isInactiveExitHero(f)).length;
- const alertExploreRange=is24h?'24h':'7d';
+ const alertExploreRange=periodMap.has(leftRange)?leftRange:(is24h&&periodMap.has('24h')?'24h':(periodMap.has('7d')?'7d':timeRanges.default_range));
  const alertClass=!anyAlertMeasured?'unknown':hasHighAlert?'high':alerts.length?'elevated':'neutral';
  const endWindow=h?formatIntervalWindow(h.end-h.window,h.end,h.window):validTime(D.end)?(is24h?formatIntervalWindow(Math.floor(D.end/HOUR)*HOUR-HOUR,Math.floor(D.end/HOUR)*HOUR,HOUR):date(Math.floor(D.end/DAY)*DAY-DAY)+' UTC'):'Unavailable';
  const alertWindowLine=isNonMidnightDay?`<div class="hero-kpi-meta">${escapeHtml(endWindow)} · completed UTC day</div>`:'';
@@ -1102,13 +1267,14 @@ function heroCard(){
    return `<li><a class="hero-alert-link ${state}" href="#family-${escapeHtml(encodeURIComponent(f.id))}" data-family-jump="${escapeHtml(f.id)}">${escapeHtml(f.icon)} ${escapeHtml(f.title)}</a>${detail}</li>`;
   }).join('')}</ul>`
   :`${alertWindowLine}<div class="hero-kpi-meta">${anyAlertMeasured?'No qualifying family alerts':'No measured family series'}</div>`;
- const desktopWindow=isHourly?controlGroup('Window','Concurrent DoS left-panel window','data-hero-range',leftRange,[['24h','24 hours'],['7d','7 days']],'hero-window-desktop'):'';
- const mobileOpts=isHourly?[['24h','24 hours'],['7d','7 days'],['all','All time']]:[['7d','7 days'],['all','All time']];
+ const leftOpts=(isHourly?HERO_HOURLY_LEFT_RANGES:HERO_DAILY_LEFT_RANGES).map(id=>[id,HERO_RANGE_META[id].label]);
+ const desktopWindow=controlGroup('Window','Concurrent DoS left-panel window','data-hero-range',leftRange,leftOpts,'hero-window-desktop');
+ const mobileOpts=[...leftOpts,['all',HERO_RANGE_META.all.label]];
  const mobileWindow=controlGroup('Window','Concurrent DoS time range','data-hero-range',heroRange,mobileOpts,'hero-window-mobile');
  const controls=`<div class="hero-controls">${desktopWindow}${mobileWindow}${controlGroup('Flow scale','Concurrent DoS flow scale','data-hero-scale',heroScale,[['linear','Linear'],['symlog','Symlog']])}<button class="hero-toggle ${heroHsdir?'active':''}" data-hero-hsdir aria-pressed="${heroHsdir}">HSDir GET/POST ${heroHsdir?'included':'excluded'}</button></div>`;
  const recScope=is24h?'1h record':'24h record';
  const dayScopeMeta=isNonMidnightDay?`${endWindow} · `:'';
- const heroPctBadge=(hasVal,rk,{isGauge=false,unitWord,extraScope=''})=>{
+ const heroPctBadge=(hasVal,rk,{isGauge=false,unitWord,extraScope='',scopeText=null})=>{
   if(!hasVal)return '';
   if(!rk||!Number.isInteger(rk.n)||rk.n<=0||(!rk.flatZero&&!isFiniteNumber(rk.rank))){
    return '<div class="hero-kpi-pct"><span class="percentile unknown" title="No matching reference intervals available">Percentile unavailable</span></div>';
@@ -1118,9 +1284,9 @@ function heroCard(){
   }
   const label=`${formatPercentileOrdinal(rk.rank)} percentile`;
   const cls=rk.n<20?'unknown':isGauge?'neutral':alertStateFor(rk.rank,rk.n,false);
-  const scope=isGauge
+  const scope=scopeText||(isGauge
    ?`Per-relay mean ranked vs ${count(rk.n)} reference ${unitWord} (resource gauge; does not trigger family alerts).`
-   :`Per-relay sum ranked vs ${count(rk.n)} matching reference ${unitWord}${extraScope}.`;
+   :`Per-relay sum ranked vs ${count(rk.n)} matching reference ${unitWord}${extraScope}.`);
   const shortTag=rk.n<20?` <span class="hero-kpi-pct-note">(${count(rk.n)}${is24h?'h':'d'})</span>`:'';
   return `<div class="hero-kpi-pct"><span class="percentile ${cls}" title="${escapeHtml(scope)}">${escapeHtml(label)}</span>${shortTag}</div>`;
  };
@@ -1133,13 +1299,30 @@ function heroCard(){
   +heroPctBadge(open!=null,h?.gauges?.openCircuits?.latestRank,{isGauge:true,unitWord});
  const waitMeta=`<div class="hero-kpi-meta">${escapeHtml(waitShare?`${dayScopeMeta}${waitShare} of ${axisNumber(waitPeak)} peak (${recScope})`:'command_wait state')}</div>`
   +heroPctBadge(wait!=null,h?.gauges?.directoryWaiting?.latestRank,{isGauge:true,unitWord});
- const kpiItems=[
-  [is24h?(heroHsdir?'Latest 1h mitigated &amp; flood rate':'Latest 1h mitigated rate'):isNonMidnightDay?(heroHsdir?'Latest UTC day mitigated &amp; flood rate':'Latest UTC day mitigated rate'):(heroHsdir?'Latest 24h mitigated &amp; flood rate':'Latest 24h mitigated rate'),total!=null?'neutral':'unknown',`${escapeHtml(total!=null?number(total):'Unavailable')} <small>events/s${latestPartial?' · partial':''}</small>`,rateMeta],
-  [is24h?'Concurrent family alerts (1h)':isNonMidnightDay?'Concurrent family alerts (UTC day)':'Concurrent family alerts (24h)',alertClass,`${count(alerts.length)} of ${count(activeFamilyCount)} <small>${activeFamilyCount<D.families.length?'active families ≥90th pct':'families ≥90th pct'}</small>`,alertMeta],
-  [is24h?'Open circuits (1h mean)':isNonMidnightDay?'Open circuits (UTC day mean)':'Open circuits (24h mean)',open!=null?'neutral':'unknown',`${escapeHtml(open!=null?number(open):'Unavailable')} <small>circuits</small>`,openMeta],
-  [is24h?'Stalled BEGIN_DIR (1h mean)':isNonMidnightDay?'Stalled BEGIN_DIR (UTC day mean)':'Stalled BEGIN_DIR (24h mean)',wait!=null?'neutral':'unknown',`${escapeHtml(wait!=null?number(wait):'Unavailable')} <small>connections</small>`,waitMeta],
- ];
- const kpis=`<div class="hero-kpi-grid">${kpiItems.map(([lbl,cls,val,meta])=>`<div class="hero-kpi"><div class="hero-kpi-label">${lbl}</div><div class="hero-kpi-value ${cls}">${val}</div>${meta}</div>`).join('')}</div>`;
+ const scopeTag=is24h?'1h':isNonMidnightDay?'UTC day':'24h';
+ const rateTile=[is24h?(heroHsdir?'Latest 1h mitigated &amp; flood rate':'Latest 1h mitigated rate'):isNonMidnightDay?(heroHsdir?'Latest UTC day mitigated &amp; flood rate':'Latest UTC day mitigated rate'):(heroHsdir?'Latest 24h mitigated &amp; flood rate':'Latest 24h mitigated rate'),total!=null?'neutral':'unknown',`${escapeHtml(total!=null?number(total):'Unavailable')} <small>events/s${latestPartial?' · partial':''}</small>`,rateMeta];
+ const alertTile=[is24h?'Concurrent family alerts (1h)':isNonMidnightDay?'Concurrent family alerts (UTC day)':'Concurrent family alerts (24h)',alertClass,`${count(alerts.length)} of ${count(activeFamilyCount)} <small>${activeFamilyCount<D.families.length?'active families ≥90th pct':'families ≥90th pct'}</small>`,alertMeta];
+ const openTile=[is24h?'Open circuits (1h mean)':isNonMidnightDay?'Open circuits (UTC day mean)':'Open circuits (24h mean)',open!=null?'neutral':'unknown',`${escapeHtml(open!=null?number(open):'Unavailable')} <small>circuits</small>`,openMeta];
+ const waitTile=[is24h?'Stalled BEGIN_DIR (1h mean)':isNonMidnightDay?'Stalled BEGIN_DIR (UTC day mean)':'Stalled BEGIN_DIR (24h mean)',wait!=null?'neutral':'unknown',`${escapeHtml(wait!=null?number(wait):'Unavailable')} <small>connections</small>`,waitMeta];
+ let kpiItems;
+ if(hasIncomingHero){
+  const incRejPct=incRej!=null?(incTotal>0?peakShare(incRej,incTotal):incRej===0?'0%':null):null;
+  const incBreakdown=(incAcc!=null||incRej!=null)
+   ?`<div class="hero-kpi-breakdown">Accepted: ${escapeHtml(incAcc!=null?number(incAcc)+'/s':'Unavailable')} · Rejected: ${escapeHtml(incRej!=null?number(incRej)+'/s':'Unavailable')}${incRejPct?` (${escapeHtml(incRejPct)} rejected)`:''}</div>`
+   :'';
+  const incMeta=incBreakdown
+   +(incShare?`<div class="hero-kpi-meta">${escapeHtml(`${dayScopeMeta}${incShare} of ${axisNumber(incPeak)} peak (${recScope})`)}</div>`:'')
+   +heroPctBadge(incTotal!=null,h?.incomingConnections?.total?.latestRank,{isGauge:true,unitWord,scopeText:`Per-relay rate ranked vs ${count(h?.incomingConnections?.total?.latestRank?.n??0)} reference ${unitWord} (traffic context; does not trigger family alerts).`});
+  const incTile=[`Incoming OR connections (${scopeTag})`,incTotal!=null?'neutral':'unknown',`${escapeHtml(incTotal!=null?number(incTotal):'Unavailable')} <small>attempts/s</small>`,incMeta];
+  const openConnMeta=`<div class="hero-kpi-meta">${escapeHtml(openConnShare?`${dayScopeMeta}${openConnShare} of ${axisNumber(openConnPeak)} peak (${recScope})`:'OR received opened state')}</div>`
+   +heroPctBadge(openConn!=null,h?.openConnections?.latestRank,{isGauge:true,unitWord});
+  const openConnTile=[`Open incoming OR (${scopeTag} mean)`,openConn!=null?'neutral':'unknown',`${escapeHtml(openConn!=null?number(openConn):'Unavailable')} <small>connections</small>`,openConnMeta];
+  kpiItems=[rateTile,incTile,alertTile,openTile,openConnTile,waitTile];
+ }else{
+  kpiItems=[rateTile,alertTile,openTile,waitTile];
+ }
+ const kpis=`<div class="hero-kpi-grid${hasIncomingHero?' hero-kpi-6':''}">${kpiItems.map(([lbl,cls,val,meta])=>`<div class="hero-kpi"><div class="hero-kpi-label">${lbl}</div><div class="hero-kpi-value ${cls}">${val}</div>${meta}</div>`).join('')}</div>`;
+ const thresholdsHtml=heroThresholdsSection(h,is24h,isNonMidnightDay);
  const hourSpan=hp=>{if(!hp?.times?.length)return '';const s=hp.start,e=hp.end,sd=date(s),ed=date(e);return sd===ed?`${sd} ${time(s)}–${time(e)}`:`${sd} ${time(s)}–${ed} ${time(e)}`;};
  const daySpan=hp=>hp?.times?.length?(hp.times.length===1?date(hp.start):`${date(hp.start)}–${date(hp.end-DAY)}`):'';
  const heroPanel=(r,title,hp,sub,unitLbl)=>{
@@ -1147,14 +1330,13 @@ function heroCard(){
   const panelCls='hero-panel'+(heroRange===r?' active':'')+(r===leftRange?' desktop-left':'')+(r==='all'?' desktop-right':'');
   return `<div class="${panelCls}" data-hero-panel="${r}"><div class="hero-panel-head"><span class="hero-panel-title"><b>${title}</b>${sub?` <small>(${escapeHtml(sub)})</small>`:''}</span><span class="hero-panel-meta">${meta}</span></div><div class="plot-wrap hero-plot-wrap" data-hero-plot="concurrent_dos_${r}" data-hero-plot-range="${r}" tabindex="0" role="img" aria-label="${escapeHtml(heroPlotLabel(r,!!hp,heroScale))}"></div></div>`;
  };
- const panelHtml=[];
- if(isHourly){const s24=hourSpan(h24);panelHtml.push(heroPanel('24h','Last 24 hours',h24,s24?`${s24} · 1h UTC`:'1h UTC','1h'));}
- const s7=daySpan(h7),sAll=daySpan(hAll),allDays=hAll?.times?.length?`${count(hAll.times.length)}d${sAll?' · '+sAll:''}`:sAll;
- panelHtml.push(heroPanel('7d','Last 7 days',h7,s7?`${s7} · 24h UTC`:'24h UTC','24h'));
- panelHtml.push(heroPanel('all','All time',hAll,allDays,'24h'));
- const panels=`<div class="hero-panels">${panelHtml.join('')}</div>`;
- const hasPartial=!!(h24?.hasPartialRate||h7?.hasPartialRate||hAll?.hasPartialRate),hasMissing=!!(h24?.hasAnyMissing||h7?.hasAnyMissing||hAll?.hasAnyMissing);
- const vecLegend=((h||h7||hAll)?.vectors||[]).map(v=>`<span><i style="background:${seriesColor(v.color)}"></i>${escapeHtml(v.label)}</span>`).join('');
+ const leftMeta=HERO_RANGE_META[leftRange];
+ const leftSpan=is24h?hourSpan(hLeft):daySpan(hLeft);
+ const leftSub=is24h?(leftSpan?`${leftSpan} · 1h UTC`:'1h UTC'):(leftSpan?`${leftSpan} · 24h UTC`:'24h UTC');
+ const sAll=daySpan(hAll),allDays=hAll?.times?.length?`${count(hAll.times.length)}d${sAll?' · '+sAll:''}`:sAll;
+ const panels=`<div class="hero-panels">${heroPanel(leftRange,leftMeta.title,hLeft,leftSub,is24h?'1h':'24h')}${heroPanel('all',HERO_RANGE_META.all.title,hAll,allDays,'24h')}</div>`;
+ const hasPartial=!!(hLeft?.hasPartialRate||hAll?.hasPartialRate),hasMissing=!!(hLeft?.hasAnyMissing||hAll?.hasAnyMissing);
+ const vecLegend=((h||hAll)?.vectors||[]).map(v=>`<span><i style="background:${seriesColor(v.color)}"></i>${escapeHtml(v.label)}</span>`).join('');
  const laneKey=D.families.map(f=>`${escapeHtml(f.icon)} ${escapeHtml(f.title)}`).join(' · ');
  const laneSpan=`${escapeHtml(D.families[0]?.icon||'01')}→${escapeHtml(D.families.at(-1)?.icon||'06')}`;
  const cohortParts=[
@@ -1166,12 +1348,12 @@ function heroCard(){
  const gaugePeakNote=(leftG,allG,fallbackPeak)=>{
   const winP=leftG?.windowPeak??0,allP=allG?.rawPeak??0;
   if(winP>0&&allP>0&&winP!==allP)return `100% = ${axisNumber(winP)} (${leftRange}) · ${axisNumber(allP)} (all-time)`;
-  if(winP>0&&(leftRange==='24h'||leftRange==='7d'))return `${axisNumber(winP)} (${leftRange} peak)`;
+  if(winP>0&&leftRange!=='all')return `${axisNumber(winP)} (${leftRange} peak)`;
   if(allP>0)return `${axisNumber(allP)} peak`;
   if(fallbackPeak>0)return `${axisNumber(fallbackPeak)} peak`;
   return '100%';
  };
- const leftGauges=(is24h?h24:h7)?.gauges;
+ const leftGauges=hLeft?.gauges;
  const openLegendPeak=gaugePeakNote(leftGauges?.openCircuits,hAll?.gauges?.openCircuits,openPeak);
  const waitLegendPeak=gaugePeakNote(leftGauges?.directoryWaiting,hAll?.gauges?.directoryWaiting,waitPeak);
  const legendHtml=`<div class="legend hero-legend">`
@@ -1183,12 +1365,12 @@ function heroCard(){
   ?'Synchronized hourly and daily UTC views across non-overlapping mitigated &amp; flood rates (/s), a 6-family ≥90th/≥99th percentile alert strip, and normalized open-circuit &amp; stalled <code>BEGIN_DIR</code> resource state.'
   :'Synchronized daily UTC view across non-overlapping mitigated &amp; flood rates (/s), a 6-family ≥90th/≥99th percentile alert strip, and normalized open-circuit &amp; stalled <code>BEGIN_DIR</code> resource state.';
  const heroShortCaption=isHourly
-  ?'Non-overlapping 1h UTC intervals (Last 24 hours) and 24h UTC intervals (Last 7 days, All time) across non-overlapping mitigated/flood rates, family alerts, and normalized resource gauges.'
-  :'Non-overlapping 24h UTC intervals (00:00 UTC) across non-overlapping mitigated/flood rates, family alerts, and normalized resource gauges.';
+  ?'Non-overlapping 1h UTC intervals (Last 24 hours) and 24h UTC intervals (Last 7 days, Last 1 month, Last 6 months, Last 12 months, All time) across non-overlapping mitigated/flood rates, family alerts, and normalized resource gauges.'
+  :'Non-overlapping 24h UTC intervals (00:00 UTC) across Last 7 days, Last 1 month, Last 6 months, Last 12 months, and All time for non-overlapping mitigated/flood rates, family alerts, and normalized resource gauges.';
  const heroFootnote=isHourly
-  ?'Non-overlapping 1-hour UTC intervals on Last 24 hours and 24-hour UTC intervals (00:00 UTC) on Last 7 days and All time; desktop displays Last 24 hours or Last 7 days (via Window) alongside All time, while smaller screens switch all three views with Window. Counter sums exclude overlapping sub-series (<code>ntor_v3</code> within <code>ntor</code>; exitward queue hits within <code>circuit_killed_max_cell</code>; HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>). Alert lanes mark families with a qualifying DoS counter at rank ≥90 with at least 20 reference windows (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference windows (high), using sampled 1-hour references on Last 24 hours and daily references on Last 7 days and All time. Bottom resource gauges normalize to each series’ window peak on Last 24 hours and Last 7 days and retained fleet record on All time; KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).'
-  :'Non-overlapping 24-hour UTC intervals (00:00 UTC); desktop displays Last 7 days and All time side by side, while smaller screens switch with Window. Counter sums exclude overlapping sub-series (<code>ntor_v3</code> within <code>ntor</code>; exitward queue hits within <code>circuit_killed_max_cell</code>; HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>). Alert lanes mark families with a qualifying DoS counter at rank ≥90 with at least 20 reference days (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference days (high). Bottom resource gauges normalize to each series’ 7-day peak on Last 7 days and retained fleet record on All time; KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).';
- return `<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="${escapeHtml(heroRange)}"><div class="card-heading"><div><div class="family-label">All six families · Concurrent DoS overview</div><h2>Concurrent DoS activity</h2></div>${controls}</div><p class="definition">${heroDesc}</p>${kpis}<figure>${panels}${legendHtml}<figcaption><b>Summary.</b> ${heroShortCaption}</figcaption><details class="method-details"><summary>Methodology &amp; overlap rules</summary><p>${heroFootnote}</p></details></figure></section>`;
+  ?'Non-overlapping 1-hour UTC intervals on Last 24 hours and 24-hour UTC intervals (00:00 UTC) on daily windows (Last 7 days, Last 1 month, Last 6 months, Last 12 months, and All time); desktop displays the selected Window alongside All time, while smaller screens switch among all six views with Window. Counter sums exclude overlapping sub-series (<code>ntor_v3</code> within <code>ntor</code>; exitward queue hits within <code>circuit_killed_max_cell</code>; HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>). Alert lanes mark families with a qualifying DoS counter at rank ≥90 with at least 20 reference windows (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference windows (high), using sampled 1-hour references on Last 24 hours and daily references on daily windows. Bottom resource gauges normalize to each series’ selected window peak on Last 24 hours through Last 12 months and retained fleet record on All time; KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).'
+  :'Non-overlapping 24-hour UTC intervals (00:00 UTC); desktop displays the selected Window (Last 7 days, Last 1 month, Last 6 months, or Last 12 months) alongside All time, while smaller screens switch among all five views with Window. Counter sums exclude overlapping sub-series (<code>ntor_v3</code> within <code>ntor</code>; exitward queue hits within <code>circuit_killed_max_cell</code>; HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>). Alert lanes mark families with a qualifying DoS counter at rank ≥90 with at least 20 reference days (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference days (high). Bottom resource gauges normalize to each series’ selected window peak on Last 7 days through Last 12 months and retained fleet record on All time; KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).';
+ return `<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="${escapeHtml(heroRange)}"><div class="card-heading"><div><div class="family-label">All six families · Concurrent DoS overview</div><h2>Concurrent DoS activity</h2></div>${controls}</div><p class="definition">${heroDesc}</p>${kpis}${thresholdsHtml}<figure>${panels}${legendHtml}<figcaption><b>Summary.</b> ${heroShortCaption}</figcaption><details class="method-details"><summary>Methodology &amp; overlap rules</summary><p>${heroFootnote}</p></details></figure></section>`;
 }
 function familyActiveAlerts(f,primaryChart,primarySeries){
  const hourly=isHourlyRelease(),sevOrder={neutral:0,elevated:1,high:2},alerts=[];
@@ -1247,14 +1429,14 @@ function childStrip(f,r){
  const pills=f.children.map(cid=>{
   const ch=chart(cid);if(!ch)return '';
   let bestSev=-1,bestRank=-Infinity,bestState='unknown',bestSeries=null;
-  const gaugeChart=isGaugeKind(ch);
+  const gaugeChart=isGaugeKind(ch),isContext=HERO_CONTEXT_CHARTS.has(cid),neutralOnly=gaugeChart||isContext;
   for(const s of ch.series){
-   if(!gaugeChart&&!isAlertEligibleSeries(ch,s))continue;
+   if(!neutralOnly&&!isAlertEligibleSeries(ch,s))continue;
    const ref=s.reference?.[refPeriod];
    if(s.current?.[refPeriod]?.valid!==true||!ref||!Number.isInteger(ref.n)||ref.n<=0)continue;
    const flatZero=!!ref.flat_zero,rank=flatZero?0:ref.current_percentile;
-   if(!flatZero&&!isFiniteNumber(rank))continue;
-   const state=gaugeChart?'neutral':alertStateFor(rank,ref.n,flatZero);
+   if(!isContext&&!flatZero&&!isFiniteNumber(rank))continue;
+   const state=neutralOnly?'neutral':alertStateFor(rank,ref.n,flatZero);
    const sev=sevOrder[state],candRank=isFiniteNumber(rank)?rank:0;
    if(sev>bestSev||(sev===bestSev&&candRank>bestRank)){bestSev=sev;bestRank=candRank;bestState=state;bestSeries=s;}
   }
@@ -1267,15 +1449,45 @@ function childStrip(f,r){
  const statusScope=hourRef?'1h status':isHourlyRelease()?'rolling 24h status':'24h status';
  return `<div class="child-strip" aria-label="${escapeHtml(f.title)} child charts"><span class="child-strip-label">Family charts (${count(f.children.length)} · ${statusScope})</span><div class="child-pill-list">${pills}</div></div>`;
 }
+function incomingContextCard(f,r){
+ const inc=chart('incoming_connections'),open=chart('open_connections');
+ if(!inc&&!open)return '';
+ const hourly=isHourlyRelease(),cols=hourly?[['hour','Last hour'],['day','24h']]:[['day','24h']];
+ const ser=k=>inc?.series?.find(s=>s.key===k);
+ const openSer=open?.series?.find(s=>s.key==='open_connections')||open?.series?.[0];
+ const fmtVal=(ch,s,p,unit)=>{
+  if(!ch||!s)return 'Unavailable';
+  const v=currentValue(s,ch,p);
+  return v!==null?`${scaledText(ch,v)} ${unit}`:'Unavailable';
+ };
+ const fmtRej=p=>{
+  if(!inc||!ser('rejected'))return 'Unavailable';
+  const rv=currentValue(ser('rejected'),inc,p);
+  if(rv===null)return 'Unavailable';
+  const tv=ser('total')?currentValue(ser('total'),inc,p):null;
+  const share=tv!=null?(tv>0?peakShare(rv,tv):rv===0?'0%':null):null;
+  return `${scaledText(inc,rv)} attempts/s${share?` · ${share} of total`:''}`;
+ };
+ const rows=[];
+ if(inc){
+  rows.push(['Total attempts',cols.map(([p])=>fmtVal(inc,ser('total'),p,'attempts/s'))]);
+  rows.push(['Accepted',cols.map(([p])=>fmtVal(inc,ser('accepted'),p,'attempts/s'))]);
+  rows.push(['Rejected',cols.map(([p])=>fmtRej(p))]);
+ }
+ if(open)rows.push(['Open incoming OR',cols.map(([p])=>fmtVal(open,openSer,p,'connections'))]);
+ const targetId=inc?inc.id:open.id,linkLabel=inc?'Explore incoming OR connections →':'Explore open incoming OR →';
+ return `<div class="incoming-context-card"><div class="incoming-context-head"><span class="incoming-context-title">Incoming OR connection traffic (context)</span><a href="${url('explorer',r,f.id,targetId)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(targetId)}" data-range="${escapeHtml(r)}">${linkLabel}</a></div><table class="incoming-context-table"><thead><tr><th>Metric</th>${cols.map(([,lbl])=>`<th>${escapeHtml(lbl)}</th>`).join('')}</tr></thead><tbody>${rows.map(([lbl,vals])=>`<tr><th>${escapeHtml(lbl)}</th>${vals.map(v=>`<td>${escapeHtml(v)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+}
 function card(c,f,r){
  const s=primary(c),relaySrc=s.current?.hour&&'relays' in s.current.hour?s.current.hour:s.current?.day,relayCount=relaySrc&&'relays' in relaySrc?relaySrc.relays:c.relays;
  const refKind=isHourRange(r)&&isHourlyRelease()?'hour':'day';
  const zeroExitNote=f.id==='exit'&&D.flags?.Exit===0&&c.series.every(item=>item.reference?.[refKind]?.flat_zero===true)
   ?'<p class="card-callout">This fleet runs <b>0 Exit relays</b>; exit stream rejections remain zero across retained history.</p>':'';
  const alertCallout=familyAlertCallout(f,c,s,r);
+ const incomingCtx=f.id==='transport'?incomingContextCard(f,r):'';
  const familyTotal=String(D.families.length).padStart(2,'0');
  const childCountLabel=f.children.length>1?` (${count(f.children.length)} charts)`:'';
- return `<article id="family-${escapeHtml(f.id)}" class="chart-card" data-family-range="${escapeHtml(r)}" tabindex="-1"><div class="card-heading"><div><div class="family-label">Family ${escapeHtml(f.icon)} of ${familyTotal}</div><h2>${escapeHtml(f.title)}</h2></div></div><div class="card-summary"><div class="card-context"><p class="definition">${escapeHtml(c.definition)}</p><div class="metric-subtitle">${metricSubtitle(c,r)}</div>${alertCallout}${zeroExitNote}</div><div class="reading-block">${reading(c,s)}</div></div>${childStrip(f,r)}${figure(c,r)}<div class="card-actions"><a href="${url('explorer',r,f.id,c.id)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(c.id)}" data-range="${escapeHtml(r)}">Explore ${escapeHtml(f.title)}${childCountLabel} →</a><span>${count(relayCount)} reporting relays</span></div></article>`;
+ return `<article id="family-${escapeHtml(f.id)}" class="chart-card" data-family-range="${escapeHtml(r)}" tabindex="-1"><div class="card-heading"><div><div class="family-label">Family ${escapeHtml(f.icon)} of ${familyTotal}</div><h2>${escapeHtml(f.title)}</h2></div></div><div class="card-summary"><div class="card-context"><p class="definition">${escapeHtml(c.definition)}</p><div class="metric-subtitle">${metricSubtitle(c,r)}</div>${alertCallout}${zeroExitNote}${incomingCtx}</div><div class="reading-block">${reading(c,s)}</div></div>${childStrip(f,r)}${figure(c,r)}<div class="card-actions"><a href="${url('explorer',r,f.id,c.id)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(c.id)}" data-range="${escapeHtml(r)}">Explore ${escapeHtml(f.title)}${childCountLabel} →</a><span>${count(relayCount)} reporting relays</span></div></article>`;
 }
 function chartControls(){return `<div class="overview-controls">${controlGroup('Time range','Chart time range','data-all-range',range,timeRanges.periods.map(p=>[p.id,p.label]))}${view==='overview'?controlGroup('Layout','Chart layout','data-layout',layout,[['grid','Grid'],['full','Full width']]):''}</div>`;}
 function overview(){return `<h2 class="sr-only" data-view-heading tabindex="-1">Overview</h2>${fleetOpsStrip()}${heroCard()}<div class="overview-toolbar"><div><h2>Six chart families</h2><p>A percentile shows where a value sits among reference windows. The ruler runs from 0 to 100. <a href="${url('methods')}#reference" data-methods>How it is calculated</a></p></div>${chartControls()}</div><div class="chart-stack chart-${layout}">${D.families.map(f=>card(chart(f.primary),f,range)).join('')}</div>`;}
@@ -1343,16 +1555,16 @@ function methods(){
  const customThresholds=dailyPeriods.filter(p=>p.minimum_comparison_windows!==30)
   .map(p=>`${count(p.minimum_comparison_windows)} for ${escapeHtml(p.label)}`);
  const summarySentence=hasHour
-  ?`The Overview opens with a <b>Concurrent DoS activity</b> card showing <b>Last 24 hours</b> or <b>Last 7 days</b> (selectable via <b>Window</b>) alongside <b>All time</b> on desktop, or all three windows via <b>Window</b> on narrower screens, followed by the six chart families controlled by the global time range (${rangeList}) and Grid/Full width layout. The 2×2 summary panel pairs the <b>Last complete hour</b> and <b>24-hour average</b> with the active range’s average (defaulting to <b>${fallbackLabel}</b> when viewing ${fixedRangeLabels}) alongside <b>${fixedLabels.join('</b> and <b>')}</b>. Hover or use arrow keys on any chart to inspect individual UTC intervals and reporting-relay counts.`
-  :`The Overview opens with a <b>Concurrent DoS activity</b> card showing <b>Last 7 days</b> and <b>All time</b> side by side on desktop (or selectable via the <b>Window</b> toggle on narrower screens), followed by the six chart families controlled by the global time range (${rangeList}) and Grid/Full width layout. The 2×2 summary panel pairs the <b>24-hour average</b> with the active range’s average (defaulting to <b>${fallbackLabel}</b> when viewing ${fixedRangeLabels}) alongside <b>${fixedLabels.join('</b> and <b>')}</b>. Hover or use arrow keys on any chart to inspect individual UTC days and reporting-relay counts.`;
+  ?`The Overview opens with a <b>Concurrent DoS activity</b> card showing <b>Last 24 hours</b>, <b>Last 7 days</b>, <b>Last 1 month</b>, <b>Last 6 months</b>, or <b>Last 12 months</b> (selectable via <b>Window</b>) alongside <b>All time</b> on desktop, or all six windows via <b>Window</b> on narrower screens, followed by the six chart families controlled by the global time range (${rangeList}) and Grid/Full width layout. The 2×2 summary panel pairs the <b>Last complete hour</b> and <b>24-hour average</b> with the active range’s average (defaulting to <b>${fallbackLabel}</b> when viewing ${fixedRangeLabels}) alongside <b>${fixedLabels.join('</b> and <b>')}</b>. Hover or use arrow keys on any chart to inspect individual UTC intervals and reporting-relay counts.`
+  :`The Overview opens with a <b>Concurrent DoS activity</b> card showing <b>Last 7 days</b>, <b>Last 1 month</b>, <b>Last 6 months</b>, or <b>Last 12 months</b> (selectable via <b>Window</b>) alongside <b>All time</b> on desktop, or all five windows via <b>Window</b> on narrower screens, followed by the six chart families controlled by the global time range (${rangeList}) and Grid/Full width layout. The 2×2 summary panel pairs the <b>24-hour average</b> with the active range’s average (defaulting to <b>${fallbackLabel}</b> when viewing ${fixedRangeLabels}) alongside <b>${fixedLabels.join('</b> and <b>')}</b>. Hover or use arrow keys on any chart to inspect individual UTC days and reporting-relay counts.`;
  const intervalLead=hasHour
   ?'The measurements come from Tor MetricsPort across non-overlapping 1-hour UTC intervals (<code>3,600s</code>) for the 24-hour snapshot and non-overlapping 24-hour UTC intervals (00:00:00 to 00:00:00 UTC) for daily views.'
   :'The measurements come from Tor MetricsPort across non-overlapping 24-hour UTC intervals (00:00:00 to 00:00:00 UTC).';
  const heroMethodDesc=hasHour
-  ?'The top Overview chart aligns three vertical tiers across non-overlapping <code>3,600s</code> UTC hours (for 24 hours) or <code>86,400s</code> UTC days (for 7 days and All time) on either a stacked linear or per-vector symlog rate scale: (1) additive source-unit rates excluding overlapping subsets (<code>ntor_v3</code> within <code>ntor</code>, exitward queue hits within <code>circuit_killed_max_cell</code>, and HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>, with optional <code>HSDir GET/POST</code> exclusion), (2) a six-family alert strip marking intervals where a qualifying DoS counter reaches rank ≥90 with at least 20 reference windows (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference windows (high), and (3) hourly or daily fleet means for open circuits and stalled <code>BEGIN_DIR</code> connections normalized to each series’ window peak on Last 24 hours and Last 7 days and retained fleet record on All time. KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).'
-  :'The top Overview chart aligns three vertical tiers across non-overlapping <code>86,400s</code> UTC days on either a stacked linear or per-vector symlog rate scale: (1) additive source-unit rates excluding overlapping subsets (<code>ntor_v3</code> within <code>ntor</code>, exitward queue hits within <code>circuit_killed_max_cell</code>, and HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>, with optional <code>HSDir GET/POST</code> exclusion), (2) a six-family alert strip marking days where a qualifying DoS counter reaches rank ≥90 with at least 20 reference days (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference days (high), and (3) daily fleet means for open circuits and stalled <code>BEGIN_DIR</code> connections normalized to each series’ 7-day peak on Last 7 days and retained fleet record on All time. KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).';
+  ?'The top Overview chart aligns three vertical tiers across non-overlapping <code>3,600s</code> UTC hours (for 24 hours) or <code>86,400s</code> UTC days (for 7 days, 1 month, 6 months, 12 months, and All time) on either a stacked linear or per-vector symlog rate scale: (1) additive source-unit rates excluding overlapping subsets (<code>ntor_v3</code> within <code>ntor</code>, exitward queue hits within <code>circuit_killed_max_cell</code>, and HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>, with optional <code>HSDir GET/POST</code> exclusion), (2) a six-family alert strip marking intervals where a qualifying DoS counter reaches rank ≥90 with at least 20 reference windows (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference windows (high), and (3) hourly or daily fleet means for open circuits and stalled <code>BEGIN_DIR</code> connections normalized to each series’ window peak on Last 24 hours through Last 12 months and retained fleet record on All time. KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).'
+  :'The top Overview chart aligns three vertical tiers across non-overlapping <code>86,400s</code> UTC days on either a stacked linear or per-vector symlog rate scale: (1) additive source-unit rates excluding overlapping subsets (<code>ntor_v3</code> within <code>ntor</code>, exitward queue hits within <code>circuit_killed_max_cell</code>, and HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>, with optional <code>HSDir GET/POST</code> exclusion), (2) a six-family alert strip marking days where a qualifying DoS counter reaches rank ≥90 with at least 20 reference days (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference days (high), and (3) daily fleet means for open circuits and stalled <code>BEGIN_DIR</code> connections normalized to each series’ window peak on Last 7 days through Last 12 months and retained fleet record on All time. KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).';
  const hourHeadlineRow=hasHour?'<tr><th>Last complete hour</th><td>Latest completed 1-hour UTC window (<code>3,600s</code>): per-source <code>rate(metric[1h])</code> before summing (<code>avg_over_time(metric[1h])</code> for gauges).</td></tr>':'';
- const headlineDayDesc=hasHour?'Rolling 24-hour UTC window ending at snapshot end (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges). On non-midnight hourly releases, selecting <b>Last 7 days</b> updates Hero KPIs to the latest completed 00:00 UTC calendar day so their figures match the daily bars (while <b>All time</b> keeps the 1h KPIs).':'Latest completed UTC day (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges).';
+ const headlineDayDesc=hasHour?'Rolling 24-hour UTC window ending at snapshot end (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges). On non-midnight hourly releases, selecting a daily window (<b>Last 7 days</b>, <b>Last 1 month</b>, <b>Last 6 months</b>, or <b>Last 12 months</b>) updates Hero KPIs to the latest completed 00:00 UTC calendar day so their figures match the daily bars or areas (while <b>All time</b> keeps the 1h KPIs).':'Latest completed UTC day (<code>86,400s</code>): per-source <code>rate(metric[1d])</code> before summing (<code>avg_over_time(metric[1d])</code> for gauges).';
  const refSentence=hasHour?'One-hour references sample one window every six hours. Daily references use complete 24-hour windows. Equal values share the middle percentile rank. The rank marker is omitted when both the reference values and the current measurement are zero.':'Daily references use complete non-overlapping 24-hour UTC windows. Equal values share the middle percentile rank. The rank marker is omitted when both the reference values and the current measurement are zero.';
  const peakSentence=hasHour?'Hourly peaks are labeled <b>Sampled 1h fleet peak</b>: older hourly data is sampled four times per day. <b>Recorded 24h fleet peak</b> uses retained daily observations plus the current 24-hour measurement. The reporting-relay count at each peak is included in its tooltip and data export.':'<b>Recorded 24h fleet peak</b> uses retained daily observations plus the current 24-hour measurement. The reporting-relay count at each peak is included in its tooltip and data export.';
  const bandSentence=hasHour?'The explorer band focuses on the selected series. Shading covers its 10th-90th percentile range, with a dashed median. The 24-hour plot uses sampled one-hour reference windows; daily ranges use 24-hour reference days.':'The explorer band focuses on the selected series. Shading covers its 10th-90th percentile range across 24-hour reference days, with a dashed median, across every configured time range.';
@@ -1369,7 +1581,9 @@ function methods(){
    ?'<b>Onion-service rates:</b> <code>hsdir_fetches</code>, <code>hsdir_uploads</code>, <code>introduction_rejections</code>, and <code>directory_requests</code> <code>hs_get</code>/<code>hs_post</code> bin to <code>0.001/s</code> with the 8-event floor applied per measurement window (<code>3,600s</code> or <code>86,400s</code>), then round to 3 significant digits.'
    :'<b>Onion-service rates:</b> <code>hsdir_fetches</code>, <code>hsdir_uploads</code>, <code>introduction_rejections</code>, and <code>directory_requests</code> <code>hs_get</code>/<code>hs_post</code> suppress below 8 events/day, bin to <code>0.001/s</code>, and round to 3 significant digits.',
   '<b>Other counter series:</b> suppress below 8 events per window, bin to 8-event increments, and round rates to 3 significant digits.',
-  '<b>Non-sensitive gauge means:</b> <code>directory_waiting</code> floors below <code>0.05</code> to <code>0</code>, quantizes <code>[0.05, 1)</code> to <code>0.1</code>, and rounds <code>&gt;= 1</code> to 3 significant digits.',
+  chart('open_connections')
+   ?'<b>Non-sensitive gauge means:</b> <code>directory_waiting</code> and <code>open_connections</code> floor below <code>0.05</code> to <code>0</code>, quantize <code>[0.05, 1)</code> to <code>0.1</code>, and round <code>&gt;= 1</code> to 3 significant digits.'
+   :'<b>Non-sensitive gauge means:</b> <code>directory_waiting</code> floors below <code>0.05</code> to <code>0</code>, quantizes <code>[0.05, 1)</code> to <code>0.1</code>, and rounds <code>&gt;= 1</code> to 3 significant digits.',
  ].map(item=>`<li>${item}</li>`).join('');
  const scopeNoun=hasHour?'last complete hour':'latest complete UTC day';
  return `<section class="text-page"><h2 data-view-heading tabindex="-1">Metrics and percentiles</h2>${release?`<p>Release <code>${escapeHtml(release.id)}</code> · ${downloadLink('manifest.json','Release manifest','methods-manifest')}</p>`:''}<p>${intervalLead} ${summarySentence}</p><h3>Concurrent DoS overview</h3><p>${heroMethodDesc}</p><h3>Headline and historical windows</h3><table><tbody>${hourHeadlineRow}<tr><th>24-hour average</th><td>${headlineDayDesc}</td></tr>${periodRows}</tbody></table><h3>Historical averages &amp; Current 24h</h3><p>${dailyPeriods.map(p=>`<b>${escapeHtml(p.average_label)}</b>`).join(', ')} are unweighted arithmetic means of the measured daily fleet values in each period; missing days are excluded. These means keep fleet totals, while their <b>Current 24h</b> rulers normalize current and historical daily values per reporting relay.</p><p>Each historical ruler compares the current 24-hour average against non-overlapping qualifying daily values ending at or before the reference cutoff (${lagSentence}), keeping historical averages in their neutral color.</p><h3 id="reference" tabindex="-1">18-month reference</h3><p>The reference contains qualifying windows from the prior 18 calendar months, ending at 00:00 UTC on the day before the reference date. Newer metrics use their shorter available record (labeled <b>Reference average (N d / N h)</b> on cards). Dates and sample counts appear below each chart.</p><p>The 18-month average is calculated per reporting relay, then scaled to the current reporting count. Peaks use the fleet total recorded at that time.</p><p>${refSentence}</p><p>Current headline values, percentile labels and markers use the same color. Upper-tail colors start at the 90th percentile when at least 20 reference windows are available (the strongest color requires at least 100 reference windows and a rank at or above the 99th percentile); comparison windows with fewer than 20 daily intervals (such as 7 days) use a neutral short-window marker rather than upper-tail alert colors. Fewer than the minimum configured comparison windows use a muted color${customThresholds.length?` (${customThresholds.join(', ')})`:''}.</p><h3>Percentile and peak</h3><p>A percentile describes position in the reference distribution. A peak describes magnitude in the full retained record. The reference excludes the current 24-hour window, so even the 100th percentile can be below a newer recorded peak.</p><p>${peakSentence}</p><h3>Optional percentile band</h3><p>${bandSentence}</p><p>Each band interval is scaled by that interval’s reporting-relay count. All time applies the current reference to older observations. The band is off by default; enabling it focuses the selected series and expands the axis to include its reference range.</p><h3>${pubHeading}</h3><p>${pubSentence}</p><p>Reference date: <b>${escapeHtml(D.reference_window?.date||'Unavailable')}</b>. ${downloadLink(referenceDocument(D.reference_document),'Download the frozen reference','methods-reference')}.</p><h3>Coverage</h3><p>${covSentence}</p><h3>Dir-spec coarsening</h3><p>${coarseningIntro}</p><ul class="coarsening-list">${coarseningItems}</ul><h3>Relay counts</h3><p>Counts describe contributors to each statistic. Historical counts are daily averages over the same measured days as the metric average. Roles use the last recorded flags within each window; flag groups can overlap. Middle-only means Running with Guard, Exit, HSDir and V2Dir off. Historical counts require an available metric average. Exact role counts require complete flag coverage. With partial flag evidence, ranges include unclassified relays over the same contributing windows; endpoints are rounded outward. Unavailable counts appear as dashes.</p><h3>Tor builds</h3><p><b>Patched Tor</b> means Tor with our additional tor41339 changes; its upstream base version is shown. Build counts describe the ${scopeNoun}. Versions come from running-binary records and direct daemon responses linked to process records.</p><h3>Current DirCache 0 cohort</h3><p><b>Middle (DirCache 0)</b> uses configuration and matching flags for the ${scopeNoun}. This cohort contains ${count(D.dircache_cohort?.configured_nonexit_zero)} non-exit relays: ${count(D.dircache_cohort?.observed_controlport_zero)} observed effective configurations and ${count(D.dircache_cohort?.file_config_fallback_zero)} explicit configuration-file records.</p><p>${downloadLink('data.json','Download values, queries and provenance →','methods-json')}</p></section>`;
@@ -1460,7 +1674,7 @@ function drawHero(el,r=heroRange,scaleMode=heroScale,includeHsdir=heroHsdir,meas
  const stripH=Math.max(36,Math.min(44,famCount*6+2)),rateH=Math.round((ph-stripGap-gaugeGap-stripH)*0.65);
  const rateTop=top,stripTop=rateTop+rateH+stripGap,gaugeTop=stripTop+stripH+gaugeGap,gaugeH=Math.max(40,top+ph-gaugeTop);
  const win=data.window||DAY,n=data.times.length,x=t=>left+(t-data.start)/(data.end-data.start)*pw,symlog=v=>{if(!(v>0))return 0;const s=v/0.01;return isFiniteNumber(s)?Math.log10(1+s):Math.log10(v)+2;};
- const safeR=r==='all'?'all':r==='7d'?'7d':'24h',patId=`hero-missing-${safeR}-${scaleMode==='symlog'?'s':'l'}-${includeHsdir?1:0}`;
+ const safeR=isHeroRange(r)?r:'24h',patId=`hero-missing-${safeR}-${scaleMode==='symlog'?'s':'l'}-${includeHsdir?1:0}`;
  const x0s=new Array(n),x1s=new Array(n);
  for(let i=0;i<n;i++){const t=data.times[i];x0s[i]=x(t-win).toFixed(2);x1s[i]=x(t).toFixed(2);}
  let out=svgHead(width,height,left,patId,scaleMode==='symlog'?'events/s (symlog)':'events/s'),rateY;
@@ -1598,9 +1812,10 @@ function inspectPlot(el,index,announce){
    metaLines.push(hot.length?'Alerts ≥90th: '+hot.join(', '):'Alerts ≥90th: No qualifying family alerts');
    if(unmeasured.length)metaLines.push(`Unmeasured families: ${unmeasured.join(', ')}`);
   }
+  const winLbl=data.range||(win===HOUR?'24h':'7d');
   for(const [lbl,g] of [['Open circuits',data.gauges.openCircuits],['Stalled BEGIN_DIR',data.gauges.directoryWaiting]]){
    const v=g.values[clamped],pct=peakShare(v,g.rawPeak),winShare=g.windowPeak>0&&g.rawPeak>0&&g.scalePeak!==g.rawPeak?peakShare(v,g.scalePeak):null;
-   metaLines.push(`${lbl}: ${v==null?'Missing':number(v)}${pct?` (${pct}${winShare?`, ${winShare} of ${win===HOUR?'24h':'7d'} peak`:''})`:''}`);
+   metaLines.push(`${lbl}: ${v==null?'Missing':number(v)}${pct?` (${pct}${winShare?`, ${winShare} of ${winLbl} peak`:''})`:''}`);
   }
   const relays=data.relayRangeByTime.get(t);
   if(relays)metaLines.push(`Reporting relays: ${relays[0]===relays[1]?count(relays[0]):`${count(relays[0])}–${count(relays[1])}`}`);
@@ -1675,7 +1890,7 @@ document.addEventListener('click',async e=>{
    return;
   }
  }
- const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const reqR=heroRangeToggle.dataset.heroRange,next=reqR==='all'?'all':reqR==='24h'&&isHourlyRelease()?'24h':'7d',prevReq=requestedHeroRange;requestedHeroRange=next;if(next!==heroRange||prevReq!==next){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
+ const heroRangeToggle=hit('[data-hero-range]');if(heroRangeToggle){const next=normalizeHeroRange(heroRangeToggle.dataset.heroRange,isHourlyRelease()),prevReq=requestedHeroRange;requestedHeroRange=next;if(next!==heroRange||prevReq!==next){heroRange=next;redrawControl(`[data-hero-range="${heroRange}"]`);}return;}
  const heroScaleToggle=hit('[data-hero-scale]');if(heroScaleToggle){const next=heroScaleToggle.dataset.heroScale==='symlog'?'symlog':'linear';if(next!==heroScale){heroScale=next;redrawControl(`[data-hero-scale="${heroScale}"]`);}return;}
  if(hit('[data-hero-hsdir]')){heroHsdir=!heroHsdir;redrawControl('[data-hero-hsdir]');return;}
  const allToggle=hit('[data-all-range]');if(allToggle){const nextRange=allToggle.dataset.allRange;if(periodMap.has(nextRange)){range=nextRange;redrawControl(`[data-all-range="${range}"]`);}return;}
@@ -1776,7 +1991,7 @@ function startObservatory(browser){
 }
 
 if(typeof module!=='undefined'&&module.exports){
- module.exports={metricSelectorTokens,createObservatory,startObservatory,parseLocation,preparePlot,prepareHeroPlot,validateTimeRanges,LEGACY_V5_TIME_RANGES,calendarWindowStart,periodWindowStart,HOUR,DAY,RESERVED_JSON_KEYS,FORBIDDEN_HOURLY_KEYS,req,isPlainRecord,hasExactKeys,isFiniteNumber,number,ordinal,percentile,niceScale,axisNumber,xAxisTicks};
+ module.exports={metricSelectorTokens,createObservatory,startObservatory,parseLocation,preparePlot,prepareHeroPlot,validateTimeRanges,LEGACY_V5_TIME_RANGES,HERO_RANGE_META,HERO_HOURLY_LEFT_RANGES,HERO_DAILY_LEFT_RANGES,isHeroRange,normalizeHeroRange,quantileSorted,calendarWindowStart,periodWindowStart,HOUR,DAY,RESERVED_JSON_KEYS,FORBIDDEN_HOURLY_KEYS,req,isPlainRecord,hasExactKeys,isFiniteNumber,number,ordinal,percentile,niceScale,axisNumber,xAxisTicks};
 }else{
  if(document.documentElement.dataset.mode!=='live')startObservatory(window);
 }

@@ -15,9 +15,33 @@ HOUR = 3600
 SAMPLED_HOUR_STEP = 21600
 DAY = 86400
 STEPS = (HOUR, SAMPLED_HOUR_STEP, DAY)
-LABELS = {'type', 'action', 'build_id', 'sha256', 'dircache', 'dircache_source', 'tor_version'}
+DOS_CONFIG_VALUE_LABELS = {
+    'dosconnectionenabled',
+    'dosconnectionmaxconcurrentcount',
+    'dosconnectionconnectrate',
+    'dosconnectionconnectburst',
+    'dosconnectiondefensetimeperiod',
+    'doscircuitcreationenabled',
+    'doscircuitcreationrate',
+    'doscircuitcreationburst',
+    'doscircuitcreationminconnections',
+    'doscircuitcreationdefensetimeperiod',
+    'dos_num_circ_max_outq',
+    'dosrefusesinglehopclientrendezvous',
+}
+DOS_CONFIG_SOURCE_LABELS = {f'{k}_source' for k in DOS_CONFIG_VALUE_LABELS}
+LABELS = (
+    {'type', 'action', 'state', 'option', 'value', 'build_id', 'sha256', 'dircache', 'dircache_source', 'tor_version'}
+    | DOS_CONFIG_VALUE_LABELS
+    | DOS_CONFIG_SOURCE_LABELS
+)
 NUMERIC_VALUE = re.compile(r'^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z')
 _TOR_VERSION_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
+_STATE_VALUES = frozenset({'created', 'rejected', 'opened', 'total'})
+_BEGINDIR_OPTION_RE = re.compile(r'DoSBeginDir(?:RateEnabled|Rate|Burst|DefenseType)\Z')
+_BEGINDIR_VALUE_RE = re.compile(r'(?:auto|[0-9]{1,8})\Z')
+_DOS_CONFIG_VALUE_RE = re.compile(r'[0-9]{1,8}\Z')
+_DOS_CONFIG_SOURCE_VALUES = frozenset({'consensus', 'torrc', 'unset'})
 LABEL_REPLACE_DEST = re.compile(r'\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,')
 LABEL_REPLACE_SRC = re.compile(r'\s*"(|[A-Za-z_][A-Za-z0-9_]*)"\s*,')
 MAX_JSON_DEPTH = 64
@@ -287,6 +311,17 @@ def validate_matrix(payload, begin, end, step, *, max_series=512, max_points=MAX
                 raise AccessError('invalid_label_value')
             if 'tor_version' in labels and not _TOR_VERSION_RE.fullmatch(labels['tor_version']):
                 raise AccessError('invalid_label_value')
+            if 'state' in labels and labels['state'] not in _STATE_VALUES:
+                raise AccessError('invalid_label_value')
+            if 'option' in labels and not _BEGINDIR_OPTION_RE.fullmatch(labels['option']):
+                raise AccessError('invalid_label_value')
+            if 'value' in labels and not _BEGINDIR_VALUE_RE.fullmatch(labels['value']):
+                raise AccessError('invalid_label_value')
+            for key, val in labels.items():
+                if key in DOS_CONFIG_SOURCE_LABELS and val not in _DOS_CONFIG_SOURCE_VALUES:
+                    raise AccessError('invalid_label_value')
+                if key in DOS_CONFIG_VALUE_LABELS and not _DOS_CONFIG_VALUE_RE.fullmatch(val):
+                    raise AccessError('invalid_label_value')
             canonical = tuple(sorted(labels.items()))
             if canonical in seen_labels:
                 raise AccessError('duplicate_series')
