@@ -1209,14 +1209,14 @@ function heroThresholdsSection(h,is24h,isNonMidnightDay){
   const fmtCut=(val,n,minN)=>isFiniteNumber(val)?`${number(val)} events/s`:`— (<${count(minN)}${unitChar})`;
   const bRows=[];
   if(hasComposite){
-   bRows.push(`<div class="hero-threshold-row"><span class="hero-threshold-key">${heroHsdir?'Composite mitigated &amp; flood rate':'Composite mitigated rate'}</span><span class="hero-threshold-val"><span class="cutoff-elevated">≥90th: ${escapeHtml(fmtCut(h.rateRank.p90Fleet,h.rateRank.n,20))}</span> · <span class="cutoff-high">≥99th: ${escapeHtml(fmtCut(h.rateRank.p99Fleet,h.rateRank.n,100))}</span> <span class="threshold-n">(${count(h.rateRank.n)}${unitChar})</span></span></div>`);
+   bRows.push(`<div class="hero-threshold-row"><span class="hero-threshold-key" title="Fleet-scaled composite reference distribution (alert colors trigger at ≥90th / ≥99th midrank percentile).">${heroHsdir?'Composite mitigated &amp; flood rate':'Composite mitigated rate'}</span><span class="hero-threshold-val"><span class="cutoff-elevated">90th: ${escapeHtml(fmtCut(h.rateRank.p90Fleet,h.rateRank.n,20))}</span> · <span class="cutoff-high">99th: ${escapeHtml(fmtCut(h.rateRank.p99Fleet,h.rateRank.n,100))}</span> <span class="threshold-n">(${count(h.rateRank.n)}${unitChar})</span></span></div>`);
   }
   for(const fam of fams){
-   bRows.push(`<div class="hero-threshold-row"><span class="hero-threshold-key">${escapeHtml(fam.icon)} ${escapeHtml(fam.title)}</span><span class="hero-threshold-val"><span class="cutoff-elevated">≥90th: ${escapeHtml(fmtCut(fam.p90,fam.n,20))}</span> · <span class="cutoff-high">≥99th: ${escapeHtml(fmtCut(fam.p99,fam.n,100))}</span> <span class="threshold-n">(${count(fam.n)}${unitChar})</span></span></div>`);
+   bRows.push(`<div class="hero-threshold-row"><span class="hero-threshold-key" title="${escapeHtml(`${fam.chartTitle}: ${fam.seriesName} reference quantile; any eligible series triggers family alerts at ≥90th / ≥99th midrank percentile.`)}">${escapeHtml(fam.icon)} ${escapeHtml(fam.title)} · ${escapeHtml(fam.seriesName)}</span><span class="hero-threshold-val"><span class="cutoff-elevated">90th: ${escapeHtml(fmtCut(fam.p90,fam.n,20))}</span> · <span class="cutoff-high">99th: ${escapeHtml(fmtCut(fam.p99,fam.n,100))}</span> <span class="threshold-n">(${count(fam.n)}${unitChar})</span></span></div>`);
   }
-  optionBHtml=`<div class="hero-threshold-col"><div class="hero-threshold-head"><h3>Dashboard alert cutoffs</h3><span class="hero-threshold-sub">${winSub} · ≥90th / ≥99th pct in events/s</span></div><div class="hero-threshold-list">${bRows.join('')}</div></div>`;
+  optionBHtml=`<div class="hero-threshold-col"><div class="hero-threshold-head"><h3>Reference rate percentiles</h3><span class="hero-threshold-sub" title="Alerts trigger at ≥90th / ≥99th midrank percentile">${winSub} · 90th / 99th pct in events/s</span></div><div class="hero-threshold-list">${bRows.join('')}</div></div>`;
  }
- return `<div class="hero-thresholds" aria-label="DoS thresholds and alert cutoffs"><div class="hero-thresholds-grid${optionAHtml&&optionBHtml?'':' single-col'}">${optionAHtml}${optionBHtml}</div></div>`;
+ return `<div class="hero-thresholds" aria-label="DoS thresholds and reference rate percentiles"><div class="hero-thresholds-grid${optionAHtml&&optionBHtml?'':' single-col'}">${optionAHtml}${optionBHtml}</div></div>`;
 }
 function heroCard(){
  const isHourly=isHourlyRelease(),defaultLeft=isHourly?'24h':'7d';

@@ -3639,7 +3639,7 @@ copyCtrl.app.start();
   const legacy4Html=application('?view=overview',legacy4Doc).app.markup();
   assert.doesNotMatch(legacy4Html,/hero-kpi-6|Incoming OR connections|Open incoming OR|Tor trigger thresholds/);
   assert.match(legacy4Html,/class="hero-kpi-grid"/);
-  assert.match(legacy4Html,/class="hero-thresholds-grid single-col"[\s\S]*Dashboard alert cutoffs/);
+  assert.match(legacy4Html,/class="hero-thresholds-grid single-col"[\s\S]*Reference rate percentiles/);
 
   // Full 15-chart dataset renders 6-tile grid, neutral incoming/open KPIs, breakdown, non-alerting childStrip, Family 01 context card, and Option A + B thresholds.
   const fullHeroDoc=makeAlertDataset(buildFullHeroDoc(v7NonMidnight,{withThresholds:true}),'hour',['neutral','neutral','neutral','neutral','neutral','neutral']);
@@ -3713,8 +3713,8 @@ copyCtrl.app.start();
   assert.match(fullOvHtml,/Circuit creation[\s\S]*DoSCircuitCreationBurst[\s\S]*Tor default \(unset\)/);
   assert.match(fullOvHtml,/Queues &amp; Intro[\s\S]*DoSCircuitMaxCellQueueSize[\s\S]*50000 cells[\s\S]*\(consensus\)/);
   assert.match(fullOvHtml,/Directory \(BEGIN_DIR\)[\s\S]*DoSBeginDirRatePerSec[\s\S]*5 req\/s[\s\S]*\(observed\)/);
-  assert.match(fullOvHtml,/Dashboard alert cutoffs[\s\S]*≥90th \/ ≥99th pct in events\/s[\s\S]*Composite mitigated rate[\s\S]*≥90th:[\s\S]*events\/s[\s\S]*≥99th:[\s\S]*events\/s/);
-  assert.match(fullOvHtml,/01 Connection floods[\s\S]*≥90th:[\s\S]*events\/s/);
+  assert.match(fullOvHtml,/Reference rate percentiles[\s\S]*90th \/ 99th pct in events\/s[\s\S]*Composite mitigated rate[\s\S]*90th:[\s\S]*events\/s[\s\S]*99th:[\s\S]*events\/s/);
+  assert.match(fullOvHtml,/01 Connection floods · Connection-rate rule[\s\S]*90th:[\s\S]*events\/s/);
 
   // Unequal-population rateRank & p90Fleet use the same population-weighted composite statistic.
   const skewDoc=structuredClone(v7NonMidnight);
@@ -3737,6 +3737,11 @@ copyCtrl.app.start();
   assert.equal(skewPrep.rateRank.p90Fleet,80,'91 samples at 80 and 10 at 1600 -> p90Fleet is 80');
   assert.ok(skewPrep.rateRank.rank>90,'curFleet 160 > p90Fleet 80 also ranks >90th percentile under consistent weighting');
   assert.match(application('?view=overview&hero_range=7d&hero_hsdir=0',skewDoc).app.markup(),/class="percentile elevated"[^>]*>90th percentile/);
+  chart('directory_rejections',skewDoc).series.find(s=>s.key==='begindir_rejected').history.daily.at(-1)[1]=80;
+  const tiedSkewPrep=ui.prepareHeroPlot(skewDoc,'7d',false);
+  assert.equal(tiedSkewPrep.rateRank.p90Fleet,80);
+  assert.ok(tiedSkewPrep.rateRank.rank<90,'tied curFleet==p90Fleet keeps neutral midrank below 90th');
+  assert.match(application('?view=overview&hero_range=7d&hero_hsdir=0',skewDoc).app.markup(),/class="percentile neutral"[^>]*>45th percentile/);
 
   assert.ok(latestCss.includes('.hero-kpi-grid.hero-kpi-6')&&latestCss.includes('.hero-thresholds-grid')&&latestCss.includes('.incoming-context-card'),
    'stylesheet defines 6-tile KPI grid, thresholds grid, and incoming context card rules');

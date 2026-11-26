@@ -566,9 +566,11 @@ def _ensure_supplemental_charts(data, routes, added=None):
     by_family = {f.get('id'): f for f in families} if isinstance(families, list) else {}
     fleet = data.get('fleet', 0)
     expected_default = max(8, int(fleet) if isinstance(fleet, (int, float)) and not isinstance(fleet, bool) else 0)
+    missing_routes_cids = set()
     for spec in SUPPLEMENTAL_CHART_SPECS:
         cid = spec['id']
         if not _chart_routes_available(cid, routes):
+            missing_routes_cids.add(cid)
             continue
         if cid not in existing:
             empty_cur = {'value': None, 'relays': None, 'expected_relays': expected_default,
@@ -614,6 +616,18 @@ def _ensure_supplemental_charts(data, routes, added=None):
         family = by_family.get(spec['family_id'])
         if family is not None and isinstance(family.get('children'), list) and cid not in family['children']:
             family['children'].append(cid)
+    if missing_routes_cids:
+        family_primary = {f.get('id'): f.get('primary') for f in families} if isinstance(families, list) else {}
+        removable = {
+            c.get('id') for c in charts
+            if c.get('id') in missing_routes_cids and family_primary.get(c.get('family_id')) != c.get('id')
+        }
+        if removable:
+            data['charts'] = [c for c in charts if c.get('id') not in removable]
+            if isinstance(families, list):
+                for fam in families:
+                    if isinstance(fam.get('children'), list):
+                        fam['children'] = [cid for cid in fam['children'] if cid not in removable]
     return data
 
 
@@ -1178,6 +1192,8 @@ class Collector:
         data['dircache_cohort'] = directory
         if 'dos.effective_config' in self.routes and 'dos.begindir_config' in self.routes:
             data['dos_thresholds'] = self.dos_thresholds(end, cohort_totals['native'])
+        else:
+            data.pop('dos_thresholds', None)
         data['sources']['current_observation_end'] = end
         data['input_provenance'] = {'description': 'Hourly UTC fixed-query aggregates with dir-spec coarsening; retained histories seeded from the configured measurement bundle.',
                                     'snapshot_end': end, 'source_public_data_sha256': seed_sha}

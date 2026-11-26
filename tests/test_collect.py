@@ -2690,24 +2690,32 @@ class CollectorTests(unittest.TestCase):
             finally:
                 cache.close()
 
-            # Verify custom subset of routes omits supplemental charts and dos_thresholds cleanly.
+            # Verify subset of routes removes both newly added and seed-inherited supplemental charts & dos_thresholds cleanly.
             subset_fixture = CollectorFixture()
+            seeded_with_supp = copy.deepcopy(subset_fixture.seed)
+            seeded_with_supp['families'] = [{'id': 'transport', 'primary': 'transport_rejections', 'children': ['transport_rejections']}]
+            collector._ensure_supplemental_charts(seeded_with_supp, subset_fixture.routes)
+            self.assertIn('incoming_connections', [c['id'] for c in seeded_with_supp['charts']])
+            self.assertIn('open_connections', [c['id'] for c in seeded_with_supp['charts']])
+            self.assertEqual(seeded_with_supp['families'][0]['children'], ['transport_rejections', 'incoming_connections', 'open_connections'])
+            seeded_with_supp['dos_thresholds'] = dt
             subset_routes = {
                 k: v for k, v in subset_fixture.routes.items()
-                if not k.startswith(('incoming_connections.', 'open_connections.', 'dos.'))
+                if not k.startswith(('incoming_connections.', 'open_connections.')) and k != 'dos.begindir_config'
             }
             subset_queries = {v: subset_fixture.queries[v] for v in set(subset_routes.values())}
             subset_src = SyntheticSource(subset_queries, subset_fixture.source.handlers)
             subset_cache = collector.ObservationCache(root / 'subset.sqlite3', subset_src, subset_queries)
             try:
-                subset_worker = collector.Collector(subset_src, subset_cache, subset_queries, subset_routes, subset_fixture.seed)
+                subset_worker = collector.Collector(subset_src, subset_cache, subset_queries, subset_routes, seeded_with_supp)
                 subset_data = subset_worker.collect(END, 'a' * 64)
             finally:
                 subset_cache.close()
             self.assertEqual(len(subset_data['charts']), 4)
+            self.assertEqual(subset_data['families'][0]['children'], ['transport_rejections'])
             self.assertNotIn('dos_thresholds', subset_data)
             self.assertGreater(
-                collector._plan_max_requests(subset_routes, subset_queries, subset_fixture.seed, END, warm_end=None, baseline_end=END),
+                collector._plan_max_requests(subset_routes, subset_queries, seeded_with_supp, END, warm_end=None, baseline_end=END),
                 0,
             )
 
