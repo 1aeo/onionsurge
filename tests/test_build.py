@@ -59,7 +59,7 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(manifest['schema_version'], 7)
             self.assertNotIn('data.js', manifest['files'])
             self.assertNotIn('catalogue.json', manifest['files'])
-            self.assertEqual(len(manifest['files']), 97)
+            self.assertEqual(len(manifest['files']), 111)
             expected_contract_sha = hashlib.sha256((ROOT / 'catalogue/contract.json').read_bytes()).hexdigest()
             self.assertEqual(manifest['query_contract_sha256'], expected_contract_sha)
             expected_release_objects = sorted([
@@ -76,7 +76,7 @@ class BuildTests(unittest.TestCase):
             self.assertEqual(offline_manifest['schema_version'], 7)
             self.assertIn('data.js', offline_manifest['files'])
             self.assertIn('catalogue.json', offline_manifest['files'])
-            self.assertEqual(len(offline_manifest['files']), 99)
+            self.assertEqual(len(offline_manifest['files']), 113)
             self.assertEqual(offline_manifest['release_objects'], expected_release_objects)
             self.assertEqual(offline_manifest['query_contract_sha256'], expected_contract_sha)
 
@@ -184,7 +184,9 @@ class BuildTests(unittest.TestCase):
         }
         actual_csvs = {p.name for p in (self.output / 'exports').glob('*.csv')}
         self.assertEqual(actual_csvs, expected_csvs)
-        self.assertEqual(len(actual_csvs), 91)
+        self.assertEqual(len(actual_csvs), 105)
+        self.assertEqual(len(self.data['charts']), 15)
+        self.assertEqual(self.data['dos_thresholds'], self.input['dos_thresholds'])
         self.assertEqual(
             self.data['provenance']['time_ranges_sha256'],
             hashlib.sha256(DEFAULT_TIME_RANGES_PATH.read_bytes()).hexdigest(),

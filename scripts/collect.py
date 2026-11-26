@@ -26,10 +26,13 @@ if str(SCRIPTS_DIR) not in sys.path:
 import query_protocol as access
 from coarsening import (
     COARSENING_DESCRIPTION,
+    DOS_BEGINDIR_CONFIG_SETTINGS,
+    DOS_EFFECTIVE_CONFIG_SETTINGS,
     coarsen_cohort_mapping,
     coarsen_count,
     coarsen_partition,
     coarsen_population_row,
+    coarsen_threshold_buckets,
     coarsen_value,
 )
 from io_helpers import atomic_text, file_lock, filesystem_contains, parse_json as io_parse_json, read_regular_bytes, sha256_hex
@@ -42,7 +45,55 @@ SSH_FIELDS = ('SOURCE_SSH_HOST', 'SOURCE_SSH_USER', 'SOURCE_SSH_PORT',
               'SOURCE_SSH_IDENTITY_FILE', 'SOURCE_SSH_KNOWN_HOSTS_FILE')
 ALIASES = {'circuit_rejections': 'circuit_rejected', 'introduction_rejections': 'introduce2_rejected',
            'exit_stream_rejections': 'stream_rejected'}
-SCALARS = {'protocol_closes', 'directory_waiting', 'open_circuits'}
+SCALARS = {'protocol_closes', 'directory_waiting', 'open_circuits', 'open_connections'}
+SUPPLEMENTAL_CHART_SPECS = (
+    {
+        'id': 'incoming_connections',
+        'family': 'Connection floods',
+        'family_id': 'transport',
+        'title': 'OR incoming connections',
+        'definition': 'Received OR connection attempts across IPv4 and IPv6: accepted (created), rejected by DoS defenses, and total attempts (accepted + rejected).',
+        'note': 'Received OR connection attempts across IPv4 and IPv6: accepted (created), rejected by DoS defenses, and total attempts (accepted + rejected).',
+        'unit': 'attempts/s',
+        'display_unit': 'attempts/s',
+        'headline_unit': 'attempts/s',
+        'display_scale': 1,
+        'kind': 'counter_hour_rate',
+        'cohort_key': 'native',
+        'metrics': ['tor_relay_connections_total'],
+        'metric_origin': 'Upstream MetricsPort',
+        'introduced_note': None,
+        'primary_series': 'total',
+        'display_keys': ['total', 'accepted', 'rejected'],
+        'series': (
+            ('total', 'Total incoming OR (accepted + rejected)', '#55dda3'),
+            ('accepted', 'Accepted incoming OR', '#48d9ef'),
+            ('rejected', 'Rejected incoming OR', '#ff9873'),
+        ),
+    },
+    {
+        'id': 'open_connections',
+        'family': 'Connection floods',
+        'family_id': 'transport',
+        'title': 'Open incoming OR connections',
+        'definition': 'Mean active received OR connections currently open across reporting relays (IPv4 + IPv6).',
+        'note': 'Mean active received OR connections currently open across reporting relays (IPv4 + IPv6).',
+        'unit': 'connections',
+        'display_unit': 'connections',
+        'headline_unit': 'connections',
+        'display_scale': 1,
+        'kind': 'gauge_hour_mean',
+        'cohort_key': 'native',
+        'metrics': ['tor_relay_connections'],
+        'metric_origin': 'Upstream MetricsPort',
+        'introduced_note': None,
+        'primary_series': 'open_connections',
+        'display_keys': ['open_connections'],
+        'series': (
+            ('open_connections', 'Open incoming OR connections', '#48d9ef'),
+        ),
+    },
+)
 COHORT_ANCHORS = (
     ('native', 'circuit_rejections', 'circuit_rejections'),
     ('custom', 'hsdir_fetches', 'success'),
@@ -76,6 +127,8 @@ _POP_CODE_RE = re.compile(r'0|[1-9][0-9]?')
 _SLUG_SUB_RE = re.compile(r'[^a-z0-9]+')
 _ATTESTED_BUILD_RE = re.compile(r'attested-(?:[0-9]+_){3}[0-9]+')
 _TOR_VERSION_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
+_DOS_DIGITS_RE = re.compile(r'[0-9]{1,8}\Z')
+_BEGINDIR_VAL_RE = re.compile(r'(?:auto|[0-9]{1,8})\Z')
 
 
 class CollectionError(ValueError):
@@ -257,7 +310,7 @@ def _endpoint_pairs(pairs, target_end):
 def _build_hourly_archive_entry(data):
     """Extract only the endpoint hour's unique coarsened delta without duplicating 24h windows or histories."""
     target_end = data['end']
-    return {
+    entry = {
         'schema': HOURLY_ARCHIVE_SCHEMA,
         'start': data['start'],
         'end': target_end,
@@ -292,6 +345,9 @@ def _build_hourly_archive_entry(data):
             for chart in data['charts']
         ],
     }
+    if 'dos_thresholds' in data:
+        entry['dos_thresholds'] = data['dos_thresholds']
+    return entry
 
 
 class ObservationCache:
@@ -488,7 +544,118 @@ def series_labels(chart, series):
         return {}
     if chart['id'] in ALIASES:
         return {'type': ALIASES[chart['id']]}
+    if chart['id'] == 'incoming_connections':
+        return {'state': 'created' if series['key'] == 'accepted' else series['key']}
     return {('action' if chart['id'] in {'hsdir_fetches', 'hsdir_uploads'} else 'type'): series['key']}
+
+
+def _chart_routes_available(chart_id, routes):
+    required = [
+        f'{chart_id}.{period}.{stat_name}'
+        for period in ('current_hour', 'sampled_hour', 'daily', 'current24')
+        for stat_name in ('available', 'eligible', 'value')
+    ] + [f'{chart_id}.relay_population.hour', f'{chart_id}.relay_population.day']
+    return all(op in routes for op in required)
+
+
+def _ensure_supplemental_charts(data, routes, added=None):
+    """Append missing supplemental charts, series, and family memberships when routes are declared."""
+    charts = data.setdefault('charts', [])
+    by_id = {c['id']: c for c in charts}
+    families = data.get('families')
+    by_family = {f.get('id'): f for f in families} if isinstance(families, list) else {}
+    fleet = data.get('fleet', 0)
+    expected_default = max(8, int(fleet) if isinstance(fleet, (int, float)) and not isinstance(fleet, bool) else 0)
+    empty_cur = {'value': None, 'relays': None, 'expected_relays': expected_default,
+                 'coverage': None, 'valid': False}
+
+    def _new_series(key, name, color):
+        return {
+            'key': key,
+            'name': name,
+            'color': color,
+            'history_status': 'queried',
+            'history': {'daily': [], 'sampled_hour': []},
+            'current': {'hour': dict(empty_cur), 'day': dict(empty_cur)},
+        }
+
+    missing_routes_cids = set()
+    for spec in SUPPLEMENTAL_CHART_SPECS:
+        cid = spec['id']
+        if not _chart_routes_available(cid, routes):
+            missing_routes_cids.add(cid)
+            continue
+        spec_keys = {k for k, _, _ in spec['series']}
+        if cid not in by_id:
+            chart = {
+                'id': cid,
+                'family': spec['family'],
+                'family_id': spec['family_id'],
+                'title': spec['title'],
+                'definition': spec['definition'],
+                'note': spec['note'],
+                'unit': spec['unit'],
+                'display_unit': spec['display_unit'],
+                'headline_unit': spec['headline_unit'],
+                'display_scale': spec['display_scale'],
+                'kind': spec['kind'],
+                'cohort_key': spec['cohort_key'],
+                'metrics': list(spec['metrics']),
+                'metric_origin': spec['metric_origin'],
+                'introduced_note': spec['introduced_note'],
+                'primary_series': spec['primary_series'],
+                'display_keys': list(spec['display_keys']),
+                'history_status': 'ready',
+                'relays': fleet,
+                'start': data.get('start'),
+                'end': data.get('end'),
+                'series': [_new_series(key, name, color) for key, name, color in spec['series']],
+            }
+            charts.append(chart)
+            by_id[cid] = chart
+            if added is not None:
+                added[cid] = set(spec_keys)
+        else:
+            existing_chart = by_id[cid]
+            existing_by_key = {s['key']: s for s in existing_chart['series']}
+            restored = set()
+            for key, name, color in spec['series']:
+                if key not in existing_by_key:
+                    existing_by_key[key] = _new_series(key, name, color)
+                    restored.add(key)
+            if restored:
+                existing_chart['series'] = (
+                    [existing_by_key[k] for k, _, _ in spec['series'] if k in existing_by_key]
+                    + [s for s in existing_chart['series'] if s['key'] not in spec_keys]
+                )
+                existing_display = set(existing_chart.get('display_keys', []))
+                existing_chart['display_keys'] = (
+                    [k for k in spec['display_keys'] if k in existing_display or k in restored]
+                    + [k for k in existing_chart.get('display_keys', []) if k not in set(spec['display_keys'])]
+                )
+                if added is not None:
+                    added.setdefault(cid, set()).update(restored)
+        family = by_family.get(spec['family_id'])
+        if family is not None and isinstance(family.get('children'), list) and cid not in family['children']:
+            family['children'].append(cid)
+    if missing_routes_cids:
+        removable = {c.get('id') for c in charts if c.get('id') in missing_routes_cids}
+        if removable:
+            data['charts'] = [c for c in charts if c.get('id') not in removable]
+            kept_by_id = {c.get('id'): c for c in data['charts']}
+            if isinstance(families, list):
+                for fam in families:
+                    if isinstance(fam.get('children'), list):
+                        fam['children'] = [cid for cid in fam['children'] if cid not in removable]
+                    if fam.get('primary') in removable:
+                        remaining = fam.get('children') if isinstance(fam.get('children'), list) else []
+                        _require(bool(remaining), f'Missing required routes for primary chart: {fam.get("primary")}')
+                        new_primary = remaining[0]
+                        fam['primary'] = new_primary
+                        primary_chart = kept_by_id.get(new_primary)
+                        if primary_chart is not None and 'primary_series' in primary_chart:
+                            fam['primary_series'] = primary_chart['primary_series']
+    return data
 
 
 def population_row(payload, metric_type, end, expected_total):
@@ -775,11 +942,74 @@ class Collector:
                 'matched_process_epochs': attested_c, 'snapshot_start': end - HOUR, 'snapshot_end': end, 'source_sha256': source_hashes}
         return result
 
+    def dos_thresholds(self, end, fleet_c):
+        eff_rows = self.endpoint('dos.effective_config', end)['data']['result']
+        bg_rows = self.endpoint('dos.begindir_config', end)['data']['result']
+
+        eff_total = 0
+        eff_buckets = {key: defaultdict(int) for key, _, _, _ in DOS_EFFECTIVE_CONFIG_SETTINGS}
+        eff_raw_totals = {key: 0 for key, _, _, _ in DOS_EFFECTIVE_CONFIG_SETTINGS}
+        for row in eff_rows:
+            metric = row['metric']
+            cnt = number(row['values'][0][1], count=True)
+            eff_total += cnt
+            for key, _, _, _ in DOS_EFFECTIVE_CONFIG_SETTINGS:
+                source_key = f'{key}_source'
+                if source_key not in metric:
+                    continue
+                source = metric[source_key]
+                _require(source in {'consensus', 'torrc', 'unset'}, 'Unexpected DoS config source')
+                if source == 'unset':
+                    val = metric.get(key, 'unset')
+                    _require(val == 'unset' or (isinstance(val, str) and _DOS_DIGITS_RE.fullmatch(val)), 'Unexpected DoS config value')
+                else:
+                    val = metric.get(key)
+                    _require(isinstance(val, str) and _DOS_DIGITS_RE.fullmatch(val), 'Unexpected DoS config value')
+                eff_buckets[key][(val, source)] += cnt
+                eff_raw_totals[key] += cnt
+
+        bg_buckets = {option: defaultdict(int) for _, option, _, _ in DOS_BEGINDIR_CONFIG_SETTINGS}
+        bg_raw_totals = {option: 0 for _, option, _, _ in DOS_BEGINDIR_CONFIG_SETTINGS}
+        for row in bg_rows:
+            metric = row['metric']
+            option = metric.get('option')
+            val = metric.get('value')
+            _require(isinstance(option, str) and option in bg_buckets, 'Unexpected BeginDir config option')
+            _require(isinstance(val, str) and _BEGINDIR_VAL_RE.fullmatch(val), 'Unexpected BeginDir config value')
+            cnt = number(row['values'][0][1], count=True)
+            bg_buckets[option][(val, 'observed')] += cnt
+            bg_raw_totals[option] += cnt
+
+        settings = []
+        for key, option, family_id, unit in DOS_EFFECTIVE_CONFIG_SETTINGS:
+            relays_c, values, suppressed_c = coarsen_threshold_buckets(
+                sorted(eff_buckets[key].items()), eff_raw_totals[key], fleet_c,
+            )
+            settings.append({
+                'key': key, 'option': option, 'family_id': family_id, 'unit': unit,
+                'relays': relays_c, 'values': values, 'suppressed_relays': suppressed_c,
+            })
+        for key, option, family_id, unit in DOS_BEGINDIR_CONFIG_SETTINGS:
+            relays_c, values, suppressed_c = coarsen_threshold_buckets(
+                sorted(bg_buckets[option].items()), bg_raw_totals[option], fleet_c,
+            )
+            settings.append({
+                'key': key, 'option': option, 'family_id': family_id, 'unit': unit,
+                'relays': relays_c, 'values': values, 'suppressed_relays': suppressed_c,
+            })
+        return {
+            'as_of': end,
+            'reported_relays': min(fleet_c, coarsen_count(eff_total)),
+            'settings': settings,
+        }
+
     def collect(self, end, seed_sha):
         data = copy.deepcopy(self.seed)
         data.update(input_schema_version=4, start=end - DAY, end=end, window_seconds=HOUR,
                     minimum_samples=24, expected_samples=30, generated_at=iso(time.time()))
         data.setdefault('history_methods', {})['coarsening'] = COARSENING_DESCRIPTION
+        added_supplemental = {}
+        _ensure_supplemental_charts(data, self.routes, added=added_supplemental)
         charts_by_id = {c['id']: c for c in data['charts']}
         raw_totals = {}
         for cohort, chart_id, key in COHORT_ANCHORS:
@@ -795,6 +1025,12 @@ class Collector:
         context_times = list(range(end - POPULATION_CONTEXT_DAYS * DAY, end + 1, HOUR))
         target_day = (end // DAY) * DAY
         target_sh = (end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+        seed_first_daily = min(
+            (int(s['history']['daily'][0][0])
+             for c in data['charts'] for s in c.get('series', [])
+             if s.get('history', {}).get('daily')),
+            default=None,
+        )
         for chart in data['charts']:
             seed_chart_relays = chart['relays']
             chart_c = cohort_totals[chart['cohort_key']]
@@ -808,7 +1044,10 @@ class Collector:
                          for stat_name in ('value', 'eligible', 'available')}
                 for period in ('daily', 'sampled_hour', 'current24')
             }
-            chart_first_daily = min((int(s['history']['daily'][0][0]) for s in chart['series'] if s['history']['daily']), default=None)
+            chart_first_daily = min(
+                (int(s['history']['daily'][0][0]) for s in chart['series'] if s['history']['daily']),
+                default=seed_first_daily,
+            )
             for series in chart['series']:
                 rows = series['history']['daily']
                 sh_rows = series['history'].setdefault('sampled_hour', [])
@@ -847,13 +1086,24 @@ class Collector:
 
                 fetched_raw_n = {}
                 last_exp_c = None
+                had_empty_daily = not rows
+                final_daily_end = int(rows[-1][0]) if rows else None
                 daily_start = (int(rows[-1][0]) + DAY) if rows else chart_first_daily
+                has_daily_history = bool(rows or (daily_start is not None and daily_start <= target_day))
                 if daily_start is not None:
                     daily_times = list(range(daily_start, target_day + 1, DAY))
+                    if daily_times:
+                        final_daily_end = daily_times[-1]
                     fetched_raw_n, last_exp_c = self._fill_history_rows(
                         chart, series, 'daily', DAY, DAY, daily_times, rows,
                         chart_c=chart_c, enforce_chart_floor=True,
                     )
+                    if had_empty_daily and rows:
+                        first_measured = next((i for i, row in enumerate(rows) if row[2] is not None), None)
+                        if first_measured is None:
+                            rows.clear()
+                        elif first_measured > 0:
+                            del rows[:first_measured]
                 if rows:
                     if not sh_rows:
                         raw_first = max(int(rows[0][0]) - DAY + SAMPLED_HOUR_STEP,
@@ -865,56 +1115,55 @@ class Collector:
                     self._fill_history_rows(chart, series, 'sampled_hour', SAMPLED_HOUR_STEP, HOUR, sh_times, sh_rows)
 
                 fetched_cur24_raw_n = {}
-                if rows:
-                    if end % DAY == 0 and rows[-1][0] == end:
-                        if fetched_raw_n:
-                            last_row = rows[-1]
-                            day_current = {
-                                'value': last_row[1] if last_row[4] else None, 'relays': last_row[2],
-                                'expected_relays': last_exp_c, 'coverage': last_row[3], 'valid': last_row[4],
-                            }
-                        else:
-                            cur = series['current']['day']
-                            had_exp = 'expected_relays' in cur
-                            cur_exp = cur['expected_relays'] if had_exp else max(8, seed_chart_relays)
-                            if chart_c > cur_exp:
-                                cur_n, cur_val = cur.get('relays'), cur.get('value')
-                                new_exp = max(8, chart_c, 0 if cur_n is None else cur_n)
-                                cov = (cur_n / new_exp) if (cur_n is not None and cur_n > 0) else None
-                                cur_valid = cur.get('valid')
-                                if cur_valid is None:
-                                    cur_valid = bool(rows[-1][4])
-                                new_valid = bool(cur_valid and cur_val is not None and cur_n is not None
-                                                 and cur_n >= 8 and cov is not None
-                                                 and MINIMUM_POPULATION_COVERAGE <= cov <= 1.0)
-                                new_val = cur_val if new_valid else None
-                                day_current = {'value': new_val, 'relays': cur_n, 'expected_relays': new_exp,
-                                               'coverage': cov, 'valid': new_valid}
-                                rows[-1] = [end, new_val, cur_n, cov, new_valid]
-                            else:
-                                day_current = dict(cur)
-                                if not had_exp and max(8, chart_c) != cur_exp:
-                                    day_current['expected_relays'] = cur_exp
+                if rows and end % DAY == 0 and rows[-1][0] == end:
+                    if fetched_raw_n:
+                        last_row = rows[-1]
+                        day_current = {
+                            'value': last_row[1] if last_row[4] else None, 'relays': last_row[2],
+                            'expected_relays': last_exp_c, 'coverage': last_row[3], 'valid': last_row[4],
+                        }
                     else:
-                        n24 = self.values(chart, series, 'current24', 'eligible', HOUR, [end])
-                        a24 = self.values(chart, series, 'current24', 'available', HOUR, [end])
-                        v24 = self.values(chart, series, 'current24', 'value', HOUR, [end])
-                        fetched_cur24_raw_n = {end: n24[end]} if n24[end] is not None else {}
-                        history_n = {int(row[0]): row[2] for row in rows if row[2] is not None}
-                        if n24[end] is not None:
-                            history_n[end] = n24[end]
-                        e24 = populations([end], history_n, {end: a24[end]})[end]
-                        n_c = None if n24[end] is None else coarsen_count(n24[end])
-                        exp_c = max(8, chart_c, 0 if n_c is None else n_c, coarsen_count(e24))
-                        cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
-                        if n_c in (None, 0):
-                            v_c, valid_c = None, False
+                        cur = series['current']['day']
+                        had_exp = 'expected_relays' in cur
+                        cur_exp = cur['expected_relays'] if had_exp else max(8, seed_chart_relays)
+                        if chart_c > cur_exp:
+                            cur_n, cur_val = cur.get('relays'), cur.get('value')
+                            new_exp = max(8, chart_c, 0 if cur_n is None else cur_n)
+                            cov = (cur_n / new_exp) if (cur_n is not None and cur_n > 0) else None
+                            cur_valid = cur.get('valid')
+                            if cur_valid is None:
+                                cur_valid = bool(rows[-1][4])
+                            new_valid = bool(cur_valid and cur_val is not None and cur_n is not None
+                                             and cur_n >= 8 and cov is not None
+                                             and MINIMUM_POPULATION_COVERAGE <= cov <= 1.0)
+                            new_val = cur_val if new_valid else None
+                            day_current = {'value': new_val, 'relays': cur_n, 'expected_relays': new_exp,
+                                           'coverage': cov, 'valid': new_valid}
+                            rows[-1] = [end, new_val, cur_n, cov, new_valid]
                         else:
-                            v_c = coarsen_value(chart['id'], series['key'], kind, v24[end], window_seconds=DAY)
-                            valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
-                                           and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
-                        day_current = {'value': v_c if valid_c else None, 'relays': n_c,
-                                       'expected_relays': exp_c, 'coverage': cov_c, 'valid': valid_c}
+                            day_current = dict(cur)
+                            if not had_exp and max(8, chart_c) != cur_exp:
+                                day_current['expected_relays'] = cur_exp
+                elif has_daily_history and not (end % DAY == 0 and final_daily_end == end):
+                    n24 = self.values(chart, series, 'current24', 'eligible', HOUR, [end])
+                    a24 = self.values(chart, series, 'current24', 'available', HOUR, [end])
+                    v24 = self.values(chart, series, 'current24', 'value', HOUR, [end])
+                    fetched_cur24_raw_n = {end: n24[end]} if n24[end] is not None else {}
+                    history_n = {int(row[0]): row[2] for row in rows if row[2] is not None}
+                    if n24[end] is not None:
+                        history_n[end] = n24[end]
+                    e24 = populations([end], history_n, {end: a24[end]})[end]
+                    n_c = None if n24[end] is None else coarsen_count(n24[end])
+                    exp_c = max(8, chart_c, 0 if n_c is None else n_c, coarsen_count(e24))
+                    cov_c = (n_c / exp_c) if (n_c is not None and n_c > 0) else None
+                    if n_c in (None, 0):
+                        v_c, valid_c = None, False
+                    else:
+                        v_c = coarsen_value(chart['id'], series['key'], kind, v24[end], window_seconds=DAY)
+                        valid_c = bool(v_c is not None and n_c >= 8 and cov_c is not None
+                                       and MINIMUM_POPULATION_COVERAGE <= cov_c <= 1.0)
+                    day_current = {'value': v_c if valid_c else None, 'relays': n_c,
+                                   'expected_relays': exp_c, 'coverage': cov_c, 'valid': valid_c}
                 else:
                     day_current = {'value': None, 'relays': None,
                                    'expected_relays': max(8, chart_c, hexp_rows[-1][1]),
@@ -923,6 +1172,33 @@ class Collector:
                 fetched_hr_map = {t: val for t, val in hourly_n.items() if t == end and val is not None}
                 series['relay_population'] = self.relay_population(
                     chart, series, end, fetched_raw_n, fetched_hr_map, fetched_cur24_raw_n)
+        if added_supplemental:
+            families = data.get('families')
+            family_primary = {f.get('id'): f.get('primary') for f in families} if isinstance(families, list) else {}
+            keep_charts = []
+            dropped_cids = set()
+            for chart in data['charts']:
+                cid = chart['id']
+                added_keys = added_supplemental.get(cid)
+                if added_keys and family_primary.get(chart.get('family_id')) != cid:
+                    observed = [
+                        s for s in chart['series']
+                        if s['key'] not in added_keys or (s['history'].get('daily') and s['history'].get('sampled_hour'))
+                    ]
+                    obs_keys = {s['key'] for s in observed}
+                    if not obs_keys or chart.get('primary_series') not in obs_keys:
+                        dropped_cids.add(cid)
+                        continue
+                    if len(observed) < len(chart['series']):
+                        chart['series'] = observed
+                        chart['display_keys'] = [k for k in chart['display_keys'] if k in obs_keys]
+                keep_charts.append(chart)
+            if dropped_cids:
+                data['charts'] = keep_charts
+                if isinstance(families, list):
+                    for fam in families:
+                        if isinstance(fam.get('children'), list):
+                            fam['children'] = [c for c in fam['children'] if c not in dropped_cids]
         data['versions'] = self.versions(end, raw_totals, cohort_totals)
         data['snapshot_flags'] = {}
         for key in METADATA_KEYS:
@@ -942,6 +1218,10 @@ class Collector:
             if (val := self.scalar('dircache.' + operation, end)) is not None:
                 directory[field] = coarsen_count(val)
         data['dircache_cohort'] = directory
+        if 'dos.effective_config' in self.routes and 'dos.begindir_config' in self.routes:
+            data['dos_thresholds'] = self.dos_thresholds(end, cohort_totals['native'])
+        else:
+            data.pop('dos_thresholds', None)
         data['sources']['current_observation_end'] = end
         data['input_provenance'] = {'description': 'Hourly UTC fixed-query aggregates with dir-spec coarsening; retained histories seeded from the configured measurement bundle.',
                                     'snapshot_end': end, 'source_public_data_sha256': seed_sha}
@@ -1233,7 +1513,9 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
         requests += len(missing) if population else _contiguous_run_batches(missing, step)
         seen.update(missing)
 
-    charts_by_id = {c['id']: c for c in seed['charts']}
+    work_seed = copy.deepcopy(seed)
+    _ensure_supplemental_charts(work_seed, routes)
+    charts_by_id = {c['id']: c for c in work_seed['charts']}
     for _, chart_id, _ in COHORT_ANCHORS:
         if chart_id in charts_by_id:
             fetch(routes[f'{chart_id}.current_hour.available'], HOUR, [end])
@@ -1242,8 +1524,14 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
     context_times = list(range(end - POPULATION_CONTEXT_DAYS * DAY, end + 1, HOUR))
     target_day = (end // DAY) * DAY
     target_sh = (end // SAMPLED_HOUR_STEP) * SAMPLED_HOUR_STEP
+    seed_first_daily = min(
+        (int(s['history']['daily'][0][0])
+         for c in work_seed['charts'] for s in c.get('series', [])
+         if s.get('history', {}).get('daily')),
+        default=None,
+    )
 
-    for chart in seed['charts']:
+    for chart in work_seed['charts']:
         cid = chart['id']
         cur_hr_elig_q = routes[f'{cid}.current_hour.eligible']
         cur_hr_avail_q = routes[f'{cid}.current_hour.available']
@@ -1254,7 +1542,7 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
         pop_hour_q = routes[f'{cid}.relay_population.hour']
         chart_first_daily = min(
             (int(s['history']['daily'][0][0]) for s in chart['series'] if s.get('history', {}).get('daily')),
-            default=None,
+            default=seed_first_daily,
         )
 
         for series in chart['series']:
@@ -1352,6 +1640,9 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
         fetch(routes[f'metadata.{key}'], HOUR, [end])
     for _, op in DIRCACHE_OPERATIONS:
         fetch(routes[f'dircache.{op}'], HOUR, [end])
+    if 'dos.effective_config' in routes and 'dos.begindir_config' in routes:
+        fetch(routes['dos.effective_config'], HOUR, [end])
+        fetch(routes['dos.begindir_config'], HOUR, [end])
     return requests
 
 

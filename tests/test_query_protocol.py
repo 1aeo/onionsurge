@@ -24,11 +24,11 @@ class QueryProtocolTests(unittest.TestCase):
         result = builder.build(access.load_json(ROOT / 'catalogue/contract.json'))
         for name, value in result.items():
             self.assertEqual(access.load_json(ROOT / 'catalogue' / name), value)
-        self.assertEqual(len(result['queries.json']), 92)
-        self.assertEqual(len(result['routes.json']), 210)
+        self.assertEqual(len(result['queries.json']), 108)
+        self.assertEqual(len(result['routes.json']), 240)
         populations = {key: value for key, value in result['queries.json'].items()
                        if key.startswith('relay_population_')}
-        self.assertEqual(len(populations), 16)
+        self.assertEqual(len(populations), 20)
         self.assertTrue(all(access.safe_aggregate(query) and len(query) < 10000
                             for query in populations.values()))
 
@@ -270,6 +270,67 @@ class QueryProtocolTests(unittest.TestCase):
                 {'metric': {'tor_version': bad}, 'values': [[100, '1']]}]}}
             with self.subTest(bad=bad), self.assertRaisesRegex(access.AccessError, 'invalid_label_value'):
                 access.aggregate_response(payload, 100, 200, 100)
+
+    def test_connection_and_dos_config_label_validation_and_strata_population_queries(self):
+        for good_labels in (
+            {'state': 'created'},
+            {'state': 'rejected'},
+            {'state': 'opened'},
+            {'state': 'total'},
+            {'option': 'DoSBeginDirRateEnabled', 'value': 'auto'},
+            {'option': 'DoSBeginDirRate', 'value': '10'},
+            {'option': 'DoSBeginDirBurst', 'value': '50'},
+            {'option': 'DoSBeginDirDefenseType', 'value': '12345678'},
+            {'dosconnectionenabled': '1', 'dosconnectionenabled_source': 'consensus',
+             'dosconnectionmaxconcurrentcount_source': 'unset',
+             'dos_num_circ_max_outq': '4096', 'dos_num_circ_max_outq_source': 'torrc'},
+        ):
+            payload = {'status': 'success', 'data': {'resultType': 'matrix', 'result': [
+                {'metric': good_labels, 'values': [[100, '8']]}]}}
+            with self.subTest(good_labels=good_labels):
+                self.assertEqual(access.aggregate_response(payload, 100, 200, 100), payload)
+
+        for bad_labels in (
+            {'state': 'unknown'},
+            {'state': ''},
+            {'state': 'created\n'},
+            {'option': 'DoSConnectionEnabled'},
+            {'option': 'DoSBeginDirRate\n'},
+            {'value': 'unset'},
+            {'value': '123456789'},
+            {'value': '-1'},
+            {'value': 'auto\n'},
+            {'dosconnectionenabled_source': 'observed'},
+            {'dosconnectionenabled_source': ''},
+            {'dosconnectionenabled': 'auto'},
+            {'dosconnectionenabled': 'unset'},
+            {'dosconnectionenabled': '123456789'},
+            {'dosconnectionenabled': '1\n'},
+        ):
+            payload = {'status': 'success', 'data': {'resultType': 'matrix', 'result': [
+                {'metric': bad_labels, 'values': [[100, '8']]}]}}
+            with self.subTest(bad_labels=bad_labels), self.assertRaisesRegex(access.AccessError, 'invalid_label_value'):
+                access.aggregate_response(payload, 100, 200, 100)
+
+        inc_q = builder.population_query(
+            {'selector': 'm{job="tor_relays"}', 'label': 'state', 'strata': 2, 'total_strata': 4},
+            '1d', 360,
+        )
+        open_q = builder.population_query(
+            {'selector': 'm{job="tor_relays"}', 'label': '', 'strata': 2},
+            '1h', 24,
+        )
+        self.assertTrue(access.safe_aggregate(inc_q))
+        self.assertTrue(access.safe_aggregate(open_q))
+        for bad_group in (
+            {'selector': 'm', 'label': 'state', 'strata': 1},
+            {'selector': 'm', 'label': 'state', 'strata': '2'},
+            {'selector': 'm', 'label': '', 'strata': 2, 'total_strata': 4},
+            {'selector': 'm', 'label': 'state', 'total_strata': 4},
+            {'selector': 'm', 'label': 'state', 'strata': 2, 'total_strata': 1},
+        ):
+            with self.subTest(bad_group=bad_group), self.assertRaises(ValueError):
+                builder.population_query(bad_group, '1d', 360)
 
 
 if __name__ == '__main__':

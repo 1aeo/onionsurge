@@ -563,6 +563,7 @@ test('current coverage matches the producer denominator, tolerance and eligibili
 test('a successful empty current cohort is an admissible release, not a broken candidate',async()=>{
  const outage=fixture('outage',{dataChange:data=>{
   data.fleet=0;data.custom=0;data.defense=0;
+  if(data.dos_thresholds){data.dos_thresholds.reported_relays=0;for(const st of data.dos_thresholds.settings){st.relays=0;st.values=[];st.suppressed_relays=0;}}
   for(const chart of data.charts){
    chart.relays=0;
    for(const series of chart.series){
@@ -652,7 +653,7 @@ test('historical comparison calendar starts clamp leap years and month ends',()=
  for(const [endText,startText] of [['2024-08-31T00:00:00Z','2024-02-29T00:00:00Z'],
   ['2025-08-31T00:00:00Z','2025-02-28T00:00:00Z'],['2026-03-31T00:00:00Z','2025-09-30T00:00:00Z']]){
   const data=comparisonData(),end=Date.parse(endText)/1000,delta=end-data.end;
-  data.start+=delta;data.end=end;data.reference_cutoff+=delta;
+  data.start+=delta;data.end=end;data.reference_cutoff+=delta;if(data.dos_thresholds)data.dos_thresholds.as_of=end;
   for(const chart of data.charts){
    chart.start+=delta;chart.end+=delta;
    for(const series of chart.series){
@@ -994,7 +995,7 @@ test('mixed reuse and downloads stay inside the existing network concurrency lim
  storage.fetch=async(url,options)=>{running++;peak=Math.max(peak,running);try{await pause(2);return await fetch(url,options);}finally{running--;}};
  storage.root={...storage.root,current:next.descriptor,previous:current.descriptor};storage.calls.length=0;
  const result=await loader(storage).load(active);
- assert.equal(result.objects.size,defaultObjectCount);assert.equal(storage.calls.length,16);
+ assert.equal(result.objects.size,defaultObjectCount);assert.equal(storage.calls.length,3+source.charts.length);
  assert.ok(peak>1&&peak<=LIVE_LIMITS.concurrency);
  assert.ok(storage.calls.every(call=>!call.key.endsWith('-all-time.csv')&&!call.key.includes('/reference/')));
 });
@@ -1297,7 +1298,7 @@ test('custom arbitrary time_ranges and up to 512 manifest objects load with zero
   assert.throws(()=>checkData(badCustom,customCandidate.manifest),/parent window mismatch/);
  }
 
- // 16 periods x 13 charts + data.json + reference = 210 objects (well above legacy 130 cap, <= 512).
+ // 16 periods x N charts + data.json + reference (well above legacy 130 cap, <= 512).
  const manyPeriods=Array.from({length:15},(_,i)=>({
   id:`d${i+2}`,summary_key:`days_${i+2}`,export_suffix:`d${i+2}`,label:`${i+2} days`,
   average_label:`Last ${i+2} days average`,plot_label:`Last ${i+2} days`,
@@ -1426,7 +1427,7 @@ test('non-midnight hourly schema 7 release and hyphenated -24h.csv exports valid
   },
   dataChange:data=>{
    const shift=13*3600,dayEnd=data.end;
-   data.end=dayEnd+shift;data.start=data.end-86400;
+   data.end=dayEnd+shift;data.start=data.end-86400;if(data.dos_thresholds)data.dos_thresholds.as_of=data.end;
    data.charts[0].id='connection-rate';
    for(const f of data.families){
     f.children=f.children.map(id=>id===source.charts[0].id?'connection-rate':id);
@@ -1575,6 +1576,7 @@ test('signed negative zero (-0) is rejected across live data, reference and time
   const c=fixture('hist-neg-zero',{
    dataChange:d=>{
     d.end=endTs;d.start=endTs-86400;d.reference_cutoff=d.start;
+    if(d.dos_thresholds)d.dos_thresholds.as_of=d.end;
     d.provenance.reference_method_sha256=originalReference.method_sha256;
     d.time_ranges={
      version:1,default_range:'7d',legacy_aliases:{},card_slots:{fallback_dynamic:'7d',fixed:['14d','all']},
@@ -1741,4 +1743,96 @@ test('daily schema_version 7 release (86400s) validates end-to-end and rejects h
  const badRef=structuredClone(v7Daily.reference);
  badRef.distributions[v7Daily.data.charts[0].id][v7Daily.data.charts[0].series[0].key].hour=[];
  assert.throws(()=>checkReference(badRef,v7Daily.data),/Sub-24h field in live JSON/);
+});
+
+test('dos_thresholds strict live schema validation accepts valid configs and rejects tampering',async()=>{
+ const makeThresholds=d=>({
+  as_of:d.end,
+  reported_relays:Math.min(d.fleet??240,240),
+  settings:[
+   {
+    key:'dos_conn_max_concurrent',option:'DoSConnectionMaxConcurrentCount',family_id:'transport',unit:'connections',
+    relays:240,suppressed_relays:8,
+    values:[{value:'100',source:'torrc',relays:160},{value:'200',source:'consensus',relays:72}],
+   },
+   {
+    key:'dos_circuit_burst',option:'DoSCircuitCreationBurst',family_id:'circuits',unit:'circuits',
+    relays:240,suppressed_relays:0,
+    values:[{value:'unset',source:'unset',relays:240}],
+   },
+   {
+    key:'dos_begindir_rate',option:'DoSBeginDirRatePerSec',family_id:'directory',unit:'req/s',
+    relays:240,suppressed_relays:0,
+    values:[{value:'auto',source:'observed',relays:240}],
+   },
+   {
+    key:'dos_suppressed_only',option:'DoSCircuitMaxCellQueueSize',family_id:'queues',unit:'cells',
+    relays:16,suppressed_relays:16,
+    values:[],
+   },
+  ],
+ });
+
+ const validCand=fixture('dos-thresh-ok',{dataChange:d=>{d.dos_thresholds=makeThresholds(d);}});
+ const loaded=await loader(server([validCand],validCand,null)).load();
+ assert.equal(loaded.data.dos_thresholds.settings.length,4);
+
+ // Optional absence passes cleanly.
+ const omittedCand=fixture('dos-thresh-none',{dataChange:d=>{delete d.dos_thresholds;}});
+ assert.ok(checkData(omittedCand.data,omittedCand.manifest));
+
+ // Malformed mutations fail closed.
+ for(const [label,mutate] of [
+  ['null dos_thresholds',d=>{d.dos_thresholds=null;}],
+  ['array dos_thresholds',d=>{d.dos_thresholds=[];}],
+  ['extra top key',d=>{d.dos_thresholds.extra=1;}],
+  ['missing top key',d=>{delete d.dos_thresholds.reported_relays;}],
+  ['as_of mismatch',d=>{d.dos_thresholds.as_of=d.end-3600;}],
+  ['as_of -0',d=>{d.dos_thresholds.as_of=-0;}],
+  ['uncoarsened reported_relays',d=>{d.dos_thresholds.reported_relays=9;}],
+  ['reported_relays > fleet',d=>{d.dos_thresholds.reported_relays=(d.fleet??240)+8;}],
+  ['reported_relays -0',d=>{d.dos_thresholds.reported_relays=-0;}],
+  ['empty settings',d=>{d.dos_thresholds.settings=[];}],
+  ['too many settings',d=>{
+   d.dos_thresholds.settings=Array.from({length:33},(_,i)=>({
+    key:`k_${i}`,option:`Opt${i}`,family_id:'transport',unit:'conn',relays:8,suppressed_relays:0,
+    values:[{value:'10',source:'consensus',relays:8}],
+   }));
+  }],
+  ['bad setting key',d=>{d.dos_thresholds.settings[0].key='BadKey';}],
+  ['duplicate setting key',d=>{d.dos_thresholds.settings[1].key='dos_conn_max_concurrent';}],
+  ['reserved setting key constructor',d=>{d.dos_thresholds.settings[0].key='constructor';}],
+  ['extra setting key',d=>{d.dos_thresholds.settings[0].extra=1;}],
+  ['missing setting key',d=>{delete d.dos_thresholds.settings[0].suppressed_relays;}],
+  ['blank option',d=>{d.dos_thresholds.settings[0].option='   ';}],
+  ['overlong option',d=>{d.dos_thresholds.settings[0].option='a'.repeat(65);}],
+  ['invalid family_id',d=>{d.dos_thresholds.settings[0].family_id='unknown_fam';}],
+  ['blank unit',d=>{d.dos_thresholds.settings[0].unit='';}],
+  ['overlong unit',d=>{d.dos_thresholds.settings[0].unit='u'.repeat(33);}],
+  ['uncoarsened setting relays',d=>{d.dos_thresholds.settings[0].relays=241;}],
+  ['setting relays > fleet',d=>{d.dos_thresholds.settings[0].relays=(d.fleet??240)+8;d.dos_thresholds.settings[0].suppressed_relays=16;}],
+  ['uncoarsened suppressed_relays',d=>{d.dos_thresholds.settings[0].suppressed_relays=7;}],
+  ['negative zero suppressed_relays',d=>{d.dos_thresholds.settings[1].suppressed_relays=-0;}],
+  ['too many buckets',d=>{
+   d.dos_thresholds.settings[0].relays=17*8;d.dos_thresholds.settings[0].suppressed_relays=0;
+   d.dos_thresholds.settings[0].values=Array.from({length:17},(_,i)=>({value:String(i),source:'consensus',relays:8}));
+  }],
+  ['extra bucket key',d=>{d.dos_thresholds.settings[0].values[0].extra=1;}],
+  ['numeric value instead of string',d=>{d.dos_thresholds.settings[0].values[0].value=100;}],
+  ['bad value string',d=>{d.dos_thresholds.settings[0].values[0].value='123456789';}],
+  ['invalid source',d=>{d.dos_thresholds.settings[0].values[0].source='guessed';}],
+  ['zero bucket relays',d=>{d.dos_thresholds.settings[0].values[0].relays=0;}],
+  ['uncoarsened bucket relays',d=>{d.dos_thresholds.settings[0].values[0].relays=9;}],
+  ['negative zero bucket relays',d=>{d.dos_thresholds.settings[0].values[0].relays=-0;}],
+  ['duplicate (value, source) pair',d=>{
+   d.dos_thresholds.settings[0].values=[{value:'100',source:'torrc',relays:112},{value:'100',source:'torrc',relays:120}];
+  }],
+  ['sum + suppressed mismatch',d=>{d.dos_thresholds.settings[0].suppressed_relays=16;}],
+ ]){
+  const bad=structuredClone(validCand.data);
+  mutate(bad);
+  assert.throws(()=>checkData(bad,validCand.manifest),/Invalid dos_thresholds|Duplicate dos_thresholds/,`rejects ${label}`);
+ }
+ assert.throws(()=>parseLiveJson(Buffer.from('{"dos_thresholds":{"__proto__":1}}')),/Reserved JSON key/);
+ assert.throws(()=>parseLiveJson(Buffer.from('{"dos_thresholds":{"constructor":1}}')),/Reserved JSON key/);
 });

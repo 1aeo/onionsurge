@@ -17,17 +17,47 @@ OPERATION_KEY = re.compile(r'^[a-z0-9][a-z0-9._-]{0,95}\Z')
 SLUG = re.compile(r'^[a-z0-9][a-z0-9_-]{0,95}\Z')
 
 
+def _population_strata(group):
+    """Validate optional per-series and total strata thresholds for population queries."""
+    if 'strata' not in group or group['strata'] is False:
+        strata_n = None
+    elif group['strata'] is True:
+        strata_n = 3
+    else:
+        strata = group['strata']
+        require(type(strata) is int and strata >= 2, 'Invalid relay population strata')
+        strata_n = strata
+    if 'total_strata' in group:
+        total_strata = group['total_strata']
+        require(bool(group.get('label')) and strata_n is not None
+                and type(total_strata) is int and total_strata >= 2,
+                'Invalid relay population total_strata')
+    else:
+        total_strata = None
+    return strata_n, total_strata
+
+
 def population_query(group, window, samples, *, selector=None):
     """Count eligible sources and their last recorded, complete flag sets."""
     source_selector = group['selector'] if selector is None else selector
+    strata, total_strata = _population_strata(group)
     eligible = f'count_over_time({source_selector}[{window}]) >= {samples}'
-    if group.get('strata'):
-        eligible = f'count by(instance,type)({eligible}) == 3'
-    eligible = f'(({eligible}) > bool 0)'
-    if group['label'] == 'action':
-        eligible = f'label_replace({eligible},"type","$1","action","(.+)")'
-    elif not group['label']:
-        eligible = f'label_replace({eligible},"type","scalar","",".*")'
+    if total_strata is not None:
+        lbl = group['label']
+        elig_lbl = (f'sum by(instance,type)(label_replace('
+                    f'((count by(instance,{lbl})({eligible}) == {strata}) > bool 0),'
+                    f'"type","$1","{lbl}","(.+)"))')
+        elig_total = f'label_replace(((count by(instance)({eligible}) == {total_strata}) > bool 0),"type","total","",".*")'
+        eligible = f'(({elig_lbl}) or ({elig_total}))'
+    else:
+        if strata is not None:
+            by_cols = f'instance,{group["label"]}' if group['label'] else 'instance'
+            eligible = f'count by({by_cols})({eligible}) == {strata}'
+        eligible = f'(({eligible}) > bool 0)'
+        if group['label'] in ('action', 'state'):
+            eligible = f'label_replace({eligible},"type","$1","{group["label"]}","(.+)")'
+        elif not group['label']:
+            eligible = f'label_replace({eligible},"type","scalar","",".*")'
 
     def flags(types, exact=False):
         operator = '=' if exact else '=~'
@@ -65,7 +95,8 @@ def build(contract):
         require(nonblank(group.get('selector')), 'Invalid relay population selector')
         if 'hour_selector' in group:
             require(nonblank(group['hour_selector']), 'Invalid relay population hour_selector')
-        require(group.get('label') in ('', 'type', 'action'), 'Unsupported population grouping label')
+        require(group.get('label') in ('', 'type', 'action', 'state'), 'Unsupported population grouping label')
+        _population_strata(group)
         charts = group.get('charts')
         require(isinstance(charts, list) and charts and all(isinstance(c, str) and SLUG.fullmatch(c) for c in charts),
                 'Invalid relay population chart list')

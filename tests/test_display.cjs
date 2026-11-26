@@ -250,6 +250,8 @@ const expectedSelectors = new Map([
   ['open_circuits','tor_relay_circuits_total{state="opened"}'],
   ['exit_stream_rejections','tor_relay_dos_total{type="stream_rejected"}'],
 ]);
+if (chart('incoming_connections')) expectedSelectors.set('incoming_connections','tor_relay_connections_total{type="OR",direction="received",state=~"created|rejected"}');
+if (chart('open_connections')) expectedSelectors.set('open_connections','tor_relay_connections{type="OR",direction="received",state="opened"}');
 const selectorTokens = (c, series) => ui.metricSelectorTokens(c, series);
 const selectorStrings = (c, series) => selectorTokens(c,series).map(tokens=>tokens.map(token=>token.text).join(''));
 const displayedSeries = c => c.series.filter(series=>c.display_keys.includes(series.key));
@@ -259,7 +261,7 @@ function selectorMarkup(html) {
     values:[...body.matchAll(/<span class="metric-selector-value">([\s\S]*?)<\/span>/g)].map(([,text])=>decode(text)),
   }));
 }
-assert.equal(expectedSelectors.size,13);
+assert.equal(expectedSelectors.size,data.charts.length);
 const ranges = data.time_ranges.periods.map(period => period.id);
 const defaultRange = data.time_ranges.default_range;
 for (const [id,expected] of expectedSelectors) {
@@ -310,6 +312,16 @@ for (const [id,key,expected] of [
   ['hsdir_fetches','refused','tor_relay_hsdir_fetch_total{action="refused"}'],
   ['directory_requests','circuit_dead','tor_relay_begindir_request_total{type="circuit_dead"}'],
 ]) assert.deepEqual(selectorStrings(chart(id),[{key}]),[expected]);
+{
+  const incProto={id:'incoming_connections',metrics:['tor_relay_connections_total']};
+  const openProto={id:'open_connections',metrics:['tor_relay_connections']};
+  assert.deepEqual(selectorStrings(incProto,[{key:'total'},{key:'accepted'},{key:'rejected'}]),['tor_relay_connections_total{type="OR",direction="received",state=~"created|rejected"}']);
+  assert.deepEqual(selectorStrings(incProto,[{key:'total'}]),['tor_relay_connections_total{type="OR",direction="received",state=~"created|rejected"}']);
+  assert.deepEqual(selectorStrings(incProto,[{key:'accepted'}]),['tor_relay_connections_total{type="OR",direction="received",state="created"}']);
+  assert.deepEqual(selectorStrings(incProto,[{key:'rejected'}]),['tor_relay_connections_total{type="OR",direction="received",state="rejected"}']);
+  assert.deepEqual(selectorStrings(incProto,[{key:'accepted'},{key:'rejected'}]),['tor_relay_connections_total{type="OR",direction="received",state=~"created|rejected"}']);
+  assert.deepEqual(selectorStrings(openProto,[{key:'open_connections'}]),['tor_relay_connections{type="OR",direction="received",state="opened"}']);
+}
 for (const [c,series] of [
   [{...transportSource,id:'constructor'},displayedSeries(transportSource)],
   [{...transportSource,metrics:['different_metric']},displayedSeries(transportSource)],
@@ -1843,7 +1855,7 @@ const heroHtml=heroDefault.page.innerHTML;
 const heroSectionPos=heroHtml.indexOf('<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="7d">');
 const toolbarPos=heroHtml.indexOf('<div class="overview-toolbar">');
 assert.ok(heroSectionPos!==-1&&toolbarPos!==-1&&heroSectionPos<toolbarPos,'hero card leads overview above family toolbar');
-assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-range]').length,2);
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-range]').length,9);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-scale]').length,2);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-hsdir]').length,1);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-panel]').length,2);
@@ -1927,7 +1939,7 @@ chart('hsdir_uploads',allNormalAlerts).series.find(s=>s.key==='success').referen
 const noFalseAlert=ui.prepareHeroPlot(allNormalAlerts,'7d',true);
 assert.equal(noFalseAlert.families.find(f=>f.id==='directory').rows[6].state,'neutral','benign hsdir success counters never trigger DoS alerts');
 
-for(const heroRange of ['7d','all'])for(const heroScale of ['linear','symlog'])for(const includeHsdir of [true,false]){
+for(const heroRange of ['7d','1mo','6mo','12mo','all'])for(const heroScale of ['linear','symlog'])for(const includeHsdir of [true,false]){
  const app=application(`?view=overview&hero_range=${heroRange}&hero_scale=${heroScale}${includeHsdir?'&hero_hsdir=1':''}`,v6Data).app;
  for(const width of [240,262,360,800,1680]){
   const plot=element(width);
@@ -1937,7 +1949,7 @@ for(const heroRange of ['7d','all'])for(const heroScale of ['linear','symlog'])f
   assert.equal((plot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g)||[]).length,1);
   assert.match(plot.innerHTML,/24h intervals · UTC/);
   if(heroScale==='symlog')assert.match(plot.innerHTML,/class="hero-rate-series"/);
-  else if(heroRange==='7d')assert.match(plot.innerHTML,/class="hero-rate-bar"/);
+  else if(heroRange==='7d'||heroRange==='1mo')assert.match(plot.innerHTML,/class="hero-rate-bar"/);
   else assert.match(plot.innerHTML,/class="hero-rate-area"/);
   if(heroRange==='all')assert.match(plot.innerHTML,/class="hero-alert-missing"/);
  }
@@ -2186,24 +2198,22 @@ assert.match(desktopMedia,/\.hero-window-mobile \{ display: none;/);
   const hiddenSkip=application('?view=overview');
   hiddenSkip.app.start();
   const p24=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_24h"]');
-  const p7=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_7d"]');
   const pAll=hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_all"]');
-  p7.innerHTML='stale';
-  p7.getBoundingClientRect=()=>({top:0,width:0});
+  assert.equal(hiddenSkip.browser.document.querySelector('[data-hero-plot="concurrent_dos_7d"]'),null,'default 24h view renders 2 hero panels');
+  pAll.innerHTML='stale';
+  pAll.getBoundingClientRect=()=>({top:0,width:0});
   p24.getBoundingClientRect=()=>({top:0,width:500});
-  pAll.getBoundingClientRect=()=>({top:0,width:500});
   hiddenSkip.windowEvents.get('resize')();
   queued.at(-1)[0]();
-  assert.equal(p7.innerHTML,'stale','hidden zero-width hero panel skips drawHero');
+  assert.equal(pAll.innerHTML,'stale','hidden zero-width hero panel skips drawHero');
   assert.match(p24.innerHTML,/<svg /,'visible left hero panel draws normally');
-  assert.match(pAll.innerHTML,/<svg /,'visible right hero panel draws normally');
  }finally{
   globalThis.setTimeout=savedSetTimeout;
  }
 }
-assert.match(application('?view=methods',v6Data).app.markup(),/Last 7 days<\/b> and <b>All time<\/b> side by side on desktop/);
+assert.match(application('?view=methods',v6Data).app.markup(),/<b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, or <b>Last 12 months<\/b> \(selectable via <b>Window<\/b>\) alongside <b>All time<\/b> on desktop/);
 assert.match(application('?view=methods',v6Data).app.markup(),/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
-assert.match(application('?view=methods',data).app.markup(),/<b>Last 24 hours<\/b> or <b>Last 7 days<\/b> \(selectable via <b>Window<\/b>\) alongside <b>All time<\/b> on desktop/);
+assert.match(application('?view=methods',data).app.markup(),/<b>Last 24 hours<\/b>, <b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, or <b>Last 12 months<\/b> \(selectable via <b>Window<\/b>\) alongside <b>All time<\/b> on desktop/);
 assert.match(application('?view=methods',data).app.markup(),/rank ≥90 with at least 20 reference windows \(elevated, unless the high rule applies\)/);
 
 const copiedQueries=[];
@@ -2624,25 +2634,28 @@ copyCtrl.app.start();
   v7Overview.app.start();
   assert.equal(v7Overview.app.getState().heroRange,'24h');
   assert.equal(v7Overview.app.getState().range,'24h');
-  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-range]').length,5);
-  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-panel]').length,3);
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-range]').length,11);
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-panel]').length,2);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel active desktop-left');
-  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]'),null);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel desktop-right');
   assert.equal(new URLSearchParams(v7Overview.app.url('overview').slice(1)).has('hero_range'),false,'default 24h hero_range is omitted from URL');
   assert.equal(ui.parseLocation(v6Data,'?hero_range=24h').heroRange,'7d','legacy bundle without hourly data clamps hero_range=24h to 7d');
   click(v7Overview,'[data-hero-range]',{heroRange:'7d'});
   assert.equal(new URLSearchParams(v7Overview.app.url('overview').slice(1)).get('hero_range'),'7d');
-  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel');
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]'),null);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel active desktop-left');
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel desktop-right');
   click(v7Overview,'[data-hero-range]',{heroRange:'all'});
   const desktopWinHtml=v7Overview.page.innerHTML.match(/hero-window-desktop"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
   const mobileWinHtml=v7Overview.page.innerHTML.match(/hero-window-mobile"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
-  assert.equal([...desktopWinHtml.matchAll(/<button /g)].length,2);
-  assert.equal([...mobileWinHtml.matchAll(/<button /g)].length,3);
+  assert.equal([...desktopWinHtml.matchAll(/<button /g)].length,5);
+  assert.equal([...mobileWinHtml.matchAll(/<button /g)].length,6);
   assert.match(desktopWinHtml,/data-hero-range="24h" class="active" aria-pressed="true"/);
   assert.match(desktopWinHtml,/data-hero-range="7d" class="" aria-pressed="false"/);
+  assert.match(desktopWinHtml,/data-hero-range="1mo" class="" aria-pressed="false"/);
+  assert.match(desktopWinHtml,/data-hero-range="6mo" class="" aria-pressed="false"/);
+  assert.match(desktopWinHtml,/data-hero-range="12mo" class="" aria-pressed="false"/);
   assert.match(mobileWinHtml,/data-hero-range="all" class="active" aria-pressed="true"/);
   assert.match(mobileWinHtml,/data-hero-range="24h" class="" aria-pressed="false"/);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel desktop-left');
@@ -3298,7 +3311,7 @@ copyCtrl.app.start();
   assert.match(unvOvHtml,/Fleet builds<\/span><span class="fleet-strip-value">Unrecorded: 240<\/span>/);
   const unvFixesHtml=application('?view=fixes',allUnverifiedDoc).app.markup();
   assert.match(unvFixesHtml,/240 relays total · 240 unrecorded[\s\S]*?Version not recorded[\s\S]*?Unrecorded[\s\S]*?240/);
-  assert.match(application('?view=methods',v7NonMidnight).app.markup(),/selecting <b>Last 7 days<\/b> updates Hero KPIs/);
+  assert.match(application('?view=methods',v7NonMidnight).app.markup(),/selecting a daily window \(<b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, or <b>Last 12 months<\/b>\) updates Hero KPIs/);
 
   // 12. Hero mitigated-rate % of peak, all-KPI percentiles (24h & 7d), apples-to-apples rateRank, gauge neutrality, and tooltip peak share.
   assert.ok(latestCss.includes('.hero-kpi-pct')&&latestCss.includes('.hero-kpi-pct-note'),
@@ -3347,7 +3360,7 @@ copyCtrl.app.start();
   const partialPeakDoc=structuredClone(peakDoc);
   for(const row of chart('directory_rejections',partialPeakDoc).series[0].history.daily){if(row[0]===peakDayEnd){row[1]=null;row[4]=false;}}
   assert.match(inspectHero(partialPeakDoc,'all',['End']).steps[0].tooltipHtml,/Total active rate<\/span><span>[^<]*\(\d+(?:\.\d+)?% of peak\) \(partial coverage\)/);
-  assert.doesNotMatch(application('?view=overview',allZeroRateData).app.markup(),/0 peak \(/);
+  assert.doesNotMatch(application('?view=overview',allZeroRateData).app.markup(),/\bof 0 peak \(/);
   assert.doesNotMatch(empty24Kpi,/class="hero-kpi-pct"|peak \(1h record\)/);
 
   // 12b. Apples-to-apples rateRank: late-introduced hs_get compares only against the 25 matching days, preventing false >=90th alert inflation.
@@ -3381,6 +3394,8 @@ copyCtrl.app.start();
   const ocState=chart('open_circuits',stateHeroDoc).series[0],dwState=chart('directory_waiting',stateHeroDoc).series[0];
   ocState.reference.hour={n:200,current_percentile:100,flat_zero:false,mean_per_relay:100,p10_per_relay:50,p50_per_relay:100,p90_per_relay:150,start:stateHeroDoc.reference_window.start,end:stateHeroDoc.reference_window.end};
   dwState.reference.hour={n:200,current_percentile:99,flat_zero:false,mean_per_relay:10,p10_per_relay:5,p50_per_relay:10,p90_per_relay:15,start:stateHeroDoc.reference_window.start,end:stateHeroDoc.reference_window.end};
+  const openConnState=chart('open_connections',stateHeroDoc)?.series?.[0];
+  if(openConnState)openConnState.reference.hour={n:200,current_percentile:95,flat_zero:false,mean_per_relay:50,p10_per_relay:20,p50_per_relay:50,p90_per_relay:80,start:stateHeroDoc.reference_window.start,end:stateHeroDoc.reference_window.end};
   for(const c of stateHeroDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
    if(s.key==='conn_rejected'){
     s.values=s.values.map(([t],i)=>[t,i===23?9999:10]);
@@ -3390,8 +3405,9 @@ copyCtrl.app.start();
     if(Array.isArray(s.history.sampled_hour))s.history.sampled_hour=Array.from({length:120},(_,k)=>[stateHeroDoc.reference_window.start+(k+1)*21600,0,240,1,true]);
    }
   }
+  const hasIncState=!!(chart('incoming_connections',stateHeroDoc)||chart('open_connections',stateHeroDoc));
   const highHeroHtml=application('?view=overview',stateHeroDoc).app.markup();
-  assert.equal((highHeroHtml.match(/class="hero-kpi-pct"/g)||[]).length,3,'all 3 numeric hero KPIs render percentile badges in 24h');
+  assert.equal((highHeroHtml.match(/class="hero-kpi-pct"/g)||[]).length,hasIncState?5:3,'all numeric hero KPIs render percentile badges in 24h');
   assert.match(highHeroHtml,/Latest 1h mitigated rate[\s\S]*?<div class="hero-kpi-value neutral">9,999 <small>events\/s<\/small><\/div>[\s\S]*?<span class="percentile high"[^>]*>100th percentile<\/span>/);
   assert.match(highHeroHtml,/Open circuits \(1h mean\)[\s\S]*?<span class="percentile neutral"[^>]*>100th percentile<\/span>/,'open circuits stays neutral at 100th');
   assert.match(highHeroHtml,/Stalled BEGIN_DIR \(1h mean\)[\s\S]*?<span class="percentile neutral"[^>]*>99th percentile<\/span>/,'stalled BEGIN_DIR stays neutral at 99th');
@@ -3426,13 +3442,309 @@ copyCtrl.app.start();
   });
   nmOc.current.day={value:999999,relays:100,expected_relays:100,coverage:1,valid:true};
   nmOc.reference.day={n:100,current_percentile:99,flat_zero:false,mean_per_relay:10,p10_per_relay:5,p50_per_relay:10,p90_per_relay:15,start:nmGaugeDoc.reference_window.start,end:nmGaugeDoc.reference_window.end};
+  const nmOpenConn=chart('open_connections',nmGaugeDoc)?.series?.[0];
+  if(nmOpenConn){nmOpenConn.history.daily=structuredClone(nmOc.history.daily);nmOpenConn.reference.day=structuredClone(nmOc.reference.day);}
   assert.equal(ui.prepareHeroPlot(nmGaugeDoc,'7d',false).gauges.openCircuits.latestRank.rank,8);
+  const hasIncNm=!!(chart('incoming_connections',nmGaugeDoc)||chart('open_connections',nmGaugeDoc));
   const nmGaugeHtml=application('?view=overview&hero_range=7d',nmGaugeDoc).app.markup();
-  assert.equal((nmGaugeHtml.match(/class="hero-kpi-pct"/g)||[]).length,3,'all 3 numeric hero KPIs render percentile badges in 7d');
+  assert.equal((nmGaugeHtml.match(/class="hero-kpi-pct"/g)||[]).length,hasIncNm?5:3,'all numeric hero KPIs render percentile badges in 7d');
   assert.match(nmGaugeHtml,/Open circuits \(UTC day mean\)[\s\S]*?<div class="hero-kpi-value neutral">250 <small>circuits<\/small><\/div>[\s\S]*?<span class="percentile neutral"[^>]*>8th percentile<\/span>/);
   const midGaugeDoc=structuredClone(nmGaugeDoc);
   midGaugeDoc.end=nmDayT;midGaugeDoc.start=nmDayT-86400;
   assert.match(application('?view=overview&hero_range=7d',midGaugeDoc).app.markup(),/Open circuits \(24h mean\)[\s\S]*?<span class="percentile neutral"[^>]*>99th percentile<\/span>/);
+
+  // 13. Hero Window selector (1mo / 6mo / 12mo): calendar bounds, bar vs area, tooltips, URL/popstate/replaceRelease, and alertExploreRange.
+  assert.deepEqual(ui.HERO_HOURLY_LEFT_RANGES,['24h','7d','1mo','6mo','12mo']);
+  assert.deepEqual(ui.HERO_DAILY_LEFT_RANGES,['7d','1mo','6mo','12mo']);
+  assert.equal(ui.HERO_RANGE_META['1mo'].months,1);
+  assert.equal(ui.HERO_RANGE_META['6mo'].months,6);
+  assert.equal(ui.HERO_RANGE_META['12mo'].months,12);
+  assert.equal(ui.isHeroRange('1mo'),true);
+  assert.equal(ui.isHeroRange('__proto__'),false);
+  assert.equal(ui.isHeroRange('constructor'),false);
+  assert.equal(ui.normalizeHeroRange('24h',false),'7d');
+  assert.equal(ui.normalizeHeroRange('1mo',false),'1mo');
+  assert.equal(ui.normalizeHeroRange('6mo',true),'6mo');
+  assert.equal(ui.normalizeHeroRange('12mo',true),'12mo');
+  assert.equal(ui.normalizeHeroRange('bogus',true),'24h');
+
+  for(const r of ['1mo','6mo','12mo']){
+   assert.equal(ui.parseLocation(v7NonMidnight,`?hero_range=${r}`).heroRange,r);
+   assert.equal(ui.parseLocation(v6Data,`?hero_range=${r}`).heroRange,r);
+  }
+  const leapHeroDoc=structuredClone(v6Data);
+  const marEnd=Date.parse('2024-03-31T00:00:00Z')/1000;
+  leapHeroDoc.end=marEnd;leapHeroDoc.start=marEnd-86400;
+  for(const c of leapHeroDoc.charts){
+   c.end=marEnd;c.start=marEnd-86400;
+   for(const s of c.series){
+    s.history.daily=Array.from({length:400},(_,k)=>[marEnd-(399-k)*86400,k+1,104,1,true]);
+   }
+  }
+  const hLeap1mo=ui.prepareHeroPlot(leapHeroDoc,'1mo',true);
+  assert.equal(hLeap1mo.range,'1mo');
+  assert.equal(hLeap1mo.start,Date.parse('2024-02-29T00:00:00Z')/1000,'1mo hero clamps Mar 31 -> Feb 29 on leap year');
+  assert.equal(hLeap1mo.times.length,31);
+  assert.equal(ui.prepareHeroPlot(leapHeroDoc,'6mo',true).range,'6mo');
+  assert.equal(ui.prepareHeroPlot(leapHeroDoc,'12mo',true).range,'12mo');
+
+  // Window-normalized gauge scalePeak and tooltip "${range} peak" on 1mo, 6mo, 12mo + bar vs area rendering.
+  const winPeakDoc=structuredClone(v7NonMidnight);
+  const wpOc=chart('open_circuits',winPeakDoc).series[0];
+  const wpEndDay=Math.floor(winPeakDoc.end/86400)*86400;
+  wpOc.peaks.day.fleet_peak=1e6;
+  wpOc.history.daily=wpOc.history.daily.map(row=>{
+   if(row[0]===wpEndDay-45*86400)return [row[0],500,104,1,true];
+   if(row[0]===wpEndDay-220*86400)return [row[0],800,104,1,true];
+   return row[0]>=wpEndDay-400*86400?[row[0],200,104,1,true]:row;
+  });
+  for(const [r,expPeak,expShare] of [['1mo',200,'100%'],['6mo',500,'40%'],['12mo',800,'25%']]){
+   const prep=ui.prepareHeroPlot(winPeakDoc,r,true);
+   assert.equal(prep.range,r);
+   assert.equal(prep.gauges.openCircuits.windowPeak,expPeak);
+   assert.equal(prep.gauges.openCircuits.scalePeak,expPeak,`${r} normalizes gauge scalePeak to windowPeak`);
+   const plotEl=element(800);
+   application(`?view=overview&hero_range=${r}`,winPeakDoc).app.drawHero(plotEl,r,'linear',true);
+   assert.match(plotEl.innerHTML,new RegExp(`hero-missing-${r}-l-1`));
+   if(r==='1mo')assert.match(plotEl.innerHTML,/class="hero-rate-bar"/);
+   else assert.match(plotEl.innerHTML,/class="hero-rate-area"/);
+   assert.match(inspectHero(winPeakDoc,r,['End']).steps[0].tooltipHtml,new RegExp(`Open circuits: 200 \\(&lt;0\\.1%, ${expShare} of ${r} peak\\)`));
+  }
+
+  // Interactive click, URL, popstate, and replaceRelease across 1mo/6mo/12mo.
+  const winCtrl=application('?view=overview',v7NonMidnight,'1',releaseContext(v7NonMidnight,'win-v7',()=>v7NonMidnight.end));
+  winCtrl.app.start();
+  click(winCtrl,'[data-hero-range]',{heroRange:'1mo'});
+  assert.equal(winCtrl.app.getState().heroRange,'1mo');
+  assert.equal(new URLSearchParams(winCtrl.browser.location.search).get('hero_range'),'1mo');
+  assert.ok(winCtrl.browser.document.querySelector('[data-hero-panel="1mo"]'));
+  click(winCtrl,'[data-hero-range]',{heroRange:'6mo'});
+  assert.equal(winCtrl.app.getState().heroRange,'6mo');
+  click(winCtrl,'[data-hero-range]',{heroRange:'12mo'});
+  assert.equal(winCtrl.app.getState().heroRange,'12mo');
+  winCtrl.app.replaceRelease(v6Data,releaseContext(v6Data,'win-v6',()=>v6Data.end));
+  assert.equal(winCtrl.app.getState().heroRange,'12mo','v7->v6 preserves 12mo heroRange');
+  winCtrl.app.replaceRelease(v7NonMidnight,releaseContext(v7NonMidnight,'win-v7b',()=>v7NonMidnight.end));
+  assert.equal(winCtrl.app.getState().heroRange,'12mo','v6->v7 preserves 12mo heroRange');
+  winCtrl.back();
+  assert.equal(winCtrl.app.getState().heroRange,'6mo','popstate restores 6mo heroRange');
+
+  // Alert deep-link range maps to 1mo/6mo/12mo when configured, and falls back to 7d/default when absent.
+  const alertRangeDoc=makeAlertDataset(v7NonMidnight,'day',['high','neutral','neutral','neutral','neutral','neutral']);
+  const alert1moHtml=application('?view=overview&hero_range=1mo',alertRangeDoc).app.markup();
+  assert.match(alert1moHtml,/class="hero-alert-detail"[^>]*data-range="1mo"/);
+  const customTrAlert=structuredClone(toV6Data(alertRangeDoc));
+  customTrAlert.time_ranges={
+   version:1,default_range:'7d',legacy_aliases:{},card_slots:{fallback_dynamic:'7d',fixed:['6mo','all']},
+   periods:[
+    customTrAlert.time_ranges.periods.find(p=>p.id==='7d'),
+    customTrAlert.time_ranges.periods.find(p=>p.id==='6mo'),
+    customTrAlert.time_ranges.periods.at(-1),
+   ],
+  };
+  for(const c of customTrAlert.charts)for(const s of c.series){
+   s.historical_averages={seven_days:s.historical_averages.seven_days,six_months:s.historical_averages.six_months,all_time:s.historical_averages.all_time};
+   if(s.relay_counts)s.relay_counts={day:s.relay_counts.day,seven_days:s.relay_counts.seven_days,six_months:s.relay_counts.six_months,all_time:s.relay_counts.all_time};
+  }
+  const fallbackAlert12Html=application('?view=overview&hero_range=12mo',customTrAlert).app.markup();
+  assert.match(fallbackAlert12Html,/class="hero-alert-detail"[^>]*data-range="7d"/,'missing 12mo period falls back to 7d');
+
+  // 14. Incoming OR connections + open_connections + Option A / Option B thresholds.
+  const buildFullHeroDoc=(src,{withThresholds=true}={})=>{
+   const doc=structuredClone(src);
+   const tplCounter=structuredClone(chart('transport_rejections',doc));
+   const tplGauge=structuredClone(chart('open_circuits',doc));
+   const makeSeries=(baseSer,key,name,color,hrVal,dayVal,histScale=1,refPct=50,refN=120)=>{
+    const s=structuredClone(baseSer);
+    s.key=key;s.name=name;s.color=color;
+    s.values=s.values.map(([t],i)=>[t,i===23?hrVal:hrVal*0.5]);
+    s.hourly_relays=s.hourly_relays.map(([t])=>[t,240]);
+    s.hourly_expected_relays=s.hourly_expected_relays.map(([t])=>[t,240]);
+    s.history.sampled_hour=Array.from({length:refN},(_,k)=>[doc.reference_window.start+(k+1)*21600,(k+1)*histScale,240,1,true]);
+    s.history.daily=Array.from({length:refN},(_,k)=>{
+     const t=doc.reference_window.start+(k+1)*86400;
+     return [t,(k+1)*histScale,240,1,true];
+    });
+    const nmEnd=Math.floor(doc.end/86400)*86400;
+    if(!s.history.daily.some(r=>r[0]===nmEnd))s.history.daily.push([nmEnd,dayVal,240,1,true]);
+    s.current.hour={value:hrVal,relays:240,expected_relays:240,coverage:1,valid:true};
+    s.current.day={value:dayVal,relays:240,expected_relays:240,coverage:1,valid:true};
+    s.reference.hour={n:refN,current_percentile:refPct,flat_zero:false,mean_per_relay:1,p10_per_relay:0.2,p50_per_relay:1,p90_per_relay:2,p99_per_relay:3,start:doc.reference_window.start,end:doc.reference_window.end};
+    s.reference.day={n:refN,current_percentile:refPct,flat_zero:false,mean_per_relay:1,p10_per_relay:0.2,p50_per_relay:1,p90_per_relay:2,p99_per_relay:3,start:doc.reference_window.start,end:doc.reference_window.end};
+    s.peaks.hour={fleet_peak:hrVal*2,fleet_peak_at:doc.end-3600,fleet_peak_relays:240,current_is_record:false};
+    s.peaks.day={fleet_peak:dayVal*4,fleet_peak_at:nmEnd-86400,fleet_peak_relays:240,current_is_record:false};
+    return s;
+   };
+   const trFam=doc.families.find(f=>f.id==='transport');
+   if(!chart('incoming_connections',doc)){
+    const incChart={
+     ...structuredClone(tplCounter),
+     id:'incoming_connections',family_id:'transport',title:'Incoming OR connections',
+     definition:'Total, accepted, and rejected incoming OR connections.',
+     display_unit:'attempts/s',headline_unit:'attempts/s',display_scale:1,
+     metrics:['tor_relay_connections_total'],primary_series:'total',display_keys:['total','accepted','rejected'],
+     series:[
+      makeSeries(tplCounter.series[0],'total','Total incoming OR','#55dda3',400,800,1,99.5,120),
+      makeSeries(tplCounter.series[0],'accepted','Accepted','#48d9ef',300,600,0.75,99.5,120),
+      makeSeries(tplCounter.series[0],'rejected','Rejected','#ff9873',100,200,0.25,99.5,120),
+     ],
+    };
+    doc.charts.push(incChart);
+    trFam.children.push('incoming_connections');
+   }else{
+    const incChart=chart('incoming_connections',doc);
+    incChart.series=[
+     makeSeries(tplCounter.series[0],'total','Total incoming OR','#55dda3',400,800,1,99.5,120),
+     makeSeries(tplCounter.series[0],'accepted','Accepted','#48d9ef',300,600,0.75,99.5,120),
+     makeSeries(tplCounter.series[0],'rejected','Rejected','#ff9873',100,200,0.25,99.5,120),
+    ];
+   }
+   if(!chart('open_connections',doc)){
+    const openChart={
+     ...structuredClone(tplGauge),
+     id:'open_connections',family_id:'transport',title:'Open incoming OR connections',
+     definition:'Currently open incoming OR connections.',
+     display_unit:'connections',headline_unit:'connections',display_scale:1,
+     metrics:['tor_relay_connections'],primary_series:'open_connections',display_keys:['open_connections'],
+     series:[makeSeries(tplGauge.series[0],'open_connections','Open incoming OR','#f1d05d',12000,16000,10,99.2,120)],
+    };
+    doc.charts.push(openChart);
+    trFam.children.push('open_connections');
+   }else{
+    const openChart=chart('open_connections',doc);
+    openChart.series=[makeSeries(tplGauge.series[0],'open_connections','Open incoming OR','#f1d05d',12000,16000,10,99.2,120)];
+   }
+   if(withThresholds){
+    doc.dos_thresholds={
+     as_of:doc.end,
+     reported_relays:240,
+     settings:[
+      {key:'dos_conn_max',option:'DoSConnectionMaxConcurrentCount',family_id:'transport',unit:'connections',relays:240,suppressed_relays:8,values:[{value:'100',source:'torrc',relays:160},{value:'200',source:'consensus',relays:72}]},
+      {key:'dos_circ_burst',option:'DoSCircuitCreationBurst',family_id:'circuits',unit:'circuits',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+      {key:'dos_queue_max',option:'DoSCircuitMaxCellQueueSize',family_id:'queues',unit:'cells',relays:240,suppressed_relays:0,values:[{value:'50000',source:'consensus',relays:240}]},
+      {key:'dos_begindir_rate',option:'DoSBeginDirRatePerSec',family_id:'directory',unit:'req/s',relays:240,suppressed_relays:0,values:[{value:'5',source:'observed',relays:240}]},
+     ],
+    };
+   }else{
+    delete doc.dos_thresholds;
+   }
+   return doc;
+  };
+
+  // Legacy dataset lacking both incoming_connections and open_connections renders classic 4-tile grid.
+  const legacy4Doc=structuredClone(v7NonMidnight);
+  legacy4Doc.charts=legacy4Doc.charts.filter(c=>c.id!=='incoming_connections'&&c.id!=='open_connections');
+  for(const f of legacy4Doc.families)f.children=f.children.filter(id=>id!=='incoming_connections'&&id!=='open_connections');
+  delete legacy4Doc.dos_thresholds;
+  const legacy4Html=application('?view=overview',legacy4Doc).app.markup();
+  assert.doesNotMatch(legacy4Html,/hero-kpi-6|Incoming OR connections|Open incoming OR|Tor trigger thresholds/);
+  assert.match(legacy4Html,/class="hero-kpi-grid"/);
+  assert.match(legacy4Html,/class="hero-thresholds-grid single-col"[\s\S]*Reference rate percentiles/);
+
+  // Full 15-chart dataset renders 6-tile grid, neutral incoming/open KPIs, breakdown, non-alerting childStrip, Family 01 context card, and Option A + B thresholds.
+  const fullHeroDoc=makeAlertDataset(buildFullHeroDoc(v7NonMidnight,{withThresholds:true}),'hour',['neutral','neutral','neutral','neutral','neutral','neutral']);
+  // Re-apply high percentiles to incoming_connections & open_connections to verify they never trigger alerts!
+  for(const cid of ['incoming_connections','open_connections']){
+   for(const s of chart(cid,fullHeroDoc).series){
+    s.reference.hour={n:120,current_percentile:100,flat_zero:false,mean_per_relay:1,p10_per_relay:0.2,p50_per_relay:1,p90_per_relay:2,p99_per_relay:3,start:fullHeroDoc.reference_window.start,end:fullHeroDoc.reference_window.end};
+    s.reference.day={n:120,current_percentile:100,flat_zero:false,mean_per_relay:1,p10_per_relay:0.2,p50_per_relay:1,p90_per_relay:2,p99_per_relay:3,start:fullHeroDoc.reference_window.start,end:fullHeroDoc.reference_window.end};
+   }
+  }
+  const prepFull=ui.prepareHeroPlot(fullHeroDoc,'24h',true);
+  assert.equal(prepFull.incomingConnections.total.values[23],400);
+  assert.equal(prepFull.incomingConnections.accepted.values[23],300);
+  assert.equal(prepFull.incomingConnections.rejected.values[23],100);
+  assert.equal(prepFull.openConnections.values[23],12000);
+  assert.equal(prepFull.families.find(f=>f.id==='transport').rows[23].state,'neutral','incoming_connections at 100th pct never alerts Family 01');
+  assert.ok(!prepFull.vectors.some(v=>v.sources?.some?.(src=>src?.c?.id==='incoming_connections')),'incoming_connections excluded from HERO_VECTORS');
+  assert.equal(prepFull.familyThresholds.length,6);
+  assert.ok(isFinite(prepFull.rateRank.p90Fleet)&&isFinite(prepFull.rateRank.p99Fleet));
+
+  const fullOvCtrl=application('?view=overview',fullHeroDoc);
+  fullOvCtrl.app.start();
+  const fullOvHtml=fullOvCtrl.page.innerHTML;
+  assert.match(fullOvHtml,/class="hero-kpi-grid hero-kpi-6"/);
+  assert.equal((fullOvHtml.match(/class="hero-kpi-pct"/g)||[]).length,5,'6-tile grid renders 5 percentile badges');
+  assert.match(fullOvHtml,/Incoming OR connections \(1h\)<\/div><div class="hero-kpi-value neutral">400 <small>attempts\/s<\/small><\/div><div class="hero-kpi-breakdown">Accepted: 300\/s · Rejected: 100\/s \(25% rejected\)<\/div><div class="hero-kpi-meta">50% of 800 peak \(1h record\)<\/div><div class="hero-kpi-pct"><span class="percentile neutral"/);
+  assert.match(fullOvHtml,/Open incoming OR \(1h mean\)<\/div><div class="hero-kpi-value neutral">12,000 <small>connections<\/small><\/div><div class="hero-kpi-meta">50% of 24,000 peak \(1h record\)<\/div><div class="hero-kpi-pct"><span class="percentile neutral"/);
+  assert.match(fullOvHtml,/0 of 6 <small>families ≥90th pct<\/small>.*No qualifying family alerts/);
+  assert.equal(ui.prepareHeroPlot(zeroExitDoc,'24h',true).familyThresholds.length,5,'inactive 0-Exit family is omitted from familyThresholds');
+
+  // Family 01 childStrip pills stay neutral (never elevated/high or unknown when measured) and incoming_context_card renders cleanly.
+  const trArticle=fullOvCtrl.browser.document.getElementById('family-transport');
+  const trPills=fullOvCtrl.browser.document.querySelectorAll('.child-pill').filter(n=>n.offset>=trArticle.contentStart&&n.offset<trArticle.contentEnd);
+  const incPill=trPills.find(n=>n.dataset.chart==='incoming_connections');
+  const openConnPill=trPills.find(n=>n.dataset.chart==='open_connections');
+  assert.equal(incPill.getAttribute('class'),'child-pill neutral');
+  assert.equal(openConnPill.getAttribute('class'),'child-pill neutral');
+  const trCardHtml=fullOvHtml.match(/<article id="family-transport"[\s\S]*?<\/article>/)[0];
+  assert.match(trCardHtml,/class="incoming-context-card"[\s\S]*<th>Last hour<\/th><th>24h<\/th>/);
+  assert.match(trCardHtml,/Total attempts<\/th><td>400 attempts\/s<\/td><td>800 attempts\/s<\/td>/);
+  assert.match(trCardHtml,/Accepted<\/th><td>300 attempts\/s<\/td><td>600 attempts\/s<\/td>/);
+  assert.match(trCardHtml,/Rejected<\/th><td>100 attempts\/s · 25% of total<\/td><td>200 attempts\/s · 25% of total<\/td>/);
+  assert.match(trCardHtml,/Open incoming OR<\/th><td>12,000 connections<\/td><td>16,000 connections<\/td>/);
+  const incExploreLink=trArticle.querySelector('[data-chart="incoming_connections"]');
+  assert.equal(incExploreLink.dataset.chart,'incoming_connections');
+  assert.notEqual(incExploreLink,incPill,'card-context deep link precedes child-strip pill');
+  fullOvCtrl.events.get('click')({target:incExploreLink,button:0,preventDefault(){}});
+  assert.equal(fullOvCtrl.app.getState().view,'explorer');
+  assert.equal(fullOvCtrl.app.getState().chartId,'incoming_connections');
+
+  // Invalid incoming_connections still falls back to grey 'unknown' pill in childStrip.
+  const unknownIncDoc=structuredClone(fullHeroDoc);
+  for(const s of chart('incoming_connections',unknownIncDoc).series)s.current.hour.valid=false;
+  const unknownIncHtml=application('?view=overview',unknownIncDoc);
+  unknownIncHtml.app.start();
+  const unkTrArticle=unknownIncHtml.browser.document.getElementById('family-transport');
+  const unkIncPill=unknownIncHtml.browser.document.querySelectorAll('.child-pill').find(n=>n.offset>=unkTrArticle.contentStart&&n.offset<unkTrArticle.contentEnd&&n.dataset.chart==='incoming_connections');
+  assert.equal(unkIncPill.getAttribute('class'),'child-pill unknown');
+
+  // Daily-only Family 01 .incoming-context-card omits Last hour column.
+  const fullDailyHtml=application('?view=overview',toV6Data(fullHeroDoc)).app.markup().match(/<article id="family-transport"[\s\S]*?<\/article>/)[0];
+  assert.match(fullDailyHtml,/class="incoming-context-card"[\s\S]*<th>24h<\/th>/);
+  assert.doesNotMatch(fullDailyHtml,/<th>Last hour<\/th>/);
+
+  // Thresholds Option A + Option B rendering & quantileSorted math.
+  assert.equal(ui.quantileSorted([10,20,30,40],0.90),37);
+  assert.equal(ui.quantileSorted([0,100],0.99),99);
+  assert.match(fullOvHtml,/class="hero-thresholds"[\s\S]*<div class="hero-thresholds-grid">/);
+  assert.match(fullOvHtml,/Tor trigger thresholds[\s\S]*consensus \/ torrc · 240 relays/);
+  assert.match(fullOvHtml,/Connection limits[\s\S]*DoSConnectionMaxConcurrentCount[\s\S]*100 connections[\s\S]*torrc: 160[\s\S]*200 connections[\s\S]*consensus: 72[\s\S]*\+8 other/);
+  assert.match(fullOvHtml,/Circuit creation[\s\S]*DoSCircuitCreationBurst[\s\S]*Tor default \(unset\)/);
+  assert.match(fullOvHtml,/Queues &amp; Intro[\s\S]*DoSCircuitMaxCellQueueSize[\s\S]*50000 cells[\s\S]*\(consensus\)/);
+  assert.match(fullOvHtml,/Directory \(BEGIN_DIR\)[\s\S]*DoSBeginDirRatePerSec[\s\S]*5 req\/s[\s\S]*\(observed\)/);
+  assert.match(fullOvHtml,/Reference rate percentiles[\s\S]*90th \/ 99th pct in events\/s[\s\S]*Composite mitigated rate[\s\S]*90th:[\s\S]*events\/s[\s\S]*99th:[\s\S]*events\/s/);
+  assert.match(fullOvHtml,/01 Connection floods · Connection-rate rule[\s\S]*90th:[\s\S]*events\/s/);
+
+  // Unequal-population rateRank & p90Fleet use the same population-weighted composite statistic.
+  const skewDoc=structuredClone(v7NonMidnight);
+  const skewDayEnd=Math.floor(skewDoc.end/86400)*86400;
+  const skewRefEnd=skewDayEnd-86400,skewRefStart=skewRefEnd-101*86400;
+  skewDoc.reference_window={...skewDoc.reference_window,start:skewRefStart,end:skewRefEnd};
+  for(const c of skewDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   if(s.key==='conn_rejected'){
+    s.history.daily=Array.from({length:101},(_,k)=>[skewRefEnd-(100-k)*86400,k<91?80:0,8,1,true]);
+    s.history.daily.push([skewDayEnd,0,8,1,true]);
+   }else if(s.key==='begindir_rejected'){
+    s.history.daily=Array.from({length:101},(_,k)=>[skewRefEnd-(100-k)*86400,k<91?0:1600,80,1,true]);
+    s.history.daily.push([skewDayEnd,160,80,1,true]);
+   }else{
+    s.history.daily=Array.from({length:101},(_,k)=>[skewRefEnd-(100-k)*86400,0,80,1,true]);
+    s.history.daily.push([skewDayEnd,0,80,1,true]);
+   }
+  }
+  const skewPrep=ui.prepareHeroPlot(skewDoc,'7d',false);
+  assert.equal(skewPrep.rateRank.p90Fleet,80,'91 samples at 80 and 10 at 1600 -> p90Fleet is 80');
+  assert.ok(skewPrep.rateRank.rank>90,'curFleet 160 > p90Fleet 80 also ranks >90th percentile under consistent weighting');
+  assert.match(application('?view=overview&hero_range=7d&hero_hsdir=0',skewDoc).app.markup(),/class="percentile elevated"[^>]*>90th percentile/);
+  chart('directory_rejections',skewDoc).series.find(s=>s.key==='begindir_rejected').history.daily.at(-1)[1]=80;
+  const tiedSkewPrep=ui.prepareHeroPlot(skewDoc,'7d',false);
+  assert.equal(tiedSkewPrep.rateRank.p90Fleet,80);
+  assert.ok(tiedSkewPrep.rateRank.rank<90,'tied curFleet==p90Fleet keeps neutral midrank below 90th');
+  assert.match(application('?view=overview&hero_range=7d&hero_hsdir=0',skewDoc).app.markup(),/class="percentile neutral"[^>]*>45th percentile/);
+
+  assert.ok(latestCss.includes('.hero-kpi-grid.hero-kpi-6')&&latestCss.includes('.hero-thresholds-grid')&&latestCss.includes('.incoming-context-card'),
+   'stylesheet defines 6-tile KPI grid, thresholds grid, and incoming context card rules');
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

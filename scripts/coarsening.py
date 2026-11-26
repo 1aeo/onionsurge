@@ -13,6 +13,26 @@ VALID_KINDS = _COUNTER_KINDS | _GAUGE_KINDS
 SENSITIVE_BIN = Decimal('0.001')
 _D_ONE, _D_EIGHT, _D_HUNDRED = Decimal(1), Decimal(8), Decimal(100)
 _D_RATE_CAP, _D_OPEN_CAP, _D_GAUGE_FLOOR, _D_GAUGE_STEP = Decimal('1e10'), Decimal('1e4'), Decimal('0.05'), Decimal('0.1')
+DOS_THRESHOLD_SETTINGS = (
+    ('dosconnectionenabled', 'DoSConnectionEnabled', 'transport', 'flag'),
+    ('dosconnectionmaxconcurrentcount', 'DoSConnectionMaxConcurrentCount', 'transport', 'connections/IP'),
+    ('dosconnectionconnectrate', 'DoSConnectionConnectRate', 'transport', 'connections/s'),
+    ('dosconnectionconnectburst', 'DoSConnectionConnectBurst', 'transport', 'connections'),
+    ('dosconnectiondefensetimeperiod', 'DoSConnectionDefenseTimePeriod', 'transport', 'seconds'),
+    ('doscircuitcreationenabled', 'DoSCircuitCreationEnabled', 'circuits', 'flag'),
+    ('doscircuitcreationrate', 'DoSCircuitCreationRate', 'circuits', 'circuits/s'),
+    ('doscircuitcreationburst', 'DoSCircuitCreationBurst', 'circuits', 'circuits'),
+    ('doscircuitcreationminconnections', 'DoSCircuitCreationMinConnections', 'circuits', 'connections'),
+    ('doscircuitcreationdefensetimeperiod', 'DoSCircuitCreationDefenseTimePeriod', 'circuits', 'seconds'),
+    ('dos_num_circ_max_outq', 'dos_num_circ_max_outq', 'queues', 'circuits'),
+    ('dosrefusesinglehopclientrendezvous', 'DoSRefuseSingleHopClientRendezvous', 'introduction', 'flag'),
+    ('dosbegindirrateenabled', 'DoSBeginDirRateEnabled', 'directory', 'mode'),
+    ('dosbegindirrate', 'DoSBeginDirRate', 'directory', 'requests/s'),
+    ('dosbegindirburst', 'DoSBeginDirBurst', 'directory', 'requests'),
+    ('dosbegindirdefensetype', 'DoSBeginDirDefenseType', 'directory', 'mode'),
+)
+DOS_EFFECTIVE_CONFIG_SETTINGS = DOS_THRESHOLD_SETTINGS[:12]
+DOS_BEGINDIR_CONFIG_SETTINGS = DOS_THRESHOLD_SETTINGS[12:]
 COARSENING_DESCRIPTION = (
     'Deterministic dir-spec coarsening at snapshot boundaries: standalone public relay, flag, '
     'cohort and dircache_cohort counts <8 are floored to 0 and counts >=8 are rounded to the '
@@ -24,7 +44,7 @@ COARSENING_DESCRIPTION = (
     'introduction_rejections, and directory_requests hs_get/hs_post suppress <8 events/window '
     'and bin to 0.001/s, then round to 3 significant digits; other counter series suppress <8 '
     'events/window, bin to 8-event increments, and round rates to 3 significant digits; and '
-    'non-sensitive gauge means (directory_waiting) floor <0.05 to 0, quantize [0.05, 1) to 0.1, '
+    'non-sensitive gauge means (directory_waiting, open_connections) floor <0.05 to 0, quantize [0.05, 1) to 0.1, '
     'and round >=1 to 3 significant digits.'
 )
 
@@ -218,6 +238,87 @@ def coarsen_population_row(row, coarsened_total):
     return [t, total_c, classified_c, guard_c, middle_c, exit_c, hsdir_c, v2dir_c]
 
 
+MAX_DOS_THRESHOLD_VALUES = 16
+
+
+def coarsen_threshold_buckets(buckets, raw_total, fleet_c, *, suppressed_raw=0):
+    """Apply dir-spec coarsening and <8 suppression to one DoS threshold setting."""
+    require(timestamp(raw_total) and timestamp(suppressed_raw) and is_coarsened_count(fleet_c),
+            'Invalid threshold count for coarsening')
+    total_c = min(int(fleet_c), coarsen_count(raw_total))
+    if total_c == 0:
+        return 0, [], 0
+    eligible = []
+    sup_raw = int(suppressed_raw)
+    for (value, source), raw in buckets:
+        require(timestamp(raw), 'Invalid threshold bucket count')
+        n = int(raw)
+        if n >= 8:
+            eligible.append((value, source, n))
+        else:
+            sup_raw += n
+    if not eligible:
+        return total_c, [], total_c
+    eligible.sort(key=lambda item: (-item[2], item[1], item[0]))
+    if len(eligible) > MAX_DOS_THRESHOLD_VALUES:
+        sup_raw += sum(r for _, _, r in eligible[MAX_DOS_THRESHOLD_VALUES:])
+        eligible = eligible[:MAX_DOS_THRESHOLD_VALUES]
+    shown_c, suppressed_c = coarsen_partition(
+        [sum(r for _, _, r in eligible), sup_raw],
+        total_c,
+    )
+    values = []
+    if shown_c > 0:
+        parts = coarsen_partition([r for _, _, r in eligible], shown_c)
+        for (value, source, _), count in zip(eligible, parts, strict=True):
+            if count > 0:
+                values.append({'value': value, 'source': source, 'relays': count})
+        values.sort(key=lambda item: (-item['relays'], item['source'], item['value']))
+    return total_c, values, suppressed_c
+
+
+def coarsen_dos_thresholds(dos_thresholds, fleet_c):
+    """Coarsen an existing dos_thresholds aggregate mapping against fleet_c."""
+    require(isinstance(dos_thresholds, dict) and is_coarsened_count(fleet_c)
+            and 'as_of' in dos_thresholds and isinstance(dos_thresholds.get('settings'), list),
+            'Invalid DoS thresholds for coarsening')
+    fleet_c = int(fleet_c)
+    reported = min(fleet_c, coarsen_count(dos_thresholds.get('reported_relays')))
+    settings_out = []
+    for setting in dos_thresholds['settings']:
+        require(isinstance(setting, dict) and isinstance(setting.get('values'), list),
+                'Invalid DoS threshold setting')
+        values = setting['values']
+        sup_raw = setting.get('suppressed_relays', 0)
+        raw_total = setting.get('relays')
+        require(timestamp(sup_raw) and timestamp(raw_total), 'Invalid DoS threshold count')
+        buckets = []
+        for item in values:
+            require(isinstance(item, dict) and isinstance(item.get('value'), str)
+                    and isinstance(item.get('source'), str) and timestamp(item.get('relays')),
+                    'Invalid DoS threshold bucket')
+            buckets.append(((item['value'], item['source']), int(item['relays'])))
+        require(sum(r for _, r in buckets) + int(sup_raw) == int(raw_total),
+                'DoS threshold bucket counts do not sum to setting relays')
+        relays_c, coarsened_values, suppressed_c = coarsen_threshold_buckets(
+            sorted(buckets), int(raw_total), fleet_c, suppressed_raw=int(sup_raw),
+        )
+        settings_out.append({
+            'key': setting['key'],
+            'option': setting['option'],
+            'family_id': setting['family_id'],
+            'unit': setting['unit'],
+            'relays': relays_c,
+            'values': coarsened_values,
+            'suppressed_relays': suppressed_c,
+        })
+    return {
+        'as_of': dos_thresholds['as_of'],
+        'reported_relays': reported,
+        'settings': settings_out,
+    }
+
+
 def _coarsen_count_string(raw):
     require(isinstance(raw, str) and not isinstance(raw, bool), 'Invalid count string')
     try:
@@ -381,6 +482,9 @@ def coarsen_snapshot(data):
     if 'history' in versions:
         for row in versions['history']['response']['data']['result']:
             row['values'] = [[int(pt[0]), _coarsen_count_string(pt[1])] for pt in row['values']]
+
+    if 'dos_thresholds' in data:
+        data['dos_thresholds'] = coarsen_dos_thresholds(data['dos_thresholds'], fleet_c)
 
     for chart in data['charts']:
         chart_c = cohort_totals[chart['cohort_key']]

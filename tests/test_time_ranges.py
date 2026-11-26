@@ -322,12 +322,12 @@ class TimeRangeConfigTests(unittest.TestCase):
                 for p in custom['periods']
             )
             self.assertEqual(csv_files, expected_csvs)
-            self.assertEqual(len(csv_files), 13 * 3)
+            self.assertEqual(len(csv_files), 15 * 3)
 
             manifest = json.loads((custom_out / 'build-manifest.json').read_text())
             self.assertEqual(
                 len([k for k in manifest['files'] if k.startswith('exports/')]),
-                39,
+                45,
             )
 
             series = data['charts'][0]['series'][0]
