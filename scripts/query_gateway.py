@@ -39,7 +39,7 @@ COHORTS = {
 }
 MEMBER_KEY = 'experiment_id,host,instance,job,kind,member_id,unit'
 PROCESS_KEY = 'experiment_id,host,instance,job,member_id,unit,pid,start_ticks,boot_id'
-STATE_BINARY = (f'(tor41339_build_info{{kind="state"}} and on({MEMBER_KEY}) (tor41339_member_valid{{kind="state"}} == 1) '
+STATE_BINARY = (f'(tor41339_build_info{{kind="state"}} '
                 f'and on({MEMBER_KEY}) (tor41339_fingerprint_verified{{kind="state"}} == 1) '
                 f'and on({MEMBER_KEY}) (tor41339_member_source_timestamp_seconds{{kind="state"}} <= time()))')
 CPU_IDENTITY = (f'(tor41339_rss_bytes{{kind="cpu"}} and on({MEMBER_KEY}) (tor41339_member_valid{{kind="cpu"}} == 1) '

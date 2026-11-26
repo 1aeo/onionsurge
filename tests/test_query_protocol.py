@@ -24,8 +24,8 @@ class QueryProtocolTests(unittest.TestCase):
         result = builder.build(access.load_json(ROOT / 'catalogue/contract.json'))
         for name, value in result.items():
             self.assertEqual(access.load_json(ROOT / 'catalogue' / name), value)
-        self.assertEqual(len(result['queries.json']), 90)
-        self.assertEqual(len(result['routes.json']), 208)
+        self.assertEqual(len(result['queries.json']), 92)
+        self.assertEqual(len(result['routes.json']), 210)
         populations = {key: value for key, value in result['queries.json'].items()
                        if key.startswith('relay_population_')}
         self.assertEqual(len(populations), 16)
@@ -260,6 +260,16 @@ class QueryProtocolTests(unittest.TestCase):
                 os.umask(old_umask)
             self.assertEqual(stat.S_IMODE((fake_root / 'catalogue/queries.json').lstat().st_mode), 0o644)
             self.assertEqual(stat.S_IMODE((fake_root / 'catalogue/routes.json').lstat().st_mode), 0o644)
+
+    def test_tor_version_label_validation(self):
+        valid = {'status': 'success', 'data': {'resultType': 'matrix', 'result': [
+            {'metric': {'tor_version': '0.4.9.17'}, 'values': [[100, '368']]}]}}
+        self.assertEqual(access.aggregate_response(valid, 100, 200, 100), valid)
+        for bad in ('0.4.9.17-dirty', 'host=abc', '', '0.4.9', 'v0.4.9.17'):
+            payload = {'status': 'success', 'data': {'resultType': 'matrix', 'result': [
+                {'metric': {'tor_version': bad}, 'values': [[100, '1']]}]}}
+            with self.subTest(bad=bad), self.assertRaisesRegex(access.AccessError, 'invalid_label_value'):
+                access.aggregate_response(payload, 100, 200, 100)
 
 
 if __name__ == '__main__':

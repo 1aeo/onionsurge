@@ -15,8 +15,9 @@ HOUR = 3600
 SAMPLED_HOUR_STEP = 21600
 DAY = 86400
 STEPS = (HOUR, SAMPLED_HOUR_STEP, DAY)
-LABELS = {'type', 'action', 'build_id', 'sha256', 'dircache', 'dircache_source'}
+LABELS = {'type', 'action', 'build_id', 'sha256', 'dircache', 'dircache_source', 'tor_version'}
 NUMERIC_VALUE = re.compile(r'^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z')
+_TOR_VERSION_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
 LABEL_REPLACE_DEST = re.compile(r'\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,')
 LABEL_REPLACE_SRC = re.compile(r'\s*"(|[A-Za-z_][A-Za-z0-9_]*)"\s*,')
 MAX_JSON_DEPTH = 64
@@ -283,6 +284,8 @@ def validate_matrix(payload, begin, end, step, *, max_series=512, max_points=MAX
             if not isinstance(labels, dict) or not set(labels) <= LABELS:
                 raise AccessError('unexpected_output_labels')
             if any(not isinstance(v, str) or len(v) > 256 for v in labels.values()):
+                raise AccessError('invalid_label_value')
+            if 'tor_version' in labels and not _TOR_VERSION_RE.fullmatch(labels['tor_version']):
                 raise AccessError('invalid_label_value')
             canonical = tuple(sorted(labels.items()))
             if canonical in seen_labels:
