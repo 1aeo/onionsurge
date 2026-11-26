@@ -3277,6 +3277,135 @@ copyCtrl.app.start();
   const unvFixesHtml=application('?view=fixes',allUnverifiedDoc).app.markup();
   assert.match(unvFixesHtml,/240 relays total · 0 verified · 240 unverified[\s\S]*?Version not recorded[\s\S]*?Unverified[\s\S]*?240/);
   assert.match(application('?view=methods',v7NonMidnight).app.markup(),/selecting <b>Last 7 days<\/b> updates Hero KPIs/);
+
+  // 12. Hero mitigated-rate % of peak, all-KPI percentiles (24h & 7d), apples-to-apples rateRank, gauge neutrality, and tooltip peak share.
+  assert.ok(latestCss.includes('.hero-kpi-pct')&&latestCss.includes('.hero-kpi-pct-note'),
+   'stylesheet defines Hero KPI percentile layout classes');
+
+  // 12a. Mitigated-rate % of peak (1h sampled_hour+values deduplicated overlap & 24h daily), HSDir toggle response, zero/null guards, and tooltip.
+  const peakDoc=structuredClone(v7NonMidnight);
+  for(const c of peakDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   s.values=s.values.map(([t])=>[t,0]);
+   s.hourly_relays=s.hourly_relays.map(([t])=>[t,240]);
+   s.hourly_expected_relays=s.hourly_expected_relays.map(([t])=>[t,240]);
+   s.history.daily=s.history.daily.map(([t])=>[t,0,240,1,true]);
+   if(Array.isArray(s.history.sampled_hour))s.history.sampled_hour=s.history.sampled_hour.map(([t])=>[t,0,240,1,true]);
+  }
+  const trConn=chart('transport_rejections',peakDoc).series.find(s=>s.key==='conn_rejected');
+  const trConc=chart('transport_rejections',peakDoc).series.find(s=>s.key==='concurrent_conn_rejected');
+  const hsGet=chart('directory_requests',peakDoc).series.find(s=>s.key==='hs_get');
+  const overlapHr=trConn.values[0][0];
+  trConn.values[23][1]=30;trConn.values[0][1]=50;trConc.values[0][1]=50;
+  trConn.history.sampled_hour=[[overlapHr,60,240,1,true],[peakDoc.reference_window.start+21600,120,240,1,true]];
+  trConc.history.sampled_hour=[[overlapHr,50,240,1,true],[peakDoc.reference_window.start+21600,0,240,1,true]];
+  hsGet.values[23][1]=270;hsGet.history.sampled_hour=[[peakDoc.reference_window.start+21600,480,240,1,true]];
+  const peak24=ui.prepareHeroPlot(peakDoc,'24h',false),peak24Hs=ui.prepareHeroPlot(peakDoc,'24h',true);
+  assert.equal(peak24.ratePeak,120,'1h ratePeak overlays values onto sampled_hour without double-counting overlap (50+50=100 < 120)');
+  assert.equal(peak24Hs.ratePeak,600,'1h ratePeak includes hs_get+hs_post when hero_hsdir=1 (120+480=600)');
+  const peakDayEnd=Math.floor(peakDoc.end/86400)*86400;
+  trConn.history.daily=[[peakDayEnd-2*86400,200,240,1,true],[peakDayEnd-86400,100,240,1,true],[peakDayEnd,20,240,1,true]];
+  trConc.history.daily=[[peakDayEnd-2*86400,0,240,1,true],[peakDayEnd-86400,0,240,1,true],[peakDayEnd,5,240,1,true]];
+  hsGet.history.daily=[[peakDayEnd-2*86400,800,240,1,true],[peakDayEnd-86400,0,240,1,true],[peakDayEnd,75,240,1,true]];
+  assert.equal(ui.prepareHeroPlot(peakDoc,'7d',false).ratePeak,200);
+  assert.equal(ui.prepareHeroPlot(peakDoc,'7d',true).ratePeak,1000);
+  const peak24Html=application('?view=overview',peakDoc).app.markup();
+  assert.match(peak24Html,/Latest 1h mitigated rate<\/div><div class="hero-kpi-value neutral">30 <small>events\/s<\/small><\/div><div class="hero-kpi-meta">25% of 120 peak \(1h record\)<\/div><div class="hero-kpi-pct">/);
+  const peak24HsHtml=application('?view=overview&hero_hsdir=1',peakDoc).app.markup();
+  assert.match(peak24HsHtml,/Latest 1h mitigated &amp; flood rate<\/div><div class="hero-kpi-value neutral">300 <small>events\/s<\/small><\/div><div class="hero-kpi-meta">50% of 600 peak \(1h record\)<\/div><div class="hero-kpi-pct">/);
+  const peak7Html=application('?view=overview&hero_range=7d',peakDoc).app.markup();
+  assert.match(peak7Html,/Latest UTC day mitigated rate<\/div><div class="hero-kpi-value neutral">25 <small>events\/s<\/small><\/div><div class="hero-kpi-meta">12\.5% of 200 peak \(24h record\)<\/div><div class="hero-kpi-pct">/);
+  const peak7HsHtml=application('?view=overview&hero_range=7d&hero_hsdir=1',peakDoc).app.markup();
+  assert.match(peak7HsHtml,/Latest UTC day mitigated &amp; flood rate<\/div><div class="hero-kpi-value neutral">100 <small>events\/s<\/small><\/div><div class="hero-kpi-meta">10% of 1,000 peak \(24h record\)<\/div><div class="hero-kpi-pct">/);
+  assert.match(inspectHero(peakDoc,'24h',['End']).steps[0].tooltipHtml,/Total active rate<\/span><span>300 events\/s \(50% of peak\)<\/span>/);
+  const partialPeakDoc=structuredClone(peakDoc);
+  for(const row of chart('directory_rejections',partialPeakDoc).series[0].history.daily){if(row[0]===peakDayEnd){row[1]=null;row[4]=false;}}
+  assert.match(inspectHero(partialPeakDoc,'all',['End']).steps[0].tooltipHtml,/Total active rate<\/span><span>[^<]*\(\d+(?:\.\d+)?% of peak\) \(partial coverage\)/);
+  assert.doesNotMatch(application('?view=overview',allZeroRateData).app.markup(),/0 peak \(/);
+  assert.doesNotMatch(empty24Kpi,/class="hero-kpi-pct"|peak \(1h record\)/);
+
+  // 12b. Apples-to-apples rateRank: late-introduced hs_get compares only against the 25 matching days, preventing false >=90th alert inflation.
+  const a2aDoc=structuredClone(v7NonMidnight);
+  const a2aDayEnd=Math.floor(a2aDoc.end/86400)*86400;
+  const a2aRefEnd=a2aDayEnd-86400,a2aRefStart=a2aRefEnd-225*86400;
+  a2aDoc.reference_window={...a2aDoc.reference_window,start:a2aRefStart,end:a2aRefEnd};
+  for(const c of a2aDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   if(s.key==='hs_get'){
+    s.history.daily=Array.from({length:25},(_,k)=>[a2aRefEnd-(24-k)*86400,4500+k*100,100,1,true]);
+    s.history.daily.push([a2aDayEnd,5500,100,1,true]);
+   }else if(s.key==='conn_rejected'){
+    s.history.daily=Array.from({length:225},(_,k)=>[a2aRefEnd-(224-k)*86400,k<200?100:500,100,1,true]);
+    s.history.daily.push([a2aDayEnd,500,100,1,true]);
+   }else{
+    s.history.daily=Array.from({length:225},(_,k)=>[a2aRefEnd-(224-k)*86400,0,100,1,true]);
+    s.history.daily.push([a2aDayEnd,0,100,1,true]);
+   }
+  }
+  const a2aHs=ui.prepareHeroPlot(a2aDoc,'7d',true),a2aNoHs=ui.prepareHeroPlot(a2aDoc,'7d',false);
+  assert.equal(a2aHs.rateRank.n,25,'hero_hsdir=1 restricts rateRank baseline to the 25 days with hs_get');
+  assert.equal(a2aHs.rateRank.rank,42,'5500+500 ranks at 42nd percentile across the 25 matching days (10 less + 0.5*1 tie / 25), not falsely >=90th');
+  assert.equal(a2aNoHs.rateRank.n,225,'hero_hsdir=0 retains full 225-day matching baseline');
+  assert.ok(a2aNoHs.rateRank.rank>90,'500 vs 200 days at 100 and 24 ties at 500 ranks >90th independently');
+  const a2aHsHtml=application('?view=overview&hero_range=7d&hero_hsdir=1',a2aDoc).app.markup();
+  assert.match(a2aHsHtml,/42nd percentile/);
+  assert.doesNotMatch(a2aHsHtml,/class="percentile (elevated|high)"[^>]*>[^<]*percentile<\/span>/);
+
+  // 12c. Gauge percentiles stay neutral even at 100th; rateRank uses elevated/high/unknown/flat appropriately; non-midnight vs midnight 7d gauges.
+  const stateHeroDoc=structuredClone(v7NonMidnight);
+  const ocState=chart('open_circuits',stateHeroDoc).series[0],dwState=chart('directory_waiting',stateHeroDoc).series[0];
+  ocState.reference.hour={n:200,current_percentile:100,flat_zero:false,mean_per_relay:100,p10_per_relay:50,p50_per_relay:100,p90_per_relay:150,start:stateHeroDoc.reference_window.start,end:stateHeroDoc.reference_window.end};
+  dwState.reference.hour={n:200,current_percentile:99,flat_zero:false,mean_per_relay:10,p10_per_relay:5,p50_per_relay:10,p90_per_relay:15,start:stateHeroDoc.reference_window.start,end:stateHeroDoc.reference_window.end};
+  for(const c of stateHeroDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   if(s.key==='conn_rejected'){
+    s.values=s.values.map(([t],i)=>[t,i===23?9999:10]);
+    s.history.sampled_hour=Array.from({length:120},(_,k)=>[stateHeroDoc.reference_window.start+(k+1)*21600,k+1,240,1,true]);
+   }else{
+    s.values=s.values.map(([t])=>[t,0]);
+    if(Array.isArray(s.history.sampled_hour))s.history.sampled_hour=Array.from({length:120},(_,k)=>[stateHeroDoc.reference_window.start+(k+1)*21600,0,240,1,true]);
+   }
+  }
+  const highHeroHtml=application('?view=overview',stateHeroDoc).app.markup();
+  assert.equal((highHeroHtml.match(/class="hero-kpi-pct"/g)||[]).length,3,'all 3 numeric hero KPIs render percentile badges in 24h');
+  assert.match(highHeroHtml,/Latest 1h mitigated rate[\s\S]*?<div class="hero-kpi-value neutral">9,999 <small>events\/s<\/small><\/div>[\s\S]*?<span class="percentile high"[^>]*>100th percentile<\/span>/);
+  assert.match(highHeroHtml,/Open circuits \(1h mean\)[\s\S]*?<span class="percentile neutral"[^>]*>100th percentile<\/span>/,'open circuits stays neutral at 100th');
+  assert.match(highHeroHtml,/Stalled BEGIN_DIR \(1h mean\)[\s\S]*?<span class="percentile neutral"[^>]*>99th percentile<\/span>/,'stalled BEGIN_DIR stays neutral at 99th');
+  // 96th percentile with n=25 -> .elevated.
+  for(const c of stateHeroDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   if(s.key==='conn_rejected'){
+    s.values=s.values.map(([t],i)=>[t,i===23?24.5:1]);
+    s.history.sampled_hour=Array.from({length:25},(_,k)=>[stateHeroDoc.reference_window.start+(k+1)*21600,k+1,240,1,true]);
+   }
+  }
+  const elevHeroHtml=application('?view=overview',stateHeroDoc).app.markup();
+  assert.match(elevHeroHtml,/Latest 1h mitigated rate[\s\S]*?<span class="percentile elevated"[^>]*>96th percentile<\/span>/);
+  // Small baseline (n=10 < 20) uses .unknown + (10h) note.
+  for(const c of stateHeroDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   if(s.key==='conn_rejected')s.history.sampled_hour=Array.from({length:10},(_,k)=>[stateHeroDoc.reference_window.start+(k+1)*21600,k+1,240,1,true]);
+  }
+  const shortHeroHtml=application('?view=overview',stateHeroDoc).app.markup();
+  assert.match(shortHeroHtml,/Latest 1h mitigated rate[\s\S]*?<span class="percentile unknown"[^>]*>100th percentile<\/span> <span class="hero-kpi-pct-note">\(10h\)<\/span>/);
+  // Flat zero reference renders Percentile — (.flat).
+  for(const c of stateHeroDoc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+   s.values=s.values.map(([t])=>[t,0]);
+   if(Array.isArray(s.history.sampled_hour))s.history.sampled_hour=Array.from({length:40},(_,k)=>[stateHeroDoc.reference_window.start+(k+1)*21600,0,240,1,true]);
+  }
+  assert.match(application('?view=overview',stateHeroDoc).app.markup(),/Latest 1h mitigated rate[\s\S]*?<span class="percentile flat"[^>]*>Percentile —<\/span>/);
+  // Non-midnight 7d gauge ranks completed UTC day row rather than rolling current.day; midnight 7d uses reference.day.
+  const nmGaugeDoc=structuredClone(v7NonMidnight);
+  const nmDayT=Math.floor(nmGaugeDoc.end/86400)*86400;
+  const nmOc=chart('open_circuits',nmGaugeDoc).series[0];
+  nmOc.history.daily=Array.from({length:26},(_,k)=>{
+   const t=nmGaugeDoc.reference_window.start+(k+1)*86400;
+   return [k<25?t:nmDayT,k===25?250:((k+1)*100),100,1,true];
+  });
+  nmOc.current.day={value:999999,relays:100,expected_relays:100,coverage:1,valid:true};
+  nmOc.reference.day={n:100,current_percentile:99,flat_zero:false,mean_per_relay:10,p10_per_relay:5,p50_per_relay:10,p90_per_relay:15,start:nmGaugeDoc.reference_window.start,end:nmGaugeDoc.reference_window.end};
+  assert.equal(ui.prepareHeroPlot(nmGaugeDoc,'7d',false).gauges.openCircuits.latestRank.rank,8);
+  const nmGaugeHtml=application('?view=overview&hero_range=7d',nmGaugeDoc).app.markup();
+  assert.equal((nmGaugeHtml.match(/class="hero-kpi-pct"/g)||[]).length,3,'all 3 numeric hero KPIs render percentile badges in 7d');
+  assert.match(nmGaugeHtml,/Open circuits \(UTC day mean\)[\s\S]*?<div class="hero-kpi-value neutral">250 <small>circuits<\/small><\/div>[\s\S]*?<span class="percentile neutral"[^>]*>8th percentile<\/span>/);
+  const midGaugeDoc=structuredClone(nmGaugeDoc);
+  midGaugeDoc.end=nmDayT;midGaugeDoc.start=nmDayT-86400;
+  assert.match(application('?view=overview&hero_range=7d',midGaugeDoc).app.markup(),/Open circuits \(24h mean\)[\s\S]*?<span class="percentile neutral"[^>]*>99th percentile<\/span>/);
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }
