@@ -639,17 +639,22 @@ def _ensure_supplemental_charts(data, routes, added=None):
         if family is not None and isinstance(family.get('children'), list) and cid not in family['children']:
             family['children'].append(cid)
     if missing_routes_cids:
-        family_primary = {f.get('id'): f.get('primary') for f in families} if isinstance(families, list) else {}
-        removable = {
-            c.get('id') for c in charts
-            if c.get('id') in missing_routes_cids and family_primary.get(c.get('family_id')) != c.get('id')
-        }
+        removable = {c.get('id') for c in charts if c.get('id') in missing_routes_cids}
         if removable:
             data['charts'] = [c for c in charts if c.get('id') not in removable]
+            kept_by_id = {c.get('id'): c for c in data['charts']}
             if isinstance(families, list):
                 for fam in families:
                     if isinstance(fam.get('children'), list):
                         fam['children'] = [cid for cid in fam['children'] if cid not in removable]
+                    if fam.get('primary') in removable:
+                        remaining = fam.get('children') if isinstance(fam.get('children'), list) else []
+                        _require(bool(remaining), f'Missing required routes for primary chart: {fam.get("primary")}')
+                        new_primary = remaining[0]
+                        fam['primary'] = new_primary
+                        primary_chart = kept_by_id.get(new_primary)
+                        if primary_chart is not None and 'primary_series' in primary_chart:
+                            fam['primary_series'] = primary_chart['primary_series']
     return data
 
 

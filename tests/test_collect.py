@@ -2763,6 +2763,27 @@ class CollectorTests(unittest.TestCase):
                 0,
             )
 
+            # Supplemental chart serving as family primary with missing routes promotes a remaining child or fails clearly (never KeyError).
+            primary_supp = copy.deepcopy(seeded_with_supp)
+            primary_supp['families'] = [{'id': 'transport', 'primary': 'incoming_connections',
+                                         'primary_series': 'total', 'children': ['circuit_rejections', 'incoming_connections', 'open_connections']}]
+            ps_cache = collector.ObservationCache(root / 'subset_primary.sqlite3', subset_src, subset_queries)
+            try:
+                ps_data = collector.Collector(subset_src, ps_cache, subset_queries, subset_routes, primary_supp).collect(END, 'a' * 64)
+            finally:
+                ps_cache.close()
+            self.assertEqual(ps_data['families'][0]['primary'], 'circuit_rejections')
+            self.assertEqual(ps_data['families'][0]['children'], ['circuit_rejections'])
+            self.assertGreater(
+                collector._plan_max_requests(subset_routes, subset_queries, primary_supp, END, warm_end=None, baseline_end=END),
+                0,
+            )
+
+            solo_supp = copy.deepcopy(seeded_with_supp)
+            solo_supp['families'] = [{'id': 'transport', 'primary': 'incoming_connections', 'children': ['incoming_connections']}]
+            with self.assertRaisesRegex(collector.CollectionError, 'Missing required routes for primary chart'):
+                collector._ensure_supplemental_charts(solo_supp, subset_routes)
+
 
 if __name__ == '__main__':
     unittest.main()
