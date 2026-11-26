@@ -1855,7 +1855,10 @@ const heroHtml=heroDefault.page.innerHTML;
 const heroSectionPos=heroHtml.indexOf('<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="7d">');
 const toolbarPos=heroHtml.indexOf('<div class="overview-toolbar">');
 assert.ok(heroSectionPos!==-1&&toolbarPos!==-1&&heroSectionPos<toolbarPos,'hero card leads overview above family toolbar');
-assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-range]').length,9);
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-range]').length,5);
+assert.deepEqual([...heroDefault.browser.document.querySelectorAll('[data-hero-range]')].map(b=>b.dataset.heroRange),['7d','1mo','6mo','12mo','all']);
+assert.equal(heroDefault.browser.document.querySelector('.hero-window-desktop'),null);
+assert.equal(heroDefault.browser.document.querySelector('.hero-window-mobile'),null);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-scale]').length,2);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-hsdir]').length,1);
 assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-panel]').length,2);
@@ -1867,8 +1870,10 @@ assert.match(heroHtml,/Last 7 days[\s\S]*7 × 24h[\s\S]*All time[\s\S]*548 × 24
 assert.equal(heroDefault.app.url('overview'),'?view=overview&range=1mo&layout=full&family=directory&chart=directory_requests',
  'default hero settings omit extra query parameters');
 click(heroDefault,'[data-hero-range]',{heroRange:'all'});
-assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel desktop-left');
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-panel]').length,1);
+assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="7d"]'),null);
 assert.equal(heroDefault.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel active desktop-right');
+assert.match(heroDefault.page.innerHTML,/class="hero-panels hero-panels-single"/);
 assert.equal(heroDefault.app.getState().heroRange,'all');
 assert.equal(heroDefault.app.getState().range,'1mo','hero All time toggle leaves 6-family 1mo range unchanged');
 assert.equal(heroDefault.browser.document.activeElement,heroDefault.browser.document.querySelector('[data-hero-range="all"]'));
@@ -1896,6 +1901,8 @@ assert.equal(heroDefault.app.getState().heroScale,'symlog');
 heroDefault.forward();
 assert.equal(heroDefault.app.getState().heroHsdir,true);
 click(heroDefault,'[data-hero-range]',{heroRange:'7d'});
+assert.equal(heroDefault.browser.document.querySelectorAll('[data-hero-panel]').length,2);
+assert.doesNotMatch(heroDefault.page.innerHTML,/hero-panels-single/);
 click(heroDefault,'[data-hero-scale]',{heroScale:'linear'});
 click(heroDefault,'[data-hero-hsdir]',{});
 assert.deepEqual([heroDefault.app.getState().heroRange,heroDefault.app.getState().heroScale,heroDefault.app.getState().heroHsdir],['7d','linear',false]);
@@ -1967,8 +1974,10 @@ assert.match(heroEmptyPlot.innerHTML,/No retained samples available/);
 assert.equal((heroEmptyPlot.innerHTML.match(/Source: 1aeo\.com - OnionSurge/g)||[]).length,1);
 
 for(const [dataset,urlQuery,plots] of [
- [v6Data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=1',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_7d"]','[data-hero-plot="concurrent_dos_all"]']],
- [data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=1',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_24h"]','[data-hero-plot="concurrent_dos_all"]']],
+ [v6Data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=1',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_all"]']],
+ [data,'?view=overview&hero_range=all&hero_scale=symlog&hero_hsdir=1',['[data-hero-range="all"]','[data-hero-scale="symlog"]','[data-hero-hsdir]','[data-hero-plot="concurrent_dos_all"]']],
+ [v6Data,'?view=overview&hero_range=7d&hero_scale=symlog&hero_hsdir=1',['[data-hero-plot="concurrent_dos_7d"]','[data-hero-plot="concurrent_dos_all"]']],
+ [data,'?view=overview&hero_range=24h&hero_scale=symlog&hero_hsdir=1',['[data-hero-plot="concurrent_dos_24h"]','[data-hero-plot="concurrent_dos_all"]']],
 ]){
  for(const selector of plots){
   const heroLive=application(urlQuery,dataset,'1',releaseContext(dataset,'hero-old',()=>dataset.end));
@@ -2185,12 +2194,11 @@ for(const [base,mob] of [['.hero-card { margin-bottom: 26px','.hero-card { margi
 }
 const desktopMedia=cssText.match(/@media\(min-width:1000px\)\s*\{[\s\S]*?\n\}/)?.[0]||'';
 assert.match(cssText,/\.hero-panel \{ display: none;/);
-assert.match(cssText,/\.hero-window-desktop \{ display: none;/);
+assert.doesNotMatch(cssText,/\.hero-window-(desktop|mobile)/);
 assert.match(desktopMedia,/\.hero-panels \{ display: grid;/);
+assert.match(desktopMedia,/\.hero-panels\.hero-panels-single \{ grid-template-columns: minmax\(0,1fr\); \}/);
 assert.match(desktopMedia,/\.hero-panel \{ display: none;/);
 assert.match(desktopMedia,/\.hero-panel\.desktop-left,\.hero-panel\.desktop-right \{ display: block;/);
-assert.match(desktopMedia,/\.hero-window-desktop \{ display: flex;/);
-assert.match(desktopMedia,/\.hero-window-mobile \{ display: none;/);
 {
  const savedSetTimeout=globalThis.setTimeout,queued=[];
  globalThis.setTimeout=(cb,ms)=>{queued.push([cb,ms]);return 0;};
@@ -2211,9 +2219,9 @@ assert.match(desktopMedia,/\.hero-window-mobile \{ display: none;/);
   globalThis.setTimeout=savedSetTimeout;
  }
 }
-assert.match(application('?view=methods',v6Data).app.markup(),/<b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, or <b>Last 12 months<\/b> \(selectable via <b>Window<\/b>\) alongside <b>All time<\/b> on desktop/);
+assert.match(application('?view=methods',v6Data).app.markup(),/offering the same five <b>Window<\/b> options \(<b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, <b>Last 12 months<\/b>, and <b>All time<\/b>\) on desktop and smaller screens/);
 assert.match(application('?view=methods',v6Data).app.markup(),/rank ≥90 with at least 20 reference days \(elevated, unless the high rule applies\)/);
-assert.match(application('?view=methods',data).app.markup(),/<b>Last 24 hours<\/b>, <b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, or <b>Last 12 months<\/b> \(selectable via <b>Window<\/b>\) alongside <b>All time<\/b> on desktop/);
+assert.match(application('?view=methods',data).app.markup(),/offering the same six <b>Window<\/b> options \(<b>Last 24 hours<\/b>, <b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, <b>Last 12 months<\/b>, and <b>All time<\/b>\) on desktop and smaller screens/);
 assert.match(application('?view=methods',data).app.markup(),/rank ≥90 with at least 20 reference windows \(elevated, unless the high rule applies\)/);
 
 const copiedQueries=[];
@@ -2634,7 +2642,10 @@ copyCtrl.app.start();
   v7Overview.app.start();
   assert.equal(v7Overview.app.getState().heroRange,'24h');
   assert.equal(v7Overview.app.getState().range,'24h');
-  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-range]').length,11);
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-range]').length,6);
+  assert.deepEqual([...v7Overview.browser.document.querySelectorAll('[data-hero-range]')].map(b=>b.dataset.heroRange),['24h','7d','1mo','6mo','12mo','all']);
+  assert.equal(v7Overview.browser.document.querySelector('.hero-window-desktop'),null);
+  assert.equal(v7Overview.browser.document.querySelector('.hero-window-mobile'),null);
   assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-panel]').length,2);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel active desktop-left');
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]'),null);
@@ -2647,31 +2658,40 @@ copyCtrl.app.start();
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="7d"]').getAttribute('class'),'hero-panel active desktop-left');
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel desktop-right');
   click(v7Overview,'[data-hero-range]',{heroRange:'all'});
-  const desktopWinHtml=v7Overview.page.innerHTML.match(/hero-window-desktop"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
-  const mobileWinHtml=v7Overview.page.innerHTML.match(/hero-window-mobile"><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
-  assert.equal([...desktopWinHtml.matchAll(/<button /g)].length,5);
-  assert.equal([...mobileWinHtml.matchAll(/<button /g)].length,6);
-  assert.match(desktopWinHtml,/data-hero-range="24h" class="active" aria-pressed="true"/);
-  assert.match(desktopWinHtml,/data-hero-range="7d" class="" aria-pressed="false"/);
-  assert.match(desktopWinHtml,/data-hero-range="1mo" class="" aria-pressed="false"/);
-  assert.match(desktopWinHtml,/data-hero-range="6mo" class="" aria-pressed="false"/);
-  assert.match(desktopWinHtml,/data-hero-range="12mo" class="" aria-pressed="false"/);
-  assert.match(mobileWinHtml,/data-hero-range="all" class="active" aria-pressed="true"/);
-  assert.match(mobileWinHtml,/data-hero-range="24h" class="" aria-pressed="false"/);
-  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]').getAttribute('class'),'hero-panel desktop-left');
+  const unifiedWinHtml=v7Overview.page.innerHTML.match(/<div class="control-group"[^>]*><span>Window<\/span><div class="range-control"[^>]*>(.*?)<\/div><\/div>/)?.[1]||'';
+  assert.equal([...unifiedWinHtml.matchAll(/<button /g)].length,6);
+  assert.match(unifiedWinHtml,/data-hero-range="all" class="active" aria-pressed="true"/);
+  for(const inactiveId of ['24h','7d','1mo','6mo','12mo']){
+   assert.match(unifiedWinHtml,new RegExp(`data-hero-range="${inactiveId}" class="" aria-pressed="false"`));
+  }
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-panel]').length,1);
+  assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="24h"]'),null);
   assert.equal(v7Overview.browser.document.querySelector('[data-hero-panel="all"]').getAttribute('class'),'hero-panel active desktop-right');
+  assert.match(v7Overview.page.innerHTML,/class="hero-panels hero-panels-single"/);
+  assert.match(v7Overview.page.innerHTML,/Latest UTC day mitigated rate/);
+  assert.match(v7Overview.page.innerHTML,/Concurrent family alerts \(UTC day\)/);
+  assert.match(v7Overview.page.innerHTML,/Open circuits \(UTC day mean\)/);
+  assert.match(v7Overview.page.innerHTML,/Stalled BEGIN_DIR \(UTC day mean\)/);
+  assert.doesNotMatch(v7Overview.page.innerHTML,/Latest 1h mitigated rate/);
   click(v7Overview,'[data-hero-range]',{heroRange:'24h'});
-  // When hidden control precedes visible control, redrawControl restores focus to the visible one (offsetParent !== null).
+  assert.equal(v7Overview.browser.document.querySelectorAll('[data-hero-panel]').length,2);
+  assert.doesNotMatch(v7Overview.page.innerHTML,/hero-panels-single/);
+  // When a hidden control precedes a visible control, redrawControl restores focus to the visible one (offsetParent !== null).
   const visCtrl=application('?view=overview',v7NonMidnight);
   const origVisQSA=visCtrl.browser.document.querySelectorAll;
+  let hiddenFocused=false;
   visCtrl.browser.document.querySelectorAll=s=>{
    const out=origVisQSA(s);
-   if(s==='[data-hero-range="7d"]'&&out.length===2){out[0].offsetParent=null;out[1].offsetParent={};}
+   if(s==='[data-hero-range="7d"]'&&out.length===1){
+    out[0].offsetParent={};
+    return [{offsetParent:null,focus(){hiddenFocused=true;}},...out];
+   }
    return out;
   };
   visCtrl.app.start();
   click(visCtrl,'[data-hero-range]',{heroRange:'7d'});
-  assert.equal(visCtrl.browser.document.activeElement,origVisQSA('[data-hero-range="7d"]')[1],'focus skips hidden button (offsetParent===null)');
+  assert.equal(hiddenFocused,false,'focus skips leading hidden button (offsetParent===null)');
+  assert.equal(visCtrl.browser.document.activeElement,origVisQSA('[data-hero-range="7d"]')[0],'focus lands on visible button');
   assert.match(v7Overview.page.innerHTML,/Hourly UTC publication planned/);
   assert.match(v7Overview.page.innerHTML,/Latest 1h mitigated rate/);
   assert.match(application('?view=overview&hero_hsdir=1',v7NonMidnight).app.markup(),/Latest 1h mitigated &amp; flood rate/);
@@ -3191,6 +3211,8 @@ copyCtrl.app.start();
   chart('open_circuits',dualGaugeDoc).series[0].history.daily=chart('open_circuits',dualGaugeDoc).series[0].history.daily.map(([t],i)=>[t,i===0?128e6:12e6,240,1,true]);
   const dualGaugeHtml=application('?view=overview',dualGaugeDoc).app.markup();
   assert.match(dualGaugeHtml,/Open circuits \(100% = 18\.6M \(24h\) · 128M \(all-time\)\)/);
+  const allGaugeHtml=application('?view=overview&hero_range=all',dualGaugeDoc).app.markup();
+  assert.match(allGaugeHtml,/Open circuits \(128M peak\)/);
 
   // 4 & 5. Multi-chart card surfaces .card-alert-callout inside .card-context, prefixes .primary-label, and excludes hidden/gauge series from .child-strip.
   const hiddenPolluteDoc=makeAlertDataset(childHeroDoc,'day',['neutral','neutral','neutral','neutral','neutral','neutral']);
@@ -3311,7 +3333,9 @@ copyCtrl.app.start();
   assert.match(unvOvHtml,/Fleet builds<\/span><span class="fleet-strip-value">Unrecorded: 240<\/span>/);
   const unvFixesHtml=application('?view=fixes',allUnverifiedDoc).app.markup();
   assert.match(unvFixesHtml,/240 relays total · 240 unrecorded[\s\S]*?Version not recorded[\s\S]*?Unrecorded[\s\S]*?240/);
-  assert.match(application('?view=methods',v7NonMidnight).app.markup(),/selecting a daily window \(<b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, or <b>Last 12 months<\/b>\) updates Hero KPIs/);
+  const v7MethodsHtml=application('?view=methods',v7NonMidnight).app.markup();
+  assert.match(v7MethodsHtml,/offering the same six <b>Window<\/b> options/);
+  assert.match(v7MethodsHtml,/selecting any daily window \(<b>Last 7 days<\/b>, <b>Last 1 month<\/b>, <b>Last 6 months<\/b>, <b>Last 12 months<\/b>, or <b>All time<\/b>\) updates Hero KPIs/);
 
   // 12. Hero mitigated-rate % of peak, all-KPI percentiles (24h & 7d), apples-to-apples rateRank, gauge neutrality, and tooltip peak share.
   assert.ok(latestCss.includes('.hero-kpi-pct')&&latestCss.includes('.hero-kpi-pct-note'),
@@ -3533,6 +3557,8 @@ copyCtrl.app.start();
   const alertRangeDoc=makeAlertDataset(v7NonMidnight,'day',['high','neutral','neutral','neutral','neutral','neutral']);
   const alert1moHtml=application('?view=overview&hero_range=1mo',alertRangeDoc).app.markup();
   assert.match(alert1moHtml,/class="hero-alert-detail"[^>]*data-range="1mo"/);
+  const alertAllHtml=application('?view=overview&hero_range=all',alertRangeDoc).app.markup();
+  assert.match(alertAllHtml,/class="hero-alert-detail"[^>]*data-range="all"/);
   const customTrAlert=structuredClone(toV6Data(alertRangeDoc));
   customTrAlert.time_ranges={
    version:1,default_range:'7d',legacy_aliases:{},card_slots:{fallback_dynamic:'7d',fixed:['6mo','all']},

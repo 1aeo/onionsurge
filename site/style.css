@@ -258,18 +258,16 @@ footer { margin: auto; border-top: 1px solid var(--edge); padding: 24px clamp(16
 .hero-panel { display: none; min-width: 0; }
 .hero-panel.active { display: block; }
 .hero-panel-head { display: none; }
-.hero-window-desktop { display: none; }
 @media(min-width:1000px) {
   .chart-grid,.hero-panels { grid-template-columns: repeat(2,minmax(0,1fr)); }
   .hero-panels { display: grid; gap: 16px; }
+  .hero-panels.hero-panels-single { grid-template-columns: minmax(0,1fr); }
   .hero-panel { display: none; }
   .hero-panel.desktop-left,.hero-panel.desktop-right { display: block; }
   .hero-panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 8px; margin-bottom: 6px; font-size: 13px; color: var(--text); }
   .hero-panel-title small,.hero-panel-meta { font-size: 12px; color: var(--muted); font-weight: normal; font-variant-numeric: tabular-nums; }
   .hero-panel-meta { white-space: nowrap; }
   .hero-panel .hero-plot-wrap { border: 1px solid var(--edge); border-radius: 4px; padding: 6px 4px 2px; background: #141a1b; }
-  .hero-window-desktop { display: flex; }
-  .hero-window-mobile { display: none; }
 }
 @media(min-width:1200px) {
   .chart-full .chart-card .card-summary { display: grid; grid-template-columns: minmax(280px,.85fr) minmax(500px,1.15fr); gap: 40px; align-items: start; }
