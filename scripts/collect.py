@@ -24,7 +24,14 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 import query_protocol as access
-from coarsening import COARSENING_DESCRIPTION, coarsen_cohort_mapping, coarsen_count, coarsen_population_row, coarsen_value
+from coarsening import (
+    COARSENING_DESCRIPTION,
+    coarsen_cohort_mapping,
+    coarsen_count,
+    coarsen_partition,
+    coarsen_population_row,
+    coarsen_value,
+)
 from io_helpers import atomic_text, file_lock, filesystem_contains, parse_json as io_parse_json, read_regular_bytes, sha256_hex
 from population_statistics import METHOD as POPULATION_METHOD
 from query_gateway import VIRTUAL_QUERIES
@@ -68,6 +75,7 @@ _HOME_VAR_RE = re.compile(r'\$\{HOME\}|\$HOME(?![A-Za-z0-9_])')
 _POP_CODE_RE = re.compile(r'0|[1-9][0-9]?')
 _SLUG_SUB_RE = re.compile(r'[^a-z0-9]+')
 _ATTESTED_BUILD_RE = re.compile(r'attested-(?:[0-9]+_){3}[0-9]+')
+_TOR_VERSION_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
 
 
 class CollectionError(ValueError):
@@ -659,7 +667,8 @@ class Collector:
         approved = {(r['metric']['build_id'], r['metric']['sha256'])
                     for r in self.seed['versions'].get('binary_hash_counts', [])}
         raw_cohorts, descriptions = {}, {}
-        binary_keys, attested_keys = set(), set()
+        binary_keys, config_keys, attested_keys = set(), set(), set()
+        binary_raw, config_raw = {}, {}
         proofs = self.endpoint('version.attestation_proof_metadata', end)['data']['result']
         source_hashes, observed, proof_times = {}, {}, []
         for row in proofs:
@@ -675,15 +684,37 @@ class Collector:
                 observed.setdefault(build_id, []).append(t)
         for cohort, total in raw_totals.items():
             counts = defaultdict(int)
+            bin_counts = defaultdict(int)
+            cfg_counts = defaultdict(int)
             for row in self.endpoint(f'cohort.{cohort}_verified_binary', end)['data']['result']:
                 labels = row['metric']; build_id = labels.get('build_id')
                 if (build_id, labels.get('sha256')) not in approved or build_id not in originals:
                     continue
                 definition = originals[build_id]
                 key = ('patched_' if definition.get('patched') else 'stock_') + _SLUG_SUB_RE.sub('_', definition['version'].lower()).strip('_')
-                counts[key] += number(row['values'][0][1], True)
+                n = number(row['values'][0][1], True)
+                counts[key] += n
+                bin_counts[key] += n
                 binary_keys.add(key)
                 descriptions[key] = dict(definition, verification='Approved recorded binary hash matched a fresh process epoch.')
+            stock_op = f'cohort.{cohort}_stock_config'
+            if stock_op in self.routes:
+                for row in self.endpoint(stock_op, end)['data']['result']:
+                    version = row['metric'].get('tor_version', '')
+                    _require(_TOR_VERSION_RE.fullmatch(version), 'Unexpected public stock Tor version')
+                    n = number(row['values'][0][1], True)
+                    key = 'stock_' + _SLUG_SUB_RE.sub('_', version.lower()).strip('_')
+                    counts[key] += n
+                    cfg_counts[key] += n
+                    config_keys.add(key)
+                    if key not in descriptions:
+                        descriptions[key] = {
+                            'build_id': 'stock-' + version.replace('.', '_'),
+                            'version': version,
+                            'base_version': version,
+                            'patched': False,
+                            'verification': 'Live non-custom process version from Prometheus config inventory.',
+                        }
             for row in self.endpoint(f'cohort.{cohort}_attested', end)['data']['result']:
                 build_id = row['metric'].get('build_id', '')
                 _require(_ATTESTED_BUILD_RE.fullmatch(build_id) and build_id in observed, 'Unexpected public attested build')
@@ -697,12 +728,28 @@ class Collector:
             known = sum(counts.values())
             _require(known <= total, 'Runtime cohort exceeds its observed population')
             raw_cohorts[cohort] = dict(counts, runtime_unverified=total - known)
+            binary_raw[cohort] = dict(bin_counts)
+            config_raw[cohort] = dict(cfg_counts)
         _require(self.endpoint('version.attestation_proof_metadata', end)['data']['result'] == proofs,
                  'Runtime attestations changed during collection')
         keys = sorted({key for counts in raw_cohorts.values() for key in counts})
+        for key in keys:
+            if key == 'runtime_unverified' or key in attested_keys:
+                continue
+            has_bin = any(binary_raw[c].get(key, 0) > 0 for c in binary_raw)
+            has_cfg = any(config_raw[c].get(key, 0) > 0 for c in config_raw)
+            if has_bin and has_cfg:
+                descriptions[key]['verification'] = (
+                    'Approved recorded binary hash matched a fresh process epoch; '
+                    'additional stock relays from live Prometheus config inventory.'
+                )
+            elif has_bin:
+                descriptions[key]['verification'] = 'Approved recorded binary hash matched a fresh process epoch.'
+            elif key in config_keys:
+                descriptions[key]['verification'] = 'Live non-custom process version from Prometheus config inventory.'
         labels = {key: ('Version not recorded' if key == 'runtime_unverified' else
-                       ('Patched Tor ' if descriptions[key].get('patched') else 'Tor ')
-                       + descriptions[key]['version'] + (' (daemon version)' if key.startswith('attested_') else '')) for key in keys}
+                       ('Patched Tor ' if descriptions[key].get('patched') else 'Tor ') + descriptions[key]['version'])
+                  for key in keys}
         cohorts = {
             cohort: coarsen_cohort_mapping({key: raw_cohorts[cohort].get(key, 0) for key in keys}, target)
             for cohort, target in cohort_totals.items()
@@ -710,7 +757,11 @@ class Collector:
         native = cohorts['native']
         native_c = cohort_totals['native']
         verified_c = sum(native[k] for k in keys if k != 'runtime_unverified')
-        binary_hash_c = sum(native[k] for k in binary_keys if k in native)
+        binary_hash_c = sum(
+            coarsen_partition([binary_raw['native'].get(k, 0), config_raw['native'].get(k, 0)], native[k])[0]
+            for k in binary_keys
+            if native.get(k, 0) > 0
+        )
         attested_c = sum(native[k] for k in attested_keys if k in native)
         result = {'as_of': end, 'native_total': native_c, 'runtime_verified_total': verified_c,
                   'runtime_unverified_relays': native['runtime_unverified'], 'runtime_binary_hash_verified_total': binary_hash_c,
@@ -719,7 +770,7 @@ class Collector:
                   'metric_cohorts': cohorts, 'cohort_labels': labels}
         if 'binary_hash_counts' in self.seed['versions']:
             result['binary_hash_counts'] = copy.deepcopy(self.seed['versions']['binary_hash_counts'])
-        if proof_times:
+        if proof_times and attested_keys:
             result['runtime_resolution'] = {'observed_at': iso(min(proof_times)), 'resolved_relays': attested_c,
                 'matched_process_epochs': attested_c, 'snapshot_start': end - HOUR, 'snapshot_end': end, 'source_sha256': source_hashes}
         return result
@@ -1293,6 +1344,8 @@ def _plan_max_requests(routes, queries, seed, end, *, warm_end, baseline_end):
     fetch(proof_q, HOUR, [end])
     for cohort in COHORT_NAMES:
         fetch(routes[f'cohort.{cohort}_verified_binary'], HOUR, [end])
+        if f'cohort.{cohort}_stock_config' in routes:
+            fetch(routes[f'cohort.{cohort}_stock_config'], HOUR, [end])
         fetch(routes[f'cohort.{cohort}_attested'], HOUR, [end])
     fetch(proof_q, HOUR, [end])
     for key in METADATA_KEYS:

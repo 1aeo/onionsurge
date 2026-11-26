@@ -3222,7 +3222,7 @@ copyCtrl.app.start();
   const lowCovHtml=application('?view=explorer&chart=directory_rejections&range=7d',lowCovDoc).app.markup();
   assert.match(lowCovHtml,/Insufficient current coverage \(84\.6% · 920\/1,088 relays; ≥90% required\)/);
 
-  // 9. Fleet build classification distinguishes Patched, Stock, Daemon-attested, and Unverified summing cleanly to native_total.
+  // 9. Fleet build classification simplifies to version + count (patched vs stock only, optional Unrecorded when > 0), omitting legacy daemon labels.
   const fleetMixDoc=structuredClone(v7NonMidnight);
   fleetMixDoc.versions={
    ...fleetMixDoc.versions,
@@ -3234,15 +3234,37 @@ copyCtrl.app.start();
    ],
   };
   const fleetOvHtml=application('?view=overview',fleetMixDoc).app.markup();
-  assert.match(fleetOvHtml,/Patched 384 · Stock 392 · Attested 136 · Unverified 176/);
+  assert.match(fleetOvHtml,/0\.4\.9\.15 \+ tor41339\.9 \(patched\): 384 · 0\.4\.9\.15 \(stock\): 392 · 0\.4\.9\.17 \(stock\): 136 · Unrecorded: 176/);
+  assert.doesNotMatch(fleetOvHtml,/Attested|\(daemon\)/);
   const fleetFixesHtml=application('?view=fixes',fleetMixDoc).app.markup();
-  assert.match(fleetFixesHtml,/1,088 relays total · 912 verified · 176 unverified/);
-  assert.match(fleetFixesHtml,/0\.4\.9\.17[\s\S]*?Daemon-attested[\s\S]*?136/);
-  assert.match(fleetFixesHtml,/Version not recorded[\s\S]*?Unverified[\s\S]*?176/);
+  assert.match(fleetFixesHtml,/1,088 relays total · Patched 384 · Stock 528 · 176 unrecorded/);
+  assert.match(fleetFixesHtml,/<th>Tor version<\/th><th>Build<\/th><th>Relays<\/th>/);
+  assert.match(fleetFixesHtml,/0\.4\.9\.17[\s\S]*?Stock[\s\S]*?136/);
+  assert.match(fleetFixesHtml,/Version not recorded[\s\S]*?Unrecorded[\s\S]*?176/);
+  assert.doesNotMatch(fleetFixesHtml,/Daemon-attested|Attested|\(daemon\)/);
   assert.ok(fleetFixesHtml.indexOf('Current fleet build mix')<fleetFixesHtml.indexOf('22 Nov 2026 UTC'),
    'live build mix precedes static 22 Nov 2026 UTC known-issues timestamp');
   assert.ok(latestCss.includes('.callout-high')&&latestCss.includes('.percentile.short')&&latestCss.includes('.status-neutral'),
    'stylesheet defines callout, short-window comparison, and build-badge rules');
+
+  // Zero unrecorded omits Unrecorded everywhere, and legacy (daemon version) suffixes are stripped from chart footnotes.
+  const fullCovBuildsDoc=structuredClone(fleetMixDoc);
+  fullCovBuildsDoc.versions={
+   ...fullCovBuildsDoc.versions,
+   native_total:1152,runtime_verified_total:1152,runtime_unverified_relays:0,
+   verified_runtime:[
+    {build_id:'tor41339.9',version:'0.4.9.15 + tor41339.9',base_version:'0.4.9.15',patched:true,relays:392},
+    {build_id:'stock.15',version:'0.4.9.15',base_version:'0.4.9.15',patched:false,relays:392},
+    {build_id:'stock-0_4_9_17',version:'0.4.9.17',base_version:'0.4.9.17',patched:false,relays:368},
+   ],
+  };
+  chart('transport_rejections',fullCovBuildsDoc).builds='Tor 0.4.9.17 (daemon version): 88 relays';
+  const fullCovOvHtml=application('?view=overview',fullCovBuildsDoc).app.markup();
+  assert.match(fullCovOvHtml,/0\.4\.9\.15 \+ tor41339\.9 \(patched\): 392 · 0\.4\.9\.15 \(stock\): 392 · 0\.4\.9\.17 \(stock\): 368/);
+  assert.doesNotMatch(fullCovOvHtml,/Unrecorded|\(daemon version\)/);
+  const fullCovFixesHtml=application('?view=fixes',fullCovBuildsDoc).app.markup();
+  assert.match(fullCovFixesHtml,/1,152 relays total · Patched 392 · Stock 760\./);
+  assert.doesNotMatch(fullCovFixesHtml,/Version not recorded|Unrecorded|Daemon-attested|Attested/);
 
   // 10. Alert callout avoids 0th pct on flat-zero non-alerting hours, labels other primary-chart series honestly, and uses 24h on daily-only bundles.
   const flatHrCalloutDoc=makeAlertDataset(v7NonMidnight,'hour',['neutral','neutral','neutral','neutral','neutral','neutral']);
@@ -3273,9 +3295,9 @@ copyCtrl.app.start();
   const allUnverifiedDoc=structuredClone(v7NonMidnight);
   allUnverifiedDoc.versions={...allUnverifiedDoc.versions,native_total:240,runtime_verified_total:0,runtime_unverified_relays:240,verified_runtime:[]};
   const unvOvHtml=application('?view=overview',allUnverifiedDoc).app.markup();
-  assert.match(unvOvHtml,/Fleet builds<\/span><span class="fleet-strip-value">Unverified 240<\/span>/);
+  assert.match(unvOvHtml,/Fleet builds<\/span><span class="fleet-strip-value">Unrecorded: 240<\/span>/);
   const unvFixesHtml=application('?view=fixes',allUnverifiedDoc).app.markup();
-  assert.match(unvFixesHtml,/240 relays total · 0 verified · 240 unverified[\s\S]*?Version not recorded[\s\S]*?Unverified[\s\S]*?240/);
+  assert.match(unvFixesHtml,/240 relays total · 240 unrecorded[\s\S]*?Version not recorded[\s\S]*?Unrecorded[\s\S]*?240/);
   assert.match(application('?view=methods',v7NonMidnight).app.markup(),/selecting <b>Last 7 days<\/b> updates Hero KPIs/);
 
   // 12. Hero mitigated-rate % of peak, all-KPI percentiles (24h & 7d), apples-to-apples rateRank, gauge neutrality, and tooltip peak share.

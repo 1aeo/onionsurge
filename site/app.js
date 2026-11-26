@@ -774,7 +774,8 @@ function setView(v,r=range,f=familyId,c=chartId,focusSelector,sKey){
 }
 const redrawControl=selector=>{if(remember()){render();focusDestination(selector);}};
 function versions(c){
- const v=c.builds,text=typeof v==='string'?v:v?.display||v?.label||D.versions?.by_chart?.[c.id]?.display;
+ const v=c.builds,raw=typeof v==='string'?v:v?.display||v?.label||D.versions?.by_chart?.[c.id]?.display;
+ const text=typeof raw==='string'?raw.replace(/\s*\(daemon version\)/g,''):'';
  return text?escapeHtml(text):'Running version not recorded';
 }
 function snapshotText(){
@@ -1017,23 +1018,22 @@ function heroPlotLabel(r=heroRange,hasData=true,scaleMode=heroScale){
 }
 function summarizeFleetBuilds(){
  const rows=Array.isArray(D.versions?.verified_runtime)?D.versions.verified_runtime:[];
- const groups=new Map(),order={patched:0,stock:1,attested:2};
- let patchedRelays=0,stockRelays=0,attestedRelays=0;
+ const groups=new Map();
+ let patchedRelays=0,stockRelays=0;
  for(const item of rows){
   if(!item||typeof item.version!=='string'||!Number.isInteger(item.relays)||item.relays<=0)continue;
-  const buildClass=item.patched===true?'patched':item.patched===false?'stock':'attested';
-  if(buildClass==='patched')patchedRelays+=item.relays;
-  else if(buildClass==='stock')stockRelays+=item.relays;
-  else attestedRelays+=item.relays;
+  const isPatched=item.patched===true,buildClass=isPatched?'patched':'stock';
+  if(isPatched)patchedRelays+=item.relays;
+  else stockRelays+=item.relays;
   const key=`${buildClass}:${item.version}`;
   const prev=groups.get(key);
   const safeUrl=typeof item.source_url==='string'&&/^https:\/\//i.test(item.source_url)?item.source_url:null;
   const verNote=typeof item.verification==='string'?item.verification:'';
   if(prev){prev.relays+=item.relays;if(!prev.sourceUrl&&safeUrl)prev.sourceUrl=safeUrl;if(!prev.verification&&verNote)prev.verification=verNote;}
-  else groups.set(key,{version:item.version,buildClass,patched:buildClass==='patched',relays:item.relays,sourceUrl:safeUrl,verification:verNote});
+  else groups.set(key,{version:item.version,buildClass,patched:isPatched,relays:item.relays,sourceUrl:safeUrl,verification:verNote});
  }
- const list=[...groups.values()].sort((a,b)=>(order[a.buildClass]-order[b.buildClass])||(b.relays-a.relays)||a.version.localeCompare(b.version));
- return {list,patchedRelays,stockRelays,attestedRelays,nativeTotal:D.versions?.native_total,verifiedTotal:D.versions?.runtime_verified_total,unverifiedTotal:D.versions?.runtime_unverified_relays,asOf:D.versions?.as_of};
+ const list=[...groups.values()].sort((a,b)=>(b.patched-a.patched)||(b.relays-a.relays)||a.version.localeCompare(b.version));
+ return {list,patchedRelays,stockRelays,nativeTotal:D.versions?.native_total,verifiedTotal:D.versions?.runtime_verified_total,unverifiedTotal:D.versions?.runtime_unverified_relays,asOf:D.versions?.as_of};
 }
 function fleetOpsStrip(){
  const hasFlags=isPlainRecord(D.flags)&&Object.keys(D.flags).length>0;
@@ -1054,14 +1054,9 @@ function fleetOpsStrip(){
   }
  }
  if(hasBuildSummary){
-  const mixParts=[];
-  if(builds.patchedRelays)mixParts.push(`Patched ${count(builds.patchedRelays)}`);
-  if(builds.stockRelays)mixParts.push(`Stock ${count(builds.stockRelays)}`);
-  if(builds.attestedRelays)mixParts.push(`Attested ${count(builds.attestedRelays)}`);
-  if(Number.isInteger(builds.unverifiedTotal)&&builds.unverifiedTotal>0)mixParts.push(`Unverified ${count(builds.unverifiedTotal)}`);
-  const breakdown=builds.list.map(b=>`${escapeHtml(b.version)}${b.buildClass==='patched'?' (patched)':b.buildClass==='attested'?' (daemon)':''}: ${count(b.relays)}`).join(' · ');
-  const mix=mixParts.length?(breakdown?`${mixParts.join(' · ')} (${breakdown})`:mixParts.join(' · ')):breakdown;
-  chips.push(`<div class="fleet-strip-item"><span class="fleet-strip-label">Fleet builds</span><span class="fleet-strip-value">${mix}</span></div>`);
+  const items=builds.list.map(b=>`${escapeHtml(b.version)} (${b.patched?'patched':'stock'}): ${count(b.relays)}`);
+  if(Number.isInteger(builds.unverifiedTotal)&&builds.unverifiedTotal>0)items.push(`Unrecorded: ${count(builds.unverifiedTotal)}`);
+  chips.push(`<div class="fleet-strip-item"><span class="fleet-strip-label">Fleet builds</span><span class="fleet-strip-value">${items.join(' · ')}</span></div>`);
  }
  if(hasDircache){
   chips.push(`<div class="fleet-strip-item"><span class="fleet-strip-label">DirCache 0 cohort</span><span class="fleet-strip-value">${count(D.dircache_cohort.configured_nonexit_zero)} non-exit relays</span></div>`);
@@ -1304,17 +1299,18 @@ function fixes(){
  const unverified=Number.isInteger(builds.unverifiedTotal)&&builds.unverifiedTotal>0?builds.unverifiedTotal:0;
  const scopeBits=[];
  if(Number.isInteger(builds.nativeTotal))scopeBits.push(`${count(builds.nativeTotal)} relays total`);
- if(Number.isInteger(builds.verifiedTotal))scopeBits.push(unverified?`${count(builds.verifiedTotal)} verified · ${count(unverified)} unverified`:`${count(builds.verifiedTotal)} verified relays`);
- else if(unverified)scopeBits.push(`${count(unverified)} unverified`);
+ if(builds.patchedRelays)scopeBits.push(`Patched ${count(builds.patchedRelays)}`);
+ if(builds.stockRelays)scopeBits.push(`Stock ${count(builds.stockRelays)}`);
+ if(unverified)scopeBits.push(`${count(unverified)} unrecorded`);
  const badgeFor=b=>{
-  if(b.buildClass==='patched')return '<span class="status-badge status-released">Patched</span>';
-  if(b.buildClass==='stock')return '<span class="status-badge status-neutral">Stock</span>';
   const title=b.verification?` title="${escapeHtml(b.verification)}"`:'';
-  return `<span class="status-badge status-muted"${title}>Daemon-attested</span>`;
+  return b.patched
+   ?`<span class="status-badge status-released"${title}>Patched</span>`
+   :`<span class="status-badge status-neutral"${title}>Stock</span>`;
  };
- const unverifiedRow=unverified?`<tr><td>Version not recorded</td><td><span class="status-badge status-muted">Unverified</span></td><td>${count(unverified)}</td></tr>`:'';
+ const unverifiedRow=unverified?`<tr><td>Version not recorded</td><td><span class="status-badge status-muted">Unrecorded</span></td><td>${count(unverified)}</td></tr>`:'';
  const buildMix=(builds.list.length||unverified)
-  ?`<h3>Current fleet build mix</h3><p>${validTime(builds.asOf)?`Snapshot as of <b>${date(builds.asOf)} ${time(builds.asOf)} UTC</b>`:'Current runtime inventory'}${scopeBits.length?` · ${scopeBits.join(' · ')}`:''}.</p><div class="table-scroll"><table><thead><tr><th>Tor runtime build</th><th>Class</th><th>Relays</th></tr></thead><tbody>${builds.list.map(b=>`<tr><td>${b.sourceUrl?`<a href="${escapeHtml(b.sourceUrl)}" rel="noopener noreferrer">${escapeHtml(b.version)}</a>`:escapeHtml(b.version)}</td><td>${badgeFor(b)}</td><td>${count(b.relays)}</td></tr>`).join('')}${unverifiedRow}</tbody></table></div>`
+  ?`<h3>Current fleet build mix</h3><p>${validTime(builds.asOf)?`Snapshot as of <b>${date(builds.asOf)} ${time(builds.asOf)} UTC</b>`:'Current runtime inventory'}${scopeBits.length?` · ${scopeBits.join(' · ')}`:''}.</p><div class="table-scroll"><table><thead><tr><th>Tor version</th><th>Build</th><th>Relays</th></tr></thead><tbody>${builds.list.map(b=>`<tr><td>${b.sourceUrl?`<a href="${escapeHtml(b.sourceUrl)}" rel="noopener noreferrer">${escapeHtml(b.version)}</a>`:escapeHtml(b.version)}</td><td>${badgeFor(b)}</td><td>${count(b.relays)}</td></tr>`).join('')}${unverifiedRow}</tbody></table></div>`
   :'';
  const issueRows=TOR_FIXES.map(item=>`<tr><td>${escapeHtml(item.issue)}</td><td><span class="status-badge status-${item.statusClass}">${escapeHtml(item.status)}</span></td><td>${escapeHtml(item.release)}</td><td>${item.links.map(([label,href])=>`<a href="${escapeHtml(href)}" rel="noopener noreferrer">${escapeHtml(label)}</a>`).join(' · ')}</td></tr>`).join('');
  return `<section class="text-page"><h2 data-view-heading tabindex="-1">Tor fixes &amp; open issues</h2>${buildMix}<h3>Known issues &amp; upstream fixes</h3><p>Read-only status snapshot · 22 Nov 2026 UTC.</p><div class="table-scroll"><table><thead><tr><th>Issue or change</th><th>Status</th><th>Tor release</th><th>Source</th></tr></thead><tbody>${issueRows}</tbody></table></div></section>`;

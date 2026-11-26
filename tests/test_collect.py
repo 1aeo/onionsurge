@@ -138,6 +138,8 @@ class CollectorFixture:
                 ('tor41339.9', 'b' * 64, 16)] if cohort == 'custom' else [('stock.15', 'a' * 64, 24)]
             handlers[self.routes[f'cohort.{cohort}_verified_binary']] = lambda t, managed=managed: [
                 ({'build_id': build, 'sha256': sha}, n) for build, sha, n in managed]
+            if f'cohort.{cohort}_stock_config' in self.routes:
+                handlers[self.routes[f'cohort.{cohort}_stock_config']] = lambda t: []
             handlers[self.routes[f'cohort.{cohort}_attested']] = lambda t, cohort=cohort: [
                 ({'build_id': 'attested-0_4_9_17'}, 8)] if self.attested and cohort != 'custom' else []
         handlers[self.routes['version.attestation_proof_metadata']] = lambda t: [
@@ -234,6 +236,8 @@ def _snapshot_handlers(seed, routes, *, live_native=None, rate_val=2.0):
     handlers[routes['metadata.up']] = lambda t: [({}, native_pop)]
     for cohort in ('native', 'custom', 'directory_defense'):
         handlers[routes[f'cohort.{cohort}_verified_binary']] = lambda t: []
+        if f'cohort.{cohort}_stock_config' in routes:
+            handlers[routes[f'cohort.{cohort}_stock_config']] = lambda t: []
         handlers[routes[f'cohort.{cohort}_attested']] = lambda t: []
     for name in ('combined_zero_nonexit', 'observed_zero', 'file_fallback_zero', 'file0_observed1_conflicts'):
         handlers[routes['dircache.' + name]] = lambda t: [({}, 0)]
@@ -646,6 +650,113 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(worker.versions(END, totals, totals)['runtime_verified_total'], 56)
                 fixture.attested = False
                 self.assertEqual(worker.versions(END, totals, totals)['runtime_verified_total'], 48)
+            finally:
+                cache.close()
+
+    def test_live_stock_config_merges_versions_avoids_attested_double_count_and_rejects_bad_version(self):
+        # Case 1: verified_binary + merged stock_config + empty attested (all unmanaged stock covered by stock_config).
+        fixture = CollectorFixture()
+        fixture.source.handlers[fixture.routes['cohort.native_verified_binary']] = lambda t: [
+            ({'build_id': 'stock.15', 'sha256': 'a' * 64}, 16),
+            ({'build_id': 'tor41339.9', 'sha256': 'b' * 64}, 16),
+        ]
+        fixture.source.handlers[fixture.routes['cohort.native_stock_config']] = lambda t: [
+            ({'tor_version': '0.4.9.17'}, 32),
+            ({'tor_version': '0.4.9.15'}, 16),  # same version merges cleanly into stock_0_4_9_15
+        ]
+        fixture.source.handlers[fixture.routes['cohort.directory_defense_verified_binary']] = lambda t: [
+            ({'build_id': 'stock.15', 'sha256': 'a' * 64}, 16),
+        ]
+        fixture.source.handlers[fixture.routes['cohort.directory_defense_stock_config']] = lambda t: [
+            ({'tor_version': '0.4.9.17'}, 32),
+        ]
+        fixture.source.handlers[fixture.routes['cohort.native_attested']] = lambda t: []
+        fixture.source.handlers[fixture.routes['cohort.directory_defense_attested']] = lambda t: []
+        totals = {'native': 80, 'custom': 16, 'directory_defense': 48}
+        with tempfile.TemporaryDirectory() as folder:
+            worker, cache = fixture.instance(Path(folder) / 'stock.sqlite3')
+            try:
+                versions = worker.versions(END, totals, totals)
+            finally:
+                cache.close()
+        self.assertEqual(versions['runtime_verified_total'], 80)
+        self.assertEqual(versions['runtime_unverified_relays'], 0)
+        self.assertEqual(versions['runtime_binary_hash_verified_total'], 32)
+        self.assertNotIn('runtime_resolution', versions)
+        self.assertEqual(versions['cohort_labels'], {
+            'patched_0_4_9_15_tor41339_9': 'Patched Tor 0.4.9.15 + tor41339.9',
+            'runtime_unverified': 'Version not recorded',
+            'stock_0_4_9_15': 'Tor 0.4.9.15',
+            'stock_0_4_9_17': 'Tor 0.4.9.17',
+        })
+        by_key = {(r['version'], r.get('patched')): r for r in versions['verified_runtime']}
+        self.assertEqual(by_key[('0.4.9.17', False)]['relays'], 32)
+        self.assertEqual(by_key[('0.4.9.17', False)]['verification'],
+                         'Live non-custom process version from Prometheus config inventory.')
+        self.assertEqual(by_key[('0.4.9.15', False)]['relays'], 32)
+        self.assertEqual(by_key[('0.4.9.15', False)]['verification'],
+                         'Approved recorded binary hash matched a fresh process epoch; '
+                         'additional stock relays from live Prometheus config inventory.')
+        self.assertEqual(by_key[('0.4.9.15 + tor41339.9', True)]['relays'], 16)
+        self.assertEqual(len({r['build_id'] for r in versions['verified_runtime']}), len(versions['verified_runtime']))
+        for label in versions['cohort_labels'].values():
+            self.assertNotIn('(daemon version)', label)
+
+        # Case 2: partial stock_config + disjoint attested relays are preserved instead of dropped.
+        partial_fixture = CollectorFixture()
+        partial_fixture.source.handlers[partial_fixture.routes['cohort.native_verified_binary']] = lambda t: [
+            ({'build_id': 'stock.15', 'sha256': 'a' * 64}, 16),
+            ({'build_id': 'tor41339.9', 'sha256': 'b' * 64}, 16),
+        ]
+        partial_fixture.source.handlers[partial_fixture.routes['cohort.native_stock_config']] = lambda t: [
+            ({'tor_version': '0.4.9.16'}, 16),
+            ({'tor_version': '0.4.9.15'}, 16),
+        ]
+        partial_fixture.source.handlers[partial_fixture.routes['cohort.native_attested']] = lambda t: [
+            ({'build_id': 'attested-0_4_9_17'}, 16),
+        ]
+        partial_fixture.source.handlers[partial_fixture.routes['cohort.directory_defense_verified_binary']] = lambda t: [
+            ({'build_id': 'stock.15', 'sha256': 'a' * 64}, 16),
+        ]
+        partial_fixture.source.handlers[partial_fixture.routes['cohort.directory_defense_stock_config']] = lambda t: [
+            ({'tor_version': '0.4.9.16'}, 16),
+        ]
+        partial_fixture.source.handlers[partial_fixture.routes['cohort.directory_defense_attested']] = lambda t: [
+            ({'build_id': 'attested-0_4_9_17'}, 16),
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            worker, cache = partial_fixture.instance(Path(folder) / 'partial.sqlite3')
+            try:
+                partial_versions = worker.versions(END, totals, totals)
+            finally:
+                cache.close()
+        self.assertEqual(partial_versions['runtime_verified_total'], 80)
+        self.assertEqual(partial_versions['runtime_unverified_relays'], 0)
+        self.assertEqual(partial_versions['runtime_binary_hash_verified_total'], 32)
+        self.assertEqual(partial_versions['runtime_resolution']['resolved_relays'], 16)
+        self.assertEqual(partial_versions['runtime_resolution']['matched_process_epochs'], 16)
+        self.assertEqual(partial_versions['cohort_labels']['attested_0_4_9_17'], 'Tor 0.4.9.17')
+        partial_by_key = {(r['build_id'], r['version']): r for r in partial_versions['verified_runtime']}
+        self.assertEqual(partial_by_key[('attested-0_4_9_17', '0.4.9.17')]['relays'], 16)
+
+        # Invalid tor_version rejected at protocol validation (AccessError) and in Collector.versions (CollectionError).
+        bad_fixture = CollectorFixture()
+        bad_fixture.source.handlers[bad_fixture.routes['cohort.native_stock_config']] = lambda t: [
+            ({'tor_version': 'bad-version'}, 8),
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            worker, cache = bad_fixture.instance(Path(folder) / 'bad.sqlite3')
+            try:
+                with self.assertRaisesRegex(collector.access.AccessError, 'invalid_label_value'):
+                    worker.versions(END, totals, totals)
+                orig_endpoint = worker.endpoint
+                def bypassed_endpoint(name, ts):
+                    if name == 'cohort.native_stock_config':
+                        return {'data': {'result': [{'metric': {'tor_version': 'bad-version'}, 'values': [[ts, '8']]}]}}
+                    return orig_endpoint(name, ts)
+                with mock.patch.object(worker, 'endpoint', side_effect=bypassed_endpoint):
+                    with self.assertRaisesRegex(collector.CollectionError, 'Unexpected public stock Tor version'):
+                        worker.versions(END, totals, totals)
             finally:
                 cache.close()
 
