@@ -559,22 +559,34 @@ def _chart_routes_available(chart_id, routes):
 
 
 def _ensure_supplemental_charts(data, routes, added=None):
-    """Append missing supplemental charts and family memberships when routes are declared."""
+    """Append missing supplemental charts, series, and family memberships when routes are declared."""
     charts = data.setdefault('charts', [])
-    existing = {c['id'] for c in charts}
+    by_id = {c['id']: c for c in charts}
     families = data.get('families')
     by_family = {f.get('id'): f for f in families} if isinstance(families, list) else {}
     fleet = data.get('fleet', 0)
     expected_default = max(8, int(fleet) if isinstance(fleet, (int, float)) and not isinstance(fleet, bool) else 0)
+    empty_cur = {'value': None, 'relays': None, 'expected_relays': expected_default,
+                 'coverage': None, 'valid': False}
+
+    def _new_series(key, name, color):
+        return {
+            'key': key,
+            'name': name,
+            'color': color,
+            'history_status': 'queried',
+            'history': {'daily': [], 'sampled_hour': []},
+            'current': {'hour': dict(empty_cur), 'day': dict(empty_cur)},
+        }
+
     missing_routes_cids = set()
     for spec in SUPPLEMENTAL_CHART_SPECS:
         cid = spec['id']
         if not _chart_routes_available(cid, routes):
             missing_routes_cids.add(cid)
             continue
-        if cid not in existing:
-            empty_cur = {'value': None, 'relays': None, 'expected_relays': expected_default,
-                         'coverage': None, 'valid': False}
+        spec_keys = {k for k, _, _ in spec['series']}
+        if cid not in by_id:
             chart = {
                 'id': cid,
                 'family': spec['family'],
@@ -597,22 +609,32 @@ def _ensure_supplemental_charts(data, routes, added=None):
                 'relays': fleet,
                 'start': data.get('start'),
                 'end': data.get('end'),
-                'series': [
-                    {
-                        'key': key,
-                        'name': name,
-                        'color': color,
-                        'history_status': 'queried',
-                        'history': {'daily': [], 'sampled_hour': []},
-                        'current': {'hour': dict(empty_cur), 'day': dict(empty_cur)},
-                    }
-                    for key, name, color in spec['series']
-                ],
+                'series': [_new_series(key, name, color) for key, name, color in spec['series']],
             }
             charts.append(chart)
-            existing.add(cid)
+            by_id[cid] = chart
             if added is not None:
-                added.add(cid)
+                added[cid] = set(spec_keys)
+        else:
+            existing_chart = by_id[cid]
+            existing_by_key = {s['key']: s for s in existing_chart['series']}
+            restored = set()
+            for key, name, color in spec['series']:
+                if key not in existing_by_key:
+                    existing_by_key[key] = _new_series(key, name, color)
+                    restored.add(key)
+            if restored:
+                existing_chart['series'] = (
+                    [existing_by_key[k] for k, _, _ in spec['series'] if k in existing_by_key]
+                    + [s for s in existing_chart['series'] if s['key'] not in spec_keys]
+                )
+                existing_display = set(existing_chart.get('display_keys', []))
+                existing_chart['display_keys'] = (
+                    [k for k in spec['display_keys'] if k in existing_display or k in restored]
+                    + [k for k in existing_chart.get('display_keys', []) if k not in set(spec['display_keys'])]
+                )
+                if added is not None:
+                    added.setdefault(cid, set()).update(restored)
         family = by_family.get(spec['family_id'])
         if family is not None and isinstance(family.get('children'), list) and cid not in family['children']:
             family['children'].append(cid)
@@ -981,7 +1003,7 @@ class Collector:
         data.update(input_schema_version=4, start=end - DAY, end=end, window_seconds=HOUR,
                     minimum_samples=24, expected_samples=30, generated_at=iso(time.time()))
         data.setdefault('history_methods', {})['coarsening'] = COARSENING_DESCRIPTION
-        added_supplemental = set()
+        added_supplemental = {}
         _ensure_supplemental_charts(data, self.routes, added=added_supplemental)
         charts_by_id = {c['id']: c for c in data['charts']}
         raw_totals = {}
@@ -1152,10 +1174,11 @@ class Collector:
             dropped_cids = set()
             for chart in data['charts']:
                 cid = chart['id']
-                if cid in added_supplemental and family_primary.get(chart.get('family_id')) != cid:
+                added_keys = added_supplemental.get(cid)
+                if added_keys and family_primary.get(chart.get('family_id')) != cid:
                     observed = [
                         s for s in chart['series']
-                        if s['history'].get('daily') and s['history'].get('sampled_hour')
+                        if s['key'] not in added_keys or (s['history'].get('daily') and s['history'].get('sampled_hour'))
                     ]
                     obs_keys = {s['key'] for s in observed}
                     if not obs_keys or chart.get('primary_series') not in obs_keys:

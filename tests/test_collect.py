@@ -2470,6 +2470,50 @@ class CollectorTests(unittest.TestCase):
             collector.validate_snapshot(empty_collected)
             self.assertEqual(empty_collected['families'][0]['children'], ['transport_rejections'])
 
+            # Partial series in run 1 (total + accepted only, rejected absent) prunes rejected, then run 2 restores rejected once observed.
+            partial_handlers = copy.copy(handlers)
+            for qid_name in ('incoming_connections.daily.eligible', 'incoming_connections.daily.available',
+                             'incoming_connections.daily.value', 'incoming_connections.sampled_hour.eligible',
+                             'incoming_connections.sampled_hour.available', 'incoming_connections.sampled_hour.value',
+                             'incoming_connections.current_hour.eligible', 'incoming_connections.current_hour.available',
+                             'incoming_connections.current_hour.value', 'incoming_connections.current24.eligible',
+                             'incoming_connections.current24.available', 'incoming_connections.current24.value'):
+                qid = routes[qid_name]
+                orig = handlers[qid]
+                partial_handlers[qid] = lambda t, orig=orig: [
+                    (lbl, val) for lbl, val in orig(t) if lbl.get('state') != 'rejected'
+                ]
+            for pop_period in ('hour', 'day'):
+                pop_qid = routes[f'incoming_connections.relay_population.{pop_period}']
+                orig_pop = handlers[pop_qid]
+                partial_handlers[pop_qid] = lambda t, orig_pop=orig_pop: [
+                    (lbl, val) for lbl, val in orig_pop(t) if lbl.get('type') != 'rejected'
+                ]
+            partial_src = SyntheticSource(queries, partial_handlers)
+            partial_out1 = root / 'partial_out1.json'
+            collector.collect(cfg, app_dir, root / 'state_partial', partial_out1,
+                              end=target_end, source=partial_src, config_path=cfg_file)
+            snap1 = json.loads(partial_out1.read_text())
+            collector.validate_snapshot(snap1)
+            inc1 = next(c for c in snap1['charts'] if c['id'] == 'incoming_connections')
+            self.assertEqual([s['key'] for s in inc1['series']], ['total', 'accepted'])
+            self.assertEqual(inc1['display_keys'], ['total', 'accepted'])
+
+            # Second collection on next UTC day using snap1 as seed when rejected observations become available restores all 3 series.
+            (app_dir / 'inputs/snapshot.json').write_text(partial_out1.read_text())
+            restored_src = SyntheticSource(queries, handlers)
+            partial_out2 = root / 'partial_out2.json'
+            collector.collect(cfg, app_dir, root / 'state_partial', partial_out2,
+                              end=seed_end + DAY, source=restored_src, config_path=cfg_file)
+            snap2 = json.loads(partial_out2.read_text())
+            collector.validate_snapshot(snap2)
+            inc2 = next(c for c in snap2['charts'] if c['id'] == 'incoming_connections')
+            self.assertEqual([s['key'] for s in inc2['series']], ['total', 'accepted', 'rejected'])
+            self.assertEqual(inc2['display_keys'], ['total', 'accepted', 'rejected'])
+            rej2 = next(s for s in inc2['series'] if s['key'] == 'rejected')
+            self.assertTrue(rej2['history']['daily'])
+            self.assertTrue(rej2['history']['sampled_hour'])
+
         # If leading-null daily trim clears rows to [] (e.g., series started today), non-midnight still reads current24 while midnight stays within plan.
         def make_trimmed_fixture():
             fx = CollectorFixture()
