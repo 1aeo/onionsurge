@@ -1411,7 +1411,7 @@ function heroCard(){
  const rr=h?.rateRank;
  const compositeHasRef=!!(rr&&Number.isInteger(rr.n)&&rr.n>=20&&(rr.flatZero||isFiniteNumber(rr.rank)));
  const compositeState=compositeHasRef?alertStateFor(rr.rank,rr.n,rr.flatZero):'neutral';
- const familyHighQualifies=hasHighAlert&&(!hasPeakData||maxPeakRatio>=0.25);
+ const familyHighQualifies=alerts.some(a=>a.state==='high'&&(!isFiniteNumber(a.row.peakRatio)||a.row.peakRatio>=0.25));
  const compositeHighQualifies=compositeState==='high'&&(!isFiniteNumber(compositePeakRatio)||compositePeakRatio>=0.25);
  let statusClass,statusLabel;
  if(!anyAlertMeasured&&total==null){
@@ -1423,7 +1423,8 @@ function heroCard(){
  }else if(alerts.length>0&&hasPeakData&&maxPeakRatio<0.05&&compositeState==='neutral'&&localizedElevatedCount<2){
   statusClass='status-localized';statusLabel='Localized activity';
  }else if(familyHighQualifies||compositeHighQualifies){
-  const severe=maxPeakRatio>=0.50||(isFiniteNumber(compositePeakRatio)&&compositePeakRatio>=0.50)||severeHighCount>=2;
+  const hasSevereHighAlert=alerts.some(a=>a.state==='high'&&isFiniteNumber(a.row.peakRatio)&&a.row.peakRatio>=0.50);
+  const severe=hasSevereHighAlert||(isFiniteNumber(compositePeakRatio)&&compositePeakRatio>=0.50)||severeHighCount>=2;
   statusClass='status-high';statusLabel=severe?'Severe surge':'Active surge';
  }else{
   statusClass='status-elevated';statusLabel='Elevated flood activity';

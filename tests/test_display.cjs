@@ -4000,6 +4000,30 @@ copyCtrl.app.start();
   chart('circuit_rejections',compHighActiveDoc).series[0].history.sampled_hour[118][1]=900;
   assert.match(application('?view=overview',compHighActiveDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Active surge<\/span>/);
 
+  const high10Elevated30Doc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':100,'circuit_rejections:circuit_rejections':300,'introduction_rejections:introduction_rejections':0},
+   ratePeaks:{'transport_rejections:conn_rejected':1000,'circuit_rejections:circuit_rejections':1000},
+   rateBaselineVals:{'introduction_rejections:introduction_rejections':Array.from({length:120},()=>500)},
+   rateRefs:{
+    'transport_rejections:conn_rejected':{n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+    'circuit_rejections:circuit_rejections':{n:120,current_percentile:93,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+   },
+  });
+  assert.match(application('?view=overview',high10Elevated30Doc).app.markup(),/class="hero-status-banner status-elevated"[\s\S]*>Elevated flood activity<\/span>/);
+
+  const high30Elevated55Doc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':300,'circuit_rejections:circuit_rejections':550},
+   ratePeaks:{'transport_rejections:conn_rejected':1000,'circuit_rejections:circuit_rejections':1000},
+   rateBaselineVals:{
+    'circuit_rejections:circuit_rejections':Array.from({length:120},(_,k)=>k===118?2000:5),
+   },
+   rateRefs:{
+    'transport_rejections:conn_rejected':{n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+    'circuit_rejections:circuit_rejections':{n:120,current_percentile:93,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+   },
+  });
+  assert.match(application('?view=overview',high30Elevated55Doc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Active surge<\/span>/);
+
   // 15e. Unavailable status banner when no measurements exist, and "Alert status unavailable" when measured rates lack >=20 reference windows.
   assert.match(empty24Kpi,/class="hero-status-banner status-unknown"[\s\S]*>Unavailable<\/span>[\s\S]*no current flood-rate or family alert measurements are available/);
   for(const sparseN of [0,10]){
