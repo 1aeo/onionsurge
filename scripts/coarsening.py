@@ -18,7 +18,7 @@ DOS_THRESHOLD_SETTINGS = (
     ('dosconnectionmaxconcurrentcount', 'DoSConnectionMaxConcurrentCount', 'transport', 'connections/IP'),
     ('dosconnectionconnectrate', 'DoSConnectionConnectRate', 'transport', 'connections/s'),
     ('dosconnectionconnectburst', 'DoSConnectionConnectBurst', 'transport', 'connections'),
-    ('dosconnectiondefensetimeperiod', 'DoSConnectionDefenseTimePeriod', 'transport', 'seconds'),
+    ('dosconnectiondefensetimeperiod', 'DoSConnectionConnectDefenseTimePeriod', 'transport', 'seconds'),
     ('doscircuitcreationenabled', 'DoSCircuitCreationEnabled', 'circuits', 'flag'),
     ('doscircuitcreationrate', 'DoSCircuitCreationRate', 'circuits', 'circuits/s'),
     ('doscircuitcreationburst', 'DoSCircuitCreationBurst', 'circuits', 'circuits'),
@@ -26,13 +26,55 @@ DOS_THRESHOLD_SETTINGS = (
     ('doscircuitcreationdefensetimeperiod', 'DoSCircuitCreationDefenseTimePeriod', 'circuits', 'seconds'),
     ('dos_num_circ_max_outq', 'dos_num_circ_max_outq', 'queues', 'circuits'),
     ('dosrefusesinglehopclientrendezvous', 'DoSRefuseSingleHopClientRendezvous', 'introduction', 'flag'),
+    ('dosbegindirlimitenabled', 'DoSBeginDirLimitEnabled', 'directory', 'flag'),
     ('dosbegindirrateenabled', 'DoSBeginDirRateEnabled', 'directory', 'mode'),
     ('dosbegindirrate', 'DoSBeginDirRate', 'directory', 'requests/s'),
     ('dosbegindirburst', 'DoSBeginDirBurst', 'directory', 'requests'),
     ('dosbegindirdefensetype', 'DoSBeginDirDefenseType', 'directory', 'mode'),
+    ('hsdironerequestpercircuit', 'HSDirOneRequestPerCircuit', 'directory', 'flag'),
 )
 DOS_EFFECTIVE_CONFIG_SETTINGS = DOS_THRESHOLD_SETTINGS[:12]
 DOS_BEGINDIR_CONFIG_SETTINGS = DOS_THRESHOLD_SETTINGS[12:]
+LEGACY_DOS_THRESHOLD_SETTINGS = (
+    *DOS_THRESHOLD_SETTINGS[:4],
+    ('dosconnectiondefensetimeperiod', 'DoSConnectionDefenseTimePeriod', 'transport', 'seconds'),
+    *DOS_THRESHOLD_SETTINGS[5:12],
+    *DOS_THRESHOLD_SETTINGS[13:17],
+)
+
+
+def migrate_legacy_dos_thresholds(dos_thresholds):
+    """Upgrade a valid 16-setting seed dos_thresholds block to the canonical 18-setting list."""
+    if not isinstance(dos_thresholds, dict):
+        return dos_thresholds
+    settings = dos_thresholds.get('settings')
+    if not isinstance(settings, list) or len(settings) != len(LEGACY_DOS_THRESHOLD_SETTINGS):
+        return dos_thresholds
+    if not all(
+        isinstance(item, dict)
+        and (item.get('key'), item.get('option'), item.get('family_id'), item.get('unit')) == expected
+        for expected, item in zip(LEGACY_DOS_THRESHOLD_SETTINGS, settings, strict=True)
+    ):
+        return dos_thresholds
+    by_key = {item['key']: item for item in settings}
+    migrated = []
+    for exp_key, exp_option, exp_family, exp_unit in DOS_THRESHOLD_SETTINGS:
+        prev = by_key.get(exp_key)
+        if prev is not None:
+            updated = dict(prev)
+            updated['option'] = exp_option
+            migrated.append(updated)
+        else:
+            migrated.append({
+                'key': exp_key,
+                'option': exp_option,
+                'family_id': exp_family,
+                'unit': exp_unit,
+                'relays': 0,
+                'values': [],
+                'suppressed_relays': 0,
+            })
+    return {**dos_thresholds, 'settings': migrated}
 COARSENING_DESCRIPTION = (
     'Deterministic dir-spec coarsening at snapshot boundaries: standalone public relay, flag, '
     'cohort and dircache_cohort counts <8 are floored to 0 and counts >=8 are rounded to the '

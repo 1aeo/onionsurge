@@ -34,6 +34,7 @@ from coarsening import (
     coarsen_population_row,
     coarsen_threshold_buckets,
     coarsen_value,
+    migrate_legacy_dos_thresholds,
 )
 from io_helpers import atomic_text, file_lock, filesystem_contains, parse_json as io_parse_json, read_regular_bytes, sha256_hex
 from population_statistics import METHOD as POPULATION_METHOD
@@ -129,6 +130,12 @@ _ATTESTED_BUILD_RE = re.compile(r'attested-(?:[0-9]+_){3}[0-9]+')
 _TOR_VERSION_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
 _DOS_DIGITS_RE = re.compile(r'[0-9]{1,8}\Z')
 _BEGINDIR_VAL_RE = re.compile(r'(?:auto|[0-9]{1,8})\Z')
+_BEGINDIR_POLICY_SOURCE_MAP = {
+    'configuration': 'torrc',
+    'consensus_parameter': 'consensus',
+    'binary_default_after_consensus': 'unset',
+    'binary_always_on': 'observed',
+}
 
 
 class CollectionError(ValueError):
@@ -974,10 +981,14 @@ class Collector:
             metric = row['metric']
             option = metric.get('option')
             val = metric.get('value')
+            raw_source = metric.get('source')
             _require(isinstance(option, str) and option in bg_buckets, 'Unexpected BeginDir config option')
             _require(isinstance(val, str) and _BEGINDIR_VAL_RE.fullmatch(val), 'Unexpected BeginDir config value')
+            _require(isinstance(raw_source, str) and raw_source in _BEGINDIR_POLICY_SOURCE_MAP,
+                     'Unexpected BeginDir config source')
+            mapped_source = _BEGINDIR_POLICY_SOURCE_MAP[raw_source]
             cnt = number(row['values'][0][1], count=True)
-            bg_buckets[option][(val, 'observed')] += cnt
+            bg_buckets[option][(val, mapped_source)] += cnt
             bg_raw_totals[option] += cnt
 
         settings = []
@@ -1710,6 +1721,8 @@ def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
                  'Collection end must be a completed UTC hour at or after the seed')
     seed_bytes = _read_bounded(seed_path, MAX_SEED_BYTES, private=private_seed)
     seed_obj = parse_json(seed_bytes)
+    if isinstance(seed_obj, dict) and 'dos_thresholds' in seed_obj:
+        seed_obj['dos_thresholds'] = migrate_legacy_dos_thresholds(seed_obj['dos_thresholds'])
     validate_snapshot(seed_obj, allow_v3_seed=True)
     if check_end:
         _require(seed_obj['end'] <= end,

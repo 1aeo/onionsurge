@@ -277,10 +277,14 @@ class QueryProtocolTests(unittest.TestCase):
             {'state': 'rejected'},
             {'state': 'opened'},
             {'state': 'total'},
-            {'option': 'DoSBeginDirRateEnabled', 'value': 'auto'},
-            {'option': 'DoSBeginDirRate', 'value': '10'},
-            {'option': 'DoSBeginDirBurst', 'value': '50'},
-            {'option': 'DoSBeginDirDefenseType', 'value': '12345678'},
+            {'option': 'DoSBeginDirLimitEnabled', 'source': 'consensus_parameter', 'value': '1'},
+            {'option': 'DoSBeginDirRateEnabled', 'source': 'binary_default_after_consensus', 'value': 'auto'},
+            {'option': 'DoSBeginDirRateEnabled', 'source': 'configuration', 'value': '0'},
+            {'option': 'DoSBeginDirRate', 'source': 'binary_default_after_consensus', 'value': '10'},
+            {'option': 'DoSBeginDirBurst', 'source': 'configuration', 'value': '60'},
+            {'option': 'DoSBeginDirDefenseType', 'source': 'consensus_parameter', 'value': '3'},
+            {'option': 'DoSBeginDirDefenseType', 'source': 'configuration', 'value': '12345678'},
+            {'option': 'HSDirOneRequestPerCircuit', 'source': 'binary_always_on', 'value': '1'},
             {'dosconnectionenabled': '1', 'dosconnectionenabled_source': 'consensus',
              'dosconnectionmaxconcurrentcount_source': 'unset',
              'dos_num_circ_max_outq': '4096', 'dos_num_circ_max_outq_source': 'torrc'},
@@ -296,6 +300,11 @@ class QueryProtocolTests(unittest.TestCase):
             {'state': 'created\n'},
             {'option': 'DoSConnectionEnabled'},
             {'option': 'DoSBeginDirRate\n'},
+            {'source': 'guessed'},
+            {'source': ''},
+            {'source': 'consensus'},
+            {'option': 'DoSBeginDirLimitEnabled', 'source': 'observed', 'value': '1'},
+            {'option': 'HSDirOneRequestPerCircuit', 'source': 'torrc', 'value': '1'},
             {'value': 'unset'},
             {'value': '123456789'},
             {'value': '-1'},
@@ -311,6 +320,12 @@ class QueryProtocolTests(unittest.TestCase):
                 {'metric': bad_labels, 'values': [[100, '8']]}]}}
             with self.subTest(bad_labels=bad_labels), self.assertRaisesRegex(access.AccessError, 'invalid_label_value'):
                 access.aggregate_response(payload, 100, 200, 100)
+
+        queries = access.load_json(ROOT / 'catalogue/queries.json')
+        begindir_q = queries['dos_begindir_config']
+        self.assertIn('tor41339_upstream_policy_value', begindir_q)
+        self.assertIn('HSDirOneRequestPerCircuit', begindir_q)
+        self.assertTrue(access.safe_aggregate(begindir_q))
 
         inc_q = builder.population_query(
             {'selector': 'm{job="tor_relays"}', 'label': 'state', 'strata': 2, 'total_strata': 4},

@@ -250,8 +250,16 @@ def _snapshot_handlers(seed, routes, *, live_native=None, rate_val=2.0):
             eff_labels[key] = '1'
         handlers[routes['dos.effective_config']] = lambda t, lbl=eff_labels: [(dict(lbl), native_pop)]
     if 'dos.begindir_config' in routes:
+        bg_defaults = {
+            'DoSBeginDirLimitEnabled': ('consensus_parameter', '1'),
+            'DoSBeginDirRateEnabled': ('binary_default_after_consensus', '1'),
+            'DoSBeginDirRate': ('configuration', '10'),
+            'DoSBeginDirBurst': ('binary_default_after_consensus', '60'),
+            'DoSBeginDirDefenseType': ('consensus_parameter', '3'),
+            'HSDirOneRequestPerCircuit': ('binary_always_on', '1'),
+        }
         handlers[routes['dos.begindir_config']] = lambda t: [
-            ({'option': opt, 'value': 'auto' if opt.endswith('Enabled') else '10'}, seed['defense'])
+            ({'option': opt, 'source': bg_defaults[opt][0], 'value': bg_defaults[opt][1]}, seed['defense'])
             for _, opt, _, _ in collector.DOS_BEGINDIR_CONFIG_SETTINGS
         ]
     return handlers
@@ -2647,14 +2655,17 @@ class CollectorTests(unittest.TestCase):
         ]
         # Total = 234 -> coarsen_count(234) = 232!
         handlers[routes['dos.begindir_config']] = lambda t: [
-            ({'option': 'DoSBeginDirRateEnabled', 'value': 'auto'}, 72),
-            ({'option': 'DoSBeginDirRateEnabled', 'value': '1'}, 5),
-            ({'option': 'DoSBeginDirRateEnabled', 'value': '0'}, 3),
-            ({'option': 'DoSBeginDirRate', 'value': '10'}, 64),
-            ({'option': 'DoSBeginDirRate', 'value': '20'}, 16),
+            ({'option': 'DoSBeginDirLimitEnabled', 'source': 'consensus_parameter', 'value': '1'}, 64),
+            ({'option': 'DoSBeginDirLimitEnabled', 'source': 'configuration', 'value': '0'}, 16),
+            ({'option': 'DoSBeginDirRateEnabled', 'source': 'binary_default_after_consensus', 'value': 'auto'}, 72),
+            ({'option': 'DoSBeginDirRateEnabled', 'source': 'configuration', 'value': '1'}, 5),
+            ({'option': 'DoSBeginDirRateEnabled', 'source': 'consensus_parameter', 'value': '0'}, 3),
+            ({'option': 'DoSBeginDirRate', 'source': 'binary_default_after_consensus', 'value': '10'}, 64),
+            ({'option': 'DoSBeginDirRate', 'source': 'configuration', 'value': '20'}, 16),
             # DoSBeginDirBurst omitted -> 0 relays, [], 0
-            ({'option': 'DoSBeginDirDefenseType', 'value': '2'}, 4),
-            ({'option': 'DoSBeginDirDefenseType', 'value': '1'}, 4),
+            ({'option': 'DoSBeginDirDefenseType', 'source': 'consensus_parameter', 'value': '2'}, 4),
+            ({'option': 'DoSBeginDirDefenseType', 'source': 'configuration', 'value': '1'}, 4),
+            ({'option': 'HSDirOneRequestPerCircuit', 'source': 'binary_always_on', 'value': '1'}, 80),
         ]
 
         with tempfile.TemporaryDirectory() as folder:
@@ -2671,7 +2682,9 @@ class CollectorTests(unittest.TestCase):
             dt = published['dos_thresholds']
             self.assertEqual(dt['as_of'], target_end)
             self.assertEqual(dt['reported_relays'], 232)
+            self.assertEqual(len(dt['settings']), 18)
             by_key = {s['key']: s for s in dt['settings']}
+            self.assertEqual(by_key['dosconnectiondefensetimeperiod']['option'], 'DoSConnectionConnectDefenseTimePeriod')
             self.assertEqual(by_key['dosconnectionenabled']['values'], [
                 {'value': '1', 'source': 'consensus', 'relays': 200},
                 {'value': '0', 'source': 'torrc', 'relays': 24},
@@ -2688,11 +2701,31 @@ class CollectorTests(unittest.TestCase):
                 {'value': '1', 'source': 'consensus', 'relays': 224},
             ])
             self.assertEqual(by_key['dos_num_circ_max_outq']['suppressed_relays'], 8)
+            self.assertEqual(by_key['dosbegindirlimitenabled'], {
+                'key': 'dosbegindirlimitenabled', 'option': 'DoSBeginDirLimitEnabled',
+                'family_id': 'directory', 'unit': 'flag',
+                'relays': 80,
+                'values': [
+                    {'value': '1', 'source': 'consensus', 'relays': 64},
+                    {'value': '0', 'source': 'torrc', 'relays': 16},
+                ],
+                'suppressed_relays': 0,
+            })
             self.assertEqual(by_key['dosbegindirrateenabled']['relays'], 80)
             self.assertEqual(by_key['dosbegindirrateenabled']['values'], [
-                {'value': 'auto', 'source': 'observed', 'relays': 72},
+                {'value': 'auto', 'source': 'unset', 'relays': 72},
             ])
             self.assertEqual(by_key['dosbegindirrateenabled']['suppressed_relays'], 8)
+            self.assertEqual(by_key['dosbegindirrate'], {
+                'key': 'dosbegindirrate', 'option': 'DoSBeginDirRate',
+                'family_id': 'directory', 'unit': 'requests/s',
+                'relays': 80,
+                'values': [
+                    {'value': '10', 'source': 'unset', 'relays': 64},
+                    {'value': '20', 'source': 'torrc', 'relays': 16},
+                ],
+                'suppressed_relays': 0,
+            })
             self.assertEqual(by_key['dosbegindirburst'], {
                 'key': 'dosbegindirburst', 'option': 'DoSBeginDirBurst',
                 'family_id': 'directory', 'unit': 'requests',
@@ -2702,6 +2735,13 @@ class CollectorTests(unittest.TestCase):
                 'key': 'dosbegindirdefensetype', 'option': 'DoSBeginDirDefenseType',
                 'family_id': 'directory', 'unit': 'mode',
                 'relays': 8, 'values': [], 'suppressed_relays': 8,
+            })
+            self.assertEqual(by_key['hsdironerequestpercircuit'], {
+                'key': 'hsdironerequestpercircuit', 'option': 'HSDirOneRequestPerCircuit',
+                'family_id': 'directory', 'unit': 'flag',
+                'relays': 80,
+                'values': [{'value': '1', 'source': 'observed', 'relays': 80}],
+                'suppressed_relays': 0,
             })
 
             # Verify hourly_archive stores and exports dos_thresholds.
@@ -2718,6 +2758,14 @@ class CollectorTests(unittest.TestCase):
             with self.assertRaisesRegex(collector.CollectionError, 'invalid_label_value'):
                 collector.collect(cfg, ROOT, root / 'bad_state', root / 'bad_out.json',
                                   end=target_end + HOUR, source=bad_src, config_path=cfg_file)
+            bad_bg_handlers = dict(handlers)
+            bad_bg_handlers[routes['dos.begindir_config']] = lambda t: [
+                ({'option': 'DoSBeginDirRate', 'source': 'guessed', 'value': '10'}, 16),
+            ]
+            bad_bg_src = SyntheticSource(queries, bad_bg_handlers)
+            with self.assertRaisesRegex(collector.CollectionError, 'invalid_label_value'):
+                collector.collect(cfg, ROOT, root / 'bad_bg_state', root / 'bad_bg_out.json',
+                                  end=target_end + HOUR, source=bad_bg_src, config_path=cfg_file)
             worker_fixture = CollectorFixture()
             worker, cache = worker_fixture.instance(root / 'direct.sqlite3')
             try:
@@ -2731,6 +2779,21 @@ class CollectorTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(collector.CollectionError, 'Unexpected DoS config value'):
                         worker.dos_thresholds(END, 80)
+                for bad_bg_metric in (
+                    {'option': 'DoSBeginDirRate', 'value': '10'},
+                    {'option': 'DoSBeginDirRate', 'source': 'consensus', 'value': '10'},
+                    {'option': 'DoSBeginDirRate', 'source': '', 'value': '10'},
+                ):
+                    with self.subTest(bad_bg_metric=bad_bg_metric), mock.patch.object(
+                        worker, 'endpoint',
+                        side_effect=lambda name, ts, m=bad_bg_metric: (
+                            {'data': {'result': [{'metric': m, 'values': [[ts, '16']]}]}}
+                            if name == 'dos.begindir_config'
+                            else {'data': {'result': []}}
+                        ),
+                    ):
+                        with self.assertRaisesRegex(collector.CollectionError, 'Unexpected BeginDir config source'):
+                            worker.dos_thresholds(END, 80)
             finally:
                 cache.close()
 
@@ -2783,6 +2846,90 @@ class CollectorTests(unittest.TestCase):
             solo_supp['families'] = [{'id': 'transport', 'primary': 'incoming_connections', 'children': ['incoming_connections']}]
             with self.assertRaisesRegex(collector.CollectionError, 'Missing required routes for primary chart'):
                 collector._ensure_supplemental_charts(solo_supp, subset_routes)
+
+            # Configured SOURCE_SEED_SNAPSHOT using the previous 16-setting schema (with
+            # DoSConnectionDefenseTimePeriod and without DoSBeginDirLimitEnabled / HSDirOneRequestPerCircuit)
+            # migrates cleanly on seed load during plan_collection & collect, while strict output
+            # validate_snapshot still rejects the 16-setting schema and current 18-setting seeds work.
+            legacy_settings = []
+            for s in dt['settings']:
+                if s['key'] in ('dosbegindirlimitenabled', 'hsdironerequestpercircuit'):
+                    continue
+                entry = copy.deepcopy(s)
+                if entry['key'] == 'dosconnectiondefensetimeperiod':
+                    entry['option'] = 'DoSConnectionDefenseTimePeriod'
+                legacy_settings.append(entry)
+            self.assertEqual(len(legacy_settings), 16)
+            legacy_dt = {
+                'as_of': seed_end,
+                'reported_relays': dt['reported_relays'],
+                'settings': legacy_settings,
+            }
+            legacy_seed = copy.deepcopy(base_v4)
+            legacy_seed['dos_thresholds'] = legacy_dt
+            with self.assertRaisesRegex(ValueError, 'canonical settings list'):
+                collector.validate_snapshot(legacy_seed)
+
+            legacy_seed_path = root / 'legacy_seed_16.json'
+            legacy_seed_path.write_text(json.dumps(legacy_seed))
+            legacy_seed_path.chmod(0o600)
+            legacy_cfg = dict(cfg, SOURCE_SEED_SNAPSHOT=str(legacy_seed_path))
+            legacy_cfg_file = root / 'legacy_source.env'
+            legacy_cfg_file.write_text('\n'.join(f'{k}={v}' for k, v in sorted(legacy_cfg.items())) + '\n')
+            legacy_cfg_file.chmod(0o600)
+            legacy_state = root / 'legacy_state'
+            legacy_out = root / 'legacy_out.json'
+            legacy_plan = collector.plan_collection(
+                legacy_cfg, ROOT, legacy_state, end=target_end, config_path=legacy_cfg_file,
+            )
+            self.assertEqual(legacy_plan['snapshot_end'], target_end)
+            legacy_src = SyntheticSource(queries, handlers)
+            collector.collect(
+                legacy_cfg, ROOT, legacy_state, legacy_out,
+                end=target_end, source=legacy_src, config_path=legacy_cfg_file,
+            )
+            legacy_published = json.loads(legacy_out.read_text())
+            collector.validate_snapshot(legacy_published)
+            self.assertEqual(len(legacy_published['dos_thresholds']['settings']), 18)
+
+            # Current 18-setting configured SOURCE_SEED_SNAPSHOT also passes plan_collection & collect.
+            current_seed = copy.deepcopy(base_v4)
+            current_seed['dos_thresholds'] = copy.deepcopy(dt)
+            current_seed['dos_thresholds']['as_of'] = seed_end
+            collector.validate_snapshot(current_seed)
+            current_seed_path = root / 'current_seed_18.json'
+            current_seed_path.write_text(json.dumps(current_seed))
+            current_seed_path.chmod(0o600)
+            current_cfg = dict(cfg, SOURCE_SEED_SNAPSHOT=str(current_seed_path))
+            current_cfg_file = root / 'current_source.env'
+            current_cfg_file.write_text('\n'.join(f'{k}={v}' for k, v in sorted(current_cfg.items())) + '\n')
+            current_cfg_file.chmod(0o600)
+            current_state = root / 'current_state'
+            current_out = root / 'current_out.json'
+            collector.plan_collection(
+                current_cfg, ROOT, current_state, end=target_end, config_path=current_cfg_file,
+            )
+            collector.collect(
+                current_cfg, ROOT, current_state, current_out,
+                end=target_end, source=SyntheticSource(queries, handlers), config_path=current_cfg_file,
+            )
+            collector.validate_snapshot(json.loads(current_out.read_text()))
+
+            # Malformed 16-setting seed (uncoarsened count / extra field) still fails validation after migration.
+            bad_legacy_seed = copy.deepcopy(legacy_seed)
+            bad_legacy_seed['dos_thresholds']['settings'][4]['relays'] = 7
+            bad_legacy_path = root / 'bad_legacy_seed_16.json'
+            bad_legacy_path.write_text(json.dumps(bad_legacy_seed))
+            bad_legacy_path.chmod(0o600)
+            bad_legacy_cfg = dict(cfg, SOURCE_SEED_SNAPSHOT=str(bad_legacy_path))
+            bad_legacy_cfg_file = root / 'bad_legacy_source.env'
+            bad_legacy_cfg_file.write_text('\n'.join(f'{k}={v}' for k, v in sorted(bad_legacy_cfg.items())) + '\n')
+            bad_legacy_cfg_file.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'coarsened DoS threshold relay'):
+                collector.plan_collection(
+                    bad_legacy_cfg, ROOT, root / 'bad_legacy_state',
+                    end=target_end, config_path=bad_legacy_cfg_file,
+                )
 
 
 if __name__ == '__main__':

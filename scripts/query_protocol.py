@@ -31,14 +31,15 @@ DOS_CONFIG_VALUE_LABELS = {
 }
 DOS_CONFIG_SOURCE_LABELS = {f'{k}_source' for k in DOS_CONFIG_VALUE_LABELS}
 LABELS = (
-    {'type', 'action', 'state', 'option', 'value', 'build_id', 'sha256', 'dircache', 'dircache_source', 'tor_version'}
+    {'type', 'action', 'state', 'option', 'source', 'value', 'build_id', 'sha256', 'dircache', 'dircache_source', 'tor_version'}
     | DOS_CONFIG_VALUE_LABELS
     | DOS_CONFIG_SOURCE_LABELS
 )
 NUMERIC_VALUE = re.compile(r'^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z')
 _TOR_VERSION_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
 _STATE_VALUES = frozenset({'created', 'rejected', 'opened', 'total'})
-_BEGINDIR_OPTION_RE = re.compile(r'DoSBeginDir(?:RateEnabled|Rate|Burst|DefenseType)\Z')
+_BEGINDIR_OPTION_RE = re.compile(r'(?:DoSBeginDir(?:LimitEnabled|RateEnabled|Rate|Burst|DefenseType)|HSDirOneRequestPerCircuit)\Z')
+_BEGINDIR_POLICY_SOURCES = frozenset({'configuration', 'consensus_parameter', 'binary_default_after_consensus', 'binary_always_on'})
 _BEGINDIR_VALUE_RE = re.compile(r'(?:auto|[0-9]{1,8})\Z')
 _DOS_CONFIG_VALUE_RE = re.compile(r'[0-9]{1,8}\Z')
 _DOS_CONFIG_SOURCE_VALUES = frozenset({'consensus', 'torrc', 'unset'})
@@ -314,6 +315,8 @@ def validate_matrix(payload, begin, end, step, *, max_series=512, max_points=MAX
             if 'state' in labels and labels['state'] not in _STATE_VALUES:
                 raise AccessError('invalid_label_value')
             if 'option' in labels and not _BEGINDIR_OPTION_RE.fullmatch(labels['option']):
+                raise AccessError('invalid_label_value')
+            if 'source' in labels and labels['source'] not in _BEGINDIR_POLICY_SOURCES:
                 raise AccessError('invalid_label_value')
             if 'value' in labels and not _BEGINDIR_VALUE_RE.fullmatch(labels['value']):
                 raise AccessError('invalid_label_value')
