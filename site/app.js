@@ -778,6 +778,26 @@ const TOR_FIXES=Object.freeze([
   ['Connection lists','https://gitlab.torproject.org/tpo/core/tor/-/commit/b035c0f5823313d83273d81856803da85b3023d9'],
  ]},
 ]);
+// Compiled Tor 0.4.9.x fallback defaults (src/core/or/dos.h & src/core/or/dos.c) used when unset in torrc and consensus.
+const TOR_DOS_DEFAULTS=Object.freeze({
+ dosconnectionenabled:Object.freeze({value:'0',note:'disabled'}),
+ dosconnectionmaxconcurrentcount:Object.freeze({value:'100'}),
+ dosconnectionconnectrate:Object.freeze({value:'20'}),
+ dosconnectionconnectburst:Object.freeze({value:'40'}),
+ dosconnectiondefensetimeperiod:Object.freeze({value:'86400',note:'24h',title:'Tor compiled default (unset in torrc and consensus): base 86,400s (24h); Tor adds a random 1s–12h delta per trigger.'}),
+ dosconnectionconnectdefensetimeperiod:Object.freeze({value:'86400',note:'24h',title:'Tor compiled default (unset in torrc and consensus): base 86,400s (24h); Tor adds a random 1s–12h delta per trigger.'}),
+ doscircuitcreationenabled:Object.freeze({value:'0',note:'disabled'}),
+ doscircuitcreationrate:Object.freeze({value:'3'}),
+ doscircuitcreationburst:Object.freeze({value:'90'}),
+ doscircuitcreationminconnections:Object.freeze({value:'3'}),
+ doscircuitcreationdefensetimeperiod:Object.freeze({value:'3600',note:'1h',title:'Tor compiled default (unset in torrc and consensus): base 3,600s (1h); Tor adds a random 1s–30m delta per trigger.'}),
+ dos_num_circ_max_outq:Object.freeze({value:'3'}),
+ dosrefusesinglehopclientrendezvous:Object.freeze({value:'0',note:'disabled'}),
+ dosbegindirrateenabled:Object.freeze({value:'1',note:'enabled',inherit:'auto'}),
+ dosbegindirrate:Object.freeze({value:'10',inherit:'0'}),
+ dosbegindirburst:Object.freeze({value:'60',inherit:'0'}),
+ dosbegindirdefensetype:Object.freeze({value:'3',note:'close circuit',inherit:'0'}),
+});
 
 function createObservatory(data,browser,initialRelease=null){
  validateDataGraph(data);
@@ -1177,7 +1197,33 @@ function heroThresholdsSection(h,is24h,isNonMidnightDay){
  const hasOptionB=hasComposite||fams.length>0;
  if(!dt&&!hasOptionB)return '';
  const unitChar=is24h?'h':'d';
- const fmtVal=(v,unit)=>v==='unset'?'Tor default (unset)':v==='auto'?'auto':(/^\d+$/.test(v)&&unit&&!/^(bool|boolean|flag|mode|enum|none|-|—)$/i.test(unit)?`${v} ${unit}`:v);
+ const showUnit=unit=>unit&&!/^(bool|boolean|flag|mode|enum|none|-|—)$/i.test(unit);
+ const fmtNum=(v,unit,commas=false)=>{const text=commas&&/^\d+$/.test(v)?count(Number(v)):v;return /^\d+$/.test(v)&&showUnit(unit)?`${text} ${unit}`:text;};
+ const torDefaultFor=item=>{const k=typeof item.key==='string'?item.key.toLowerCase():'',o=typeof item.option==='string'?item.option.toLowerCase():'';return Object.hasOwn(TOR_DOS_DEFAULTS,k)?TOR_DOS_DEFAULTS[k]:(Object.hasOwn(TOR_DOS_DEFAULTS,o)?TOR_DOS_DEFAULTS[o]:null);};
+ const fmtThresholdBucket=(b,item,split)=>{
+  const def=torDefaultFor(item);
+  if(b.value==='unset'){
+   if(def){
+    const valText=fmtNum(def.value,item.unit,true);
+    const srcLabel=b.source==='unset'?'Tor default':`${b.source} · Tor default`;
+    const parts=[];
+    if(def.note)parts.push(def.note);
+    parts.push(split?`${srcLabel}: ${count(b.relays)}`:srcLabel);
+    const titleAttr=def.title?` title="${escapeHtml(def.title)}"`:'';
+    return `${escapeHtml(valText)} <span class="threshold-source"${titleAttr}>(${escapeHtml(parts.join(' · '))})</span>`;
+   }
+   if(split)return `Tor default <span class="threshold-source">(${escapeHtml(b.source)}: ${count(b.relays)})</span>`;
+   return `Tor default (unset)`+(b.source!=='unset'?` <span class="threshold-source">(${escapeHtml(b.source)})</span>`:'');
+  }
+  if(b.source==='observed'&&def?.inherit&&b.value===def.inherit){
+   const defVal=fmtNum(def.value,item.unit,true);
+   const defDesc=def.note?`${defVal}, ${def.note}`:defVal;
+   const srcText=split?`(observed: ${count(b.relays)} · consensus / Tor default: ${defDesc})`:`(observed · consensus / Tor default: ${defDesc})`;
+   const titleText=`torrc is set to ${b.value}, which inherits the consensus parameter or Tor default (${defDesc}) when unset in consensus.`;
+   return `${escapeHtml(b.value)} <span class="threshold-source" title="${escapeHtml(titleText)}">${escapeHtml(srcText)}</span>`;
+  }
+  return `${escapeHtml(fmtNum(b.value,item.unit,false))} <span class="threshold-source">(${escapeHtml(b.source)}${split?`: ${count(b.relays)}`:''})</span>`;
+ };
  let optionAHtml='';
  if(dt){
   const groupedHtml=DOS_THRESHOLD_GROUPS.map(([title,famSet])=>{
@@ -1187,13 +1233,10 @@ function heroThresholdsSection(h,is24h,isNonMidnightDay){
     const vals=Array.isArray(item.values)?item.values:[],sup=Number.isInteger(item.suppressed_relays)&&item.suppressed_relays>0?item.suppressed_relays:0;
     const split=vals.length>1||sup>0;
     let valHtml;
-    if(split){
-     const parts=vals.map(b=>`${escapeHtml(fmtVal(b.value,item.unit))} <span class="threshold-source">(${escapeHtml(b.source)}: ${count(b.relays)})</span>`);
+    if(vals.length||sup){
+     const parts=vals.map(b=>fmtThresholdBucket(b,item,split));
      if(sup)parts.push(`<span class="threshold-source">+${count(sup)} other</span>`);
      valHtml=parts.join(' · ');
-    }else if(vals.length===1){
-     const b=vals[0];
-     valHtml=`${escapeHtml(fmtVal(b.value,item.unit))}`+(b.value!=='unset'||b.source!=='unset'?` <span class="threshold-source">(${escapeHtml(b.source)})</span>`:'');
     }else{
      valHtml='Unavailable';
     }
@@ -1992,7 +2035,7 @@ function startObservatory(browser){
 }
 
 if(typeof module!=='undefined'&&module.exports){
- module.exports={metricSelectorTokens,createObservatory,startObservatory,parseLocation,preparePlot,prepareHeroPlot,validateTimeRanges,LEGACY_V5_TIME_RANGES,HERO_RANGE_META,HERO_HOURLY_LEFT_RANGES,HERO_DAILY_LEFT_RANGES,isHeroRange,normalizeHeroRange,quantileSorted,calendarWindowStart,periodWindowStart,HOUR,DAY,RESERVED_JSON_KEYS,FORBIDDEN_HOURLY_KEYS,req,isPlainRecord,hasExactKeys,isFiniteNumber,number,ordinal,percentile,niceScale,axisNumber,xAxisTicks};
+ module.exports={metricSelectorTokens,createObservatory,startObservatory,parseLocation,preparePlot,prepareHeroPlot,validateTimeRanges,LEGACY_V5_TIME_RANGES,HERO_RANGE_META,HERO_HOURLY_LEFT_RANGES,HERO_DAILY_LEFT_RANGES,TOR_DOS_DEFAULTS,isHeroRange,normalizeHeroRange,quantileSorted,calendarWindowStart,periodWindowStart,HOUR,DAY,RESERVED_JSON_KEYS,FORBIDDEN_HOURLY_KEYS,req,isPlainRecord,hasExactKeys,isFiniteNumber,number,ordinal,percentile,niceScale,axisNumber,xAxisTicks};
 }else{
  if(document.documentElement.dataset.mode!=='live')startObservatory(window);
 }
