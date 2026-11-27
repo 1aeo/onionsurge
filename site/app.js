@@ -645,12 +645,13 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
  const families=familySpecs.map(fam=>({
   id:fam.id,icon:fam.icon,title:fam.title,primary:fam.primary,
   rows:times.map(t=>{
-   let bestSev=-1,bestRank=-Infinity,bestState='missing',bestN=0,bestSeries=null,bestChart=null,bestChartId=null,bestSeriesKey=null,bestValue=null,bestPeak=0,bestScale=1,alertCount=0;
+   let bestSev=-1,bestRank=-Infinity,bestState='missing',bestN=0,bestSeries=null,bestChart=null,bestChartId=null,bestSeriesKey=null,bestValue=null,bestPeak=0,bestScale=1,alertCount=0,hasAlertRef=false;
    for(const {c,s,idx,peak,scale} of fam.members){
     const ranked=rankSeriesAt(s,idx,t);
     if(!ranked)continue;
     hasAnyMeasured=true;notePop(t,ranked.pop);
     const {rank,n,flatZero}=ranked;
+    if(Number.isInteger(n)&&n>=20&&(flatZero||isFiniteNumber(rank)))hasAlertRef=true;
     const state=alertStateFor(rank,n,flatZero);
     if(state==='high'||state==='elevated')alertCount++;
     const sev=sevOrder[state],candRank=isFiniteNumber(rank)?rank:0;
@@ -662,10 +663,10 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
    }
    if(bestSev<0){
     hasMissingAlerts=true;
-    return {state:'missing',rank:null,n:0,seriesName:null,chartTitle:null,chartId:null,seriesKey:null,alertCount:0,value:null,peak:0,peakRatio:null,displayScale:1};
+    return {state:'missing',rank:null,n:0,hasAlertRef:false,seriesName:null,chartTitle:null,chartId:null,seriesKey:null,alertCount:0,value:null,peak:0,peakRatio:null,displayScale:1};
    }
    return {
-    state:bestState,rank:bestRank,n:bestN,seriesName:bestSeries,chartTitle:bestChart,chartId:bestChartId,seriesKey:bestSeriesKey,alertCount,
+    state:bestState,rank:bestRank,n:bestN,hasAlertRef,seriesName:bestSeries,chartTitle:bestChart,chartId:bestChartId,seriesKey:bestSeriesKey,alertCount,
     value:bestValue,peak:bestPeak,peakRatio:(bestValue!=null&&bestPeak>0?bestValue/bestPeak:null),displayScale:bestScale,
    };
   }),
@@ -838,7 +839,7 @@ function createObservatory(data,browser,initialRelease=null){
  let {view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN);
  const parseRequestedHeroRange=search=>{const reqHero=new URLSearchParams(search).get('hero_range');return isHeroRange(reqHero)?reqHero:null;};
  let requestedHeroRange=parseRequestedHeroRange(location.search);
- let plotCache=new WeakMap(),heroCache=new Map(),urlCache=null,lastHeaderH=null,touchPlot=null;
+ let plotCache=new WeakMap(),heroCache=new Map(),urlCache=null,lastHeaderH=null,touchPlot=null,thresholdsOpen=false;
  const plotMeta=new WeakMap(),copyTimers=new WeakMap(),copyRequests=new WeakMap();
 const chartCache=c=>{let cache=plotCache.get(c);if(!cache){cache=new Map();plotCache.set(c,cache);}return cache;};
 const shown=c=>{const cc=chartCache(c);let out=cc.get('shown');if(!out){out=c.series.filter(s=>c.display_keys.includes(s.key));cc.set('shown',out);}return out;};
@@ -913,9 +914,14 @@ function setView(v,r=range,f=familyId,c=chartId,focusSelector,sKey){
  if(chartId!==c||sKey!==undefined){seriesKey=sKey||null;bandEnabled=false;}
  view=v;familyId=f;chartId=c;range=r;
  if(!remember())return false;
+ if(view!=='overview')thresholdsOpen=false;
  render();closeNavigation();window.scrollTo?.(0,0);focusDestination(focusSelector);return true;
 }
-const redrawControl=selector=>{if(remember()){render();focusDestination(selector);}};
+const redrawControl=selector=>{
+ const curTh=view==='overview'?$('[data-hero-thresholds]'):null;
+ if(curTh)thresholdsOpen=typeof curTh.open==='boolean'?curTh.open:curTh.hasAttribute('open');
+ if(remember()){render();focusDestination(selector);}
+};
 function versions(c){
  const v=c.builds,raw=typeof v==='string'?v:v?.display||v?.label||D.versions?.by_chart?.[c.id]?.display;
  const text=typeof raw==='string'?raw.replace(/\s*\(daemon version\)/g,''):'';
@@ -945,7 +951,9 @@ function updateFreshness(status={}){
 }
 function replaceRelease(nextData,nextRelease){
  const appEl=$('#app');
- const before={D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,requestedHeroRange,plotCache,heroCache,html:appEl.innerHTML};
+ const curTh=view==='overview'?$('[data-hero-thresholds]'):null;
+ if(curTh)thresholdsOpen=typeof curTh.open==='boolean'?curTh.open:curTh.hasAttribute('open');
+ const before={D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,requestedHeroRange,thresholdsOpen,plotCache,heroCache,html:appEl.innerHTML};
  const active=document.activeElement,hadAppFocus=!!appEl.contains?.(active);
  const focus=hadAppFocus?FOCUS_ATTRS.filter(name=>active.hasAttribute(name)).map(name=>[name,active.getAttribute(name)]):[];
  const matchInApp=node=>(!appEl.contains||appEl.contains(node))&&focus.every(([key,value])=>node.getAttribute(key)===value);
@@ -976,7 +984,7 @@ function replaceRelease(nextData,nextRelease){
   if(seriesKey&&!chart(chartId).series.some(series=>series.key===seriesKey))seriesKey=null;
   render();restorePosition();
  }catch(error){
-  ({D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,requestedHeroRange,plotCache,heroCache}=before);
+  ({D,release,timeRanges,periodMap,charts,families,range,familyId,chartId,seriesKey,bandEnabled,heroRange,requestedHeroRange,thresholdsOpen,plotCache,heroCache}=before);
   try{render();}catch{appEl.innerHTML=before.html;}
   restorePosition();throw error;
  }
@@ -1341,7 +1349,7 @@ function heroThresholdsSection(h,is24h,isNonMidnightDay){
  if(alertCutParts.length)summaryGroups.push(`Alerts: ${alertCutParts.join(' · ')}`);
  const summaryLine=summaryGroups.join(' | ');
  const toggleText=dt?(dt.settings.length===1?'Details · 1 setting':`Details · ${count(dt.settings.length)} settings`):'Reference cutoffs';
- return `<details class="hero-thresholds" aria-label="DoS thresholds and reference rate percentiles"><summary class="hero-thresholds-summary"><span class="hero-thresholds-summary-label">Thresholds &amp; alert cutoffs</span>${summaryLine?`<span class="hero-thresholds-summary-line">${escapeHtml(summaryLine)}</span>`:''}<span class="hero-thresholds-summary-toggle">${escapeHtml(toggleText)}</span></summary><div class="hero-thresholds-grid${optionAHtml&&optionBHtml?'':' single-col'}">${optionAHtml}${optionBHtml}</div></details>`;
+ return `<details class="hero-thresholds" data-hero-thresholds${thresholdsOpen?' open':''} aria-label="DoS thresholds and reference rate percentiles"><summary class="hero-thresholds-summary" data-focus-key="hero-thresholds-summary"><span class="hero-thresholds-summary-label">Thresholds &amp; alert cutoffs</span>${summaryLine?`<span class="hero-thresholds-summary-line">${escapeHtml(summaryLine)}</span>`:''}<span class="hero-thresholds-summary-toggle">${escapeHtml(toggleText)}</span></summary><div class="hero-thresholds-grid${optionAHtml&&optionBHtml?'':' single-col'}">${optionAHtml}${optionBHtml}</div></details>`;
 }
 function heroCard(){
  const isHourly=isHourlyRelease(),isAll=heroRange==='all';
@@ -1362,10 +1370,11 @@ function heroCard(){
  const openConn=last>=0?h.openConnections?.values?.[last]??null:null;
  const openConnPeak=h?.openConnections?.rawPeak??0,openConnShare=peakShare(openConn,openConnPeak);
  const alerts=[];
- let anyAlertMeasured=false,hasHighAlert=false;
+ let anyAlertMeasured=false,anyAlertRef=false,hasHighAlert=false;
  if(last>=0)for(const f of h.families){
   const row=f.rows[last],st=row.state;
   if(st!=='missing')anyAlertMeasured=true;
+  if(row.hasAlertRef)anyAlertRef=true;
   if(st==='high'||st==='elevated'){alerts.push({f,state:st,row});if(st==='high')hasHighAlert=true;}
  }
  const refP=is24h?'hour':'day';
@@ -1396,18 +1405,25 @@ function heroCard(){
   :`${alertWindowLine}<div class="hero-kpi-meta">${anyAlertMeasured?'No qualifying family alerts':'No measured family series'}</div>`;
  const maxPeakRatio=alerts.length?Math.max(...alerts.map(a=>isFiniteNumber(a.row.peakRatio)?a.row.peakRatio:-1)):-1;
  const hasPeakData=alerts.some(a=>isFiniteNumber(a.row.peakRatio));
+ const localizedElevatedCount=alerts.filter(a=>isFiniteNumber(a.row.peakRatio)&&a.row.peakRatio>=0.02).length;
+ const severeHighCount=alerts.filter(a=>a.state==='high'&&isFiniteNumber(a.row.peakRatio)&&a.row.peakRatio>=0.25).length;
  const compositePeakRatio=ratePeak>0&&total!=null?total/ratePeak:null;
  const rr=h?.rateRank;
- const compositeState=rr&&Number.isInteger(rr.n)&&rr.n>=20?alertStateFor(rr.rank,rr.n,rr.flatZero):'neutral';
+ const compositeHasRef=!!(rr&&Number.isInteger(rr.n)&&rr.n>=20&&(rr.flatZero||isFiniteNumber(rr.rank)));
+ const compositeState=compositeHasRef?alertStateFor(rr.rank,rr.n,rr.flatZero):'neutral';
+ const familyHighQualifies=hasHighAlert&&(!hasPeakData||maxPeakRatio>=0.25);
+ const compositeHighQualifies=compositeState==='high'&&(!isFiniteNumber(compositePeakRatio)||compositePeakRatio>=0.25);
  let statusClass,statusLabel;
  if(!anyAlertMeasured&&total==null){
   statusClass='status-unknown';statusLabel='Unavailable';
+ }else if(!anyAlertRef&&!compositeHasRef){
+  statusClass='status-unknown';statusLabel='Alert status unavailable';
  }else if(alerts.length===0&&compositeState==='neutral'){
   statusClass='status-quiet';statusLabel='Quiet';
- }else if(alerts.length>0&&hasPeakData&&maxPeakRatio<0.05&&compositeState==='neutral'&&!(alerts.length>=2&&maxPeakRatio>=0.02)){
+ }else if(alerts.length>0&&hasPeakData&&maxPeakRatio<0.05&&compositeState==='neutral'&&localizedElevatedCount<2){
   statusClass='status-localized';statusLabel='Localized activity';
- }else if((hasHighAlert||compositeState==='high')&&(!hasPeakData||maxPeakRatio>=0.25)){
-  const severe=maxPeakRatio>=0.50||(isFiniteNumber(compositePeakRatio)&&compositePeakRatio>=0.50)||(alerts.length>=2&&hasHighAlert&&maxPeakRatio>=0.25);
+ }else if(familyHighQualifies||compositeHighQualifies){
+  const severe=maxPeakRatio>=0.50||(isFiniteNumber(compositePeakRatio)&&compositePeakRatio>=0.50)||severeHighCount>=2;
   statusClass='status-high';statusLabel=severe?'Severe surge':'Active surge';
  }else{
   statusClass='status-elevated';statusLabel='Elevated flood activity';
@@ -1430,9 +1446,13 @@ function heroCard(){
  const alertSummaryList=sortedBannerAlerts.map(formatBannerAlert).join(', ');
  let statusTextHtml;
  if(statusClass==='status-unknown'){
-  statusTextHtml=`${escapeHtml(statusWindowNoun)}: no current flood-rate or family alert measurements are available.`;
+  statusTextHtml=(!anyAlertMeasured&&total==null)
+   ?`${escapeHtml(statusWindowNoun)}: no current flood-rate or family alert measurements are available.`
+   :`${escapeHtml(statusWindowNoun)}: alert status unavailable (insufficient reference windows for ≥90th pct comparison); ${compositeRateName} is ${compositeContext}.`;
  }else if(statusClass==='status-quiet'){
-  statusTextHtml=`${escapeHtml(statusWindowNoun)}: no DoS alert families triggered (0 of ${count(activeFamilyCount)} ≥90th pct); ${compositeRateName} is ${compositeContext}.`;
+  statusTextHtml=anyAlertRef
+   ?`${escapeHtml(statusWindowNoun)}: no DoS alert families triggered (0 of ${count(activeFamilyCount)} ≥90th pct); ${compositeRateName} is ${compositeContext}.`
+   :`${escapeHtml(statusWindowNoun)}: ${compositeRateName} is within reference range (${compositeContext}); family alert comparisons are unavailable.`;
  }else if(alerts.length===0){
   const compPct=isFiniteNumber(rr?.rank)?`${formatPercentileOrdinal(rr.rank)} pct`:'elevated percentile';
   statusTextHtml=`${escapeHtml(statusWindowNoun)}: ${compositeRateName} reached ${escapeHtml(compPct)} (${compositeContext}), with no single family ≥90th pct.`;
@@ -1441,12 +1461,12 @@ function heroCard(){
   statusTextHtml=`${escapeHtml(statusWindowNoun)}: ${lead} ${alertSummaryList}; ${compositeRateName} is ${compositeContext}.`;
  }
  let subsidedHtml='';
- if(isHourly&&is24h&&anyAlertMeasured){
+ if(isHourly&&is24h){
   const alertingIds=new Set(alerts.map(a=>a.f.id));
-  const subsided=[];
+  const subsidedNormal=[],subsidedUnavail=[];
   for(const f of D.families){
    if(alertingIds.has(f.id))continue;
-   let hasDayAlert=false;
+   let hasDayAlert=false,allDayAlertsNormal1h=true;
    for(const cid of f.children||[]){
     const c=chart(cid);if(!c)continue;
     for(const s of c.series||[]){
@@ -1456,16 +1476,23 @@ function heroCard(){
      const flatZero=!!ref.flat_zero,rank=flatZero?0:ref.current_percentile;
      if(!flatZero&&(!isFiniteNumber(rank)||rank<0||rank>100))continue;
      const st=alertStateFor(rank,ref.n,flatZero);
-     if(st==='elevated'||st==='high'){hasDayAlert=true;break;}
+     if(st==='elevated'||st==='high'){
+      hasDayAlert=true;
+      const hrCur=s.current?.hour,hrVal=currentValue(s,c,'hour'),hrRef=s.reference?.hour;
+      const hrFlat=!!hrRef?.flat_zero,hrRank=hrFlat?0:hrRef?.current_percentile;
+      const hrUsableRef=!!(hrRef&&Number.isInteger(hrRef.n)&&hrRef.n>=20&&(hrFlat||(isFiniteNumber(hrRank)&&hrRank>=0&&hrRank<=100)));
+      const hrNormal=hrCur?.valid===true&&hrVal!==null&&hrUsableRef&&alertStateFor(hrRank,hrRef.n,hrFlat)==='neutral';
+      if(!hrNormal)allDayAlertsNormal1h=false;
+     }
     }
-    if(hasDayAlert)break;
    }
-   if(hasDayAlert)subsided.push(f);
+   if(hasDayAlert)(allDayAlertsNormal1h?subsidedNormal:subsidedUnavail).push(f);
   }
-  if(subsided.length){
-   const links=subsided.map(f=>`<a href="#family-${escapeHtml(encodeURIComponent(f.id))}" data-family-jump="${escapeHtml(f.id)}">${escapeHtml(f.title)}</a>`).join(', ');
-   subsidedHtml=`<div class="hero-status-subsided">Earlier in last 24h (normal in last 1h): ${links}</div>`;
-  }
+  const jumpList=list=>list.map(f=>`<a href="#family-${escapeHtml(encodeURIComponent(f.id))}" data-family-jump="${escapeHtml(f.id)}">${escapeHtml(f.title)}</a>`).join(', ');
+  const subsidedParts=[];
+  if(subsidedNormal.length)subsidedParts.push(`<div class="hero-status-subsided">24h alert (normal in last 1h): ${jumpList(subsidedNormal)}</div>`);
+  if(subsidedUnavail.length)subsidedParts.push(`<div class="hero-status-subsided">24h alert (1h comparison unavailable): ${jumpList(subsidedUnavail)}</div>`);
+  subsidedHtml=subsidedParts.join('');
  }
  const badgeTitle='Severity combines reference percentile rank with share of retained fleet peak (<5% localized, >=5% / multi-family elevated, >=25% high-pct surge; >=50% or multi-family high >=25% severe).';
  const statusBannerHtml=`<div class="hero-status-banner ${statusClass}" role="status" aria-label="Current flood status: ${escapeHtml(statusLabel)}"><span class="hero-status-badge" title="${escapeHtml(badgeTitle)}">${escapeHtml(statusLabel)}</span><div class="hero-status-body"><p class="hero-status-text">${statusTextHtml}</p>${subsidedHtml}</div></div>`;
@@ -1583,13 +1610,14 @@ function familyActiveAlerts(f,primaryChart,primarySeries){
   const cur=item.current?.[period],ref=item.reference?.[period],val=currentValue(item,ch,period);
   if(cur?.valid!==true||val===null){
    if(cur?.valid===false&&isFiniteNumber(cur.coverage)&&cur.coverage<0.9){
-    return {valid:false,state:'unknown',rank:null,shortText:`${coverageFormat.format(cleanZero(cur.coverage))} coverage (<90%)`,title:coverageUnavailableReason(cur)};
+    return {valid:false,hasComparison:false,state:'unknown',rank:null,shortText:`${coverageFormat.format(cleanZero(cur.coverage))} coverage (<90%)`,title:coverageUnavailableReason(cur)};
    }
-   return {valid:false,state:'unknown',rank:null,shortText:'unavailable',title:cur?.valid===false?coverageUnavailableReason(cur):''};
+   return {valid:false,hasComparison:false,state:'unknown',rank:null,shortText:'unavailable',title:cur?.valid===false?coverageUnavailableReason(cur):''};
   }
   const st=percentile(ref),state=alertStateFor(st.rank,ref?.n??0,ref?.flat_zero);
-  const pctText=isFiniteNumber(st.rank)?`${formatPercentileOrdinal(st.rank)} pct`:(ref?.flat_zero?'flat zero':'');
-  return {valid:true,state,rank:st.rank,valText:`${scaledText(ch,val)} ${headlineUnit(ch,item)}`,pctText};
+  const hasComparison=!!(ref&&Number.isInteger(ref.n)&&ref.n>=20&&(ref.flat_zero===true||isFiniteNumber(st.rank)));
+  const pctText=isFiniteNumber(st.rank)?`${formatPercentileOrdinal(st.rank)} pct`:(ref?.flat_zero?'flat zero':'percentile unavailable');
+  return {valid:true,hasComparison,state,rank:st.rank,valText:`${scaledText(ch,val)} ${headlineUnit(ch,item)}`,pctText};
  };
  for(const cid of f.children){
   const ch=chart(cid);if(!ch)continue;
@@ -1613,9 +1641,12 @@ function familyAlertCallout(f,c,s,r){
  const hasHigh=alerts.some(a=>a.maxSev>=2);
  const allChildCharts=alerts.every(a=>a.ch.id!==c.id);
  const anyHrHot=alerts.some(a=>a.hrHot),anyHrValid=alerts.some(a=>a.hr?.valid);
+ const allHrNormal=alerts.every(a=>a.hr?.valid&&a.hr.hasComparison&&a.hr.state==='neutral');
+ const someHrNormal=alerts.some(a=>a.hr?.valid&&a.hr.hasComparison&&a.hr.state==='neutral');
  const subsided=isHourlyRelease()&&!anyHrHot;
+ const hrSuffix=allHrNormal?'(normal in last 1h)':someHrNormal?'(last 1h partially unavailable)':anyHrValid?'(1h comparison unavailable)':'(last 1h unavailable)';
  const title=subsided
-  ?(allChildCharts?(alerts.length>1?'Recent 24h alerts in child charts':'Recent 24h alert in child chart'):(alerts.length>1?'Recent 24h alerts in other series':'Recent 24h alert in other series'))+' '+(anyHrValid?'(normal in last 1h)':'(last 1h unavailable)')
+  ?(allChildCharts?(alerts.length>1?'Recent 24h alerts in child charts':'Recent 24h alert in child chart'):(alerts.length>1?'Recent 24h alerts in other series':'Recent 24h alert in other series'))+' '+hrSuffix
   :(allChildCharts?(alerts.length>1?'Active alerts in child charts':'Active alert in child chart'):(alerts.length>1?'Active alerts in other series':'Active alert in other series'));
  const dayLbl=isHourlyRelease()&&validTime(D.end)&&D.end%DAY!==0?'Rolling 24h':'24h';
  const fallbackDaily=timeRanges.card_slots.fallback_dynamic||timeRanges.periods.find(p=>p.window.unit!=='hours')?.id||r;
@@ -1624,7 +1655,7 @@ function familyAlertCallout(f,c,s,r){
   const linkRange=hrHot&&periodMap.has('24h')?'24h':(isHourlyRelease()&&isHourRange(r)?fallbackDaily:r);
   const href=url('explorer',linkRange,f.id,ch.id,item.key);
   const chip=(lbl,win,extraTitle='')=>win.valid
-   ?`<span class="card-alert-chip chip-${win.state}">${lbl}: ${escapeHtml(win.valText)}${win.pctText?` (${escapeHtml(win.pctText)})`:''}</span>`
+   ?`<span class="card-alert-chip chip-${win.hasComparison?win.state:'unknown'}">${lbl}: ${escapeHtml(win.valText)}${win.pctText?` (${escapeHtml(win.pctText)})`:''}</span>`
    :`<span class="card-alert-chip chip-unknown"${win.title||extraTitle?` title="${escapeHtml(win.title||extraTitle)}"`:''}>${lbl}: ${escapeHtml(win.shortText)}</span>`;
   const chips=[hr?chip('1h',hr):'',chip(dayLbl,day)].filter(Boolean).join('');
   return `<li class="card-alert-item"><a class="card-alert-link" href="${href}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(ch.id)}" data-series="${escapeHtml(item.key)}" data-range="${escapeHtml(linkRange)}">${escapeHtml(label)} →</a><div class="card-alert-chips">${chips}</div></li>`;
@@ -2141,6 +2172,10 @@ document.addEventListener('change',e=>{
  const select=targetEl(e)?.closest('[data-series-select]');
  if(select&&chart(chartId)?.series.some(s=>s.key===select.value)){seriesKey=select.value;redrawControl('[data-series-select]');}
 });
+document.addEventListener('toggle',e=>{
+ const d=e.target;
+ if(d?.hasAttribute?.('data-hero-thresholds'))thresholdsOpen=typeof d.open==='boolean'?d.open:d.hasAttribute('open');
+},true);
 const plotNode=target=>target?.closest?.('[data-hero-plot]')||target?.closest?.('[data-chart-plot]')||null;
 document.addEventListener('keydown',e=>{
  if(e.key==='Escape'&&$('.nav-links')?.classList.contains('show')){e.preventDefault?.();closeNavigation();$('.nav-toggle')?.focus?.({preventScroll:true});return;}
@@ -2182,6 +2217,7 @@ for(const type of ['pointerout','focusout'])document.addEventListener(type,onPlo
 let resizeTimer;window.addEventListener('resize',()=>{updateHeaderOffset();clearTimeout(resizeTimer);resizeTimer=setTimeout(renderPlots,80);});
 window.addEventListener('popstate',()=>{
  ({view,range,layout,familyId,chartId,seriesKey,bandEnabled,heroRange,heroScale,heroHsdir}=parseLocation(D,location.search,location.hash,browser.DEFAULT_DESIGN));
+ if(view!=='overview')thresholdsOpen=false;
  requestedHeroRange=parseRequestedHeroRange(location.search);
  render();closeNavigation();
  const frag=scrollToFragment(),fragId=frag?.getAttribute?.('id')||'';

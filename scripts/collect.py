@@ -34,6 +34,7 @@ from coarsening import (
     coarsen_population_row,
     coarsen_threshold_buckets,
     coarsen_value,
+    migrate_legacy_dos_thresholds,
 )
 from io_helpers import atomic_text, file_lock, filesystem_contains, parse_json as io_parse_json, read_regular_bytes, sha256_hex
 from population_statistics import METHOD as POPULATION_METHOD
@@ -1720,6 +1721,8 @@ def _prepare_context(config, application_dir, state_dir, end=None, seed=None, *,
                  'Collection end must be a completed UTC hour at or after the seed')
     seed_bytes = _read_bounded(seed_path, MAX_SEED_BYTES, private=private_seed)
     seed_obj = parse_json(seed_bytes)
+    if isinstance(seed_obj, dict) and 'dos_thresholds' in seed_obj:
+        seed_obj['dos_thresholds'] = migrate_legacy_dos_thresholds(seed_obj['dos_thresholds'])
     validate_snapshot(seed_obj, allow_v3_seed=True)
     if check_end:
         _require(seed_obj['end'] <= end,

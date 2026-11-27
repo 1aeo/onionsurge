@@ -163,7 +163,7 @@ function renderedDocument(events, focusLog) {
           scrollIntoView() {},
           focus(options) {
             const control = ['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(tag);
-            const native = control || (tag === 'A' && attributes.has('href'));
+            const native = control || tag === 'SUMMARY' || (tag === 'A' && attributes.has('href'));
             const explicit = /^-?\d+$/.test(attributes.get('tabindex') ?? '');
             if (renderedGeneration !== generation || attributes.has('hidden') || attributes.has('inert')
                 || (control && attributes.has('disabled')) || (tag === 'INPUT' && attributes.get('type') === 'hidden')
@@ -3919,8 +3919,8 @@ copyCtrl.app.start();
   assert.equal(locCtrl.browser.location.hash,'#family-transport');
   assert.equal(locCtrl.browser.document.activeElement.getAttribute('id'),'family-transport');
 
-  // 15c. Elevated flood activity: (a) 2 families at >=2% (<5%) overrides localized even with neutral composite; (b) 99th pct at 10% (<25%) with neutral composite is elevated, not surge.
-  const multiSmallDoc=makeStatusDoc('hour',{
+  // 15c. Localized vs Elevated flood activity: (3%, 1%) stays Localized (only 1 family >=2%), (3%, 2%) is Elevated (2 families >=2%), and 10% at 99th pct is Elevated, not surge.
+  const oneAboveTwoDoc=makeStatusDoc('hour',{
    rateVals:{'transport_rejections:conn_rejected':30,'circuit_rejections:circuit_rejections':10,'introduction_rejections:introduction_rejections':0},
    ratePeaks:{'transport_rejections:conn_rejected':1000,'circuit_rejections:circuit_rejections':1000},
    rateBaselineVals:{
@@ -3931,7 +3931,12 @@ copyCtrl.app.start();
     'circuit_rejections:circuit_rejections':{n:120,current_percentile:93,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.1,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
    },
   });
-  assert.match(application('?view=overview',multiSmallDoc).app.markup(),/class="hero-status-banner status-elevated"[\s\S]*>Elevated flood activity<\/span>/);
+  assert.match(application('?view=overview',oneAboveTwoDoc).app.markup(),/class="hero-status-banner status-localized"[\s\S]*>Localized activity<\/span>/);
+
+  const twoAboveTwoDoc=structuredClone(oneAboveTwoDoc);
+  chart('circuit_rejections',twoAboveTwoDoc).series[0].values[23][1]=20;
+  chart('circuit_rejections',twoAboveTwoDoc).series[0].current.hour.value=20;
+  assert.match(application('?view=overview',twoAboveTwoDoc).app.markup(),/class="hero-status-banner status-elevated"[\s\S]*>Elevated flood activity<\/span>/);
 
   const highSmallPeakDoc=makeStatusDoc('hour',{
    rateVals:{'transport_rejections:conn_rejected':100,'introduction_rejections:introduction_rejections':0},
@@ -3941,7 +3946,7 @@ copyCtrl.app.start();
   });
   assert.match(application('?view=overview',highSmallPeakDoc).app.markup(),/class="hero-status-banner status-elevated"[\s\S]*>Elevated flood activity<\/span>/);
 
-  // 15d. Active surge (99th pct + >=25% & <50% peak) vs Severe surge (>=50% peak, or >=2 high alerts >=25%, or composite >=50%).
+  // 15d. Active surge (99th pct + >=25% & <50% peak) vs Severe surge (>=50% peak, or >=2 high alerts each >=25%, or composite high >=50% even when an unrelated family alert is <25%).
   const activeSurgeDoc=makeStatusDoc('hour',{
    rateVals:{'transport_rejections:conn_rejected':300},
    ratePeaks:{'transport_rejections:conn_rejected':1000},
@@ -3958,7 +3963,7 @@ copyCtrl.app.start();
   });
   assert.match(application('?view=overview',severeOneDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Severe surge<\/span>[\s\S]*Severe surge in <a class="hero-status-jump"[^>]*>Connection floods<\/a>/);
 
-  const severeMultiDoc=makeStatusDoc('hour',{
+  const oneHigh30TenDoc=makeStatusDoc('hour',{
    rateVals:{'transport_rejections:conn_rejected':300,'circuit_rejections:circuit_rejections':100},
    ratePeaks:{'transport_rejections:conn_rejected':1000,'circuit_rejections:circuit_rejections':1000},
    rateBaselineVals:{
@@ -3970,10 +3975,44 @@ copyCtrl.app.start();
     'circuit_rejections:circuit_rejections':{n:120,current_percentile:99.2,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
    },
   });
-  assert.match(application('?view=overview',severeMultiDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Severe surge<\/span>/);
+  assert.match(application('?view=overview',oneHigh30TenDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Active surge<\/span>/);
 
-  // 15e. Unavailable status banner when no alert series and no total rate are measured.
+  const twoHigh30TwentyFiveDoc=structuredClone(oneHigh30TenDoc);
+  chart('circuit_rejections',twoHigh30TwentyFiveDoc).series[0].values[23][1]=250;
+  chart('circuit_rejections',twoHigh30TwentyFiveDoc).series[0].current.hour.value=250;
+  assert.match(application('?view=overview',twoHigh30TwentyFiveDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Severe surge<\/span>/);
+
+  const compHighSevereDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':100,'circuit_rejections:circuit_rejections':200},
+   ratePeaks:{'transport_rejections:conn_rejected':1000,'circuit_rejections:circuit_rejections':1000},
+   rateBaselineVals:{
+    'transport_rejections:conn_rejected':Array.from({length:120},(_,k)=>k===118?100:10),
+    'circuit_rejections:circuit_rejections':Array.from({length:120},(_,k)=>k===118?500:5),
+   },
+   rateRefs:{
+    'transport_rejections:conn_rejected':{n:120,current_percentile:95,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+    'circuit_rejections:circuit_rejections':{n:120,current_percentile:50,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+   },
+  });
+  assert.match(application('?view=overview',compHighSevereDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Severe surge<\/span>/);
+
+  const compHighActiveDoc=structuredClone(compHighSevereDoc);
+  chart('circuit_rejections',compHighActiveDoc).series[0].history.sampled_hour[118][1]=900;
+  assert.match(application('?view=overview',compHighActiveDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Active surge<\/span>/);
+
+  // 15e. Unavailable status banner when no measurements exist, and "Alert status unavailable" when measured rates lack >=20 reference windows.
   assert.match(empty24Kpi,/class="hero-status-banner status-unknown"[\s\S]*>Unavailable<\/span>[\s\S]*no current flood-rate or family alert measurements are available/);
+  for(const sparseN of [0,10]){
+   const noRefDoc=makeStatusDoc('hour',{
+    rateVals:{'transport_rejections:conn_rejected':12},
+    ratePeaks:{'transport_rejections:conn_rejected':1200},
+    rateRankN:sparseN,
+   });
+   const noRefHtml=application('?view=overview',noRefDoc).app.markup();
+   assert.match(noRefHtml,/class="hero-status-banner status-unknown"[\s\S]*>Alert status unavailable<\/span>[\s\S]*alert status unavailable \(insufficient reference windows for ≥90th pct comparison\); composite mitigated rate is 12 events\/s \(100% of peak\)\./);
+   assert.doesNotMatch(noRefHtml,/Quiet|0 of 5 ≥90th pct/);
+   assert.match(noRefHtml,/Latest 1h mitigated rate<\/div><div class="hero-kpi-value neutral">12 <small>events\/s<\/small>/);
+  }
 
   // 15f. Queue-limit /h scaling in Hero alert bullet & status banner, plus graceful omission of (% of peak) when peak === 0.
   const queueAlertDoc=makeStatusDoc('hour',{
@@ -3995,23 +4034,57 @@ copyCtrl.app.start();
   assert.match(zeroPeakHtml,/class="hero-alert-detail"[^>]*>Connection-rate rule · 0\/s · 95th pct</);
   assert.doesNotMatch(zeroPeakHtml,/class="hero-alert-detail"[^>]*>[^<]*of peak/);
 
-  // 15g. Earlier in last 24h (normal in last 1h) subsided line on 24h view (and omitted on 7d).
+  // 15g. "24h alert (normal in last 1h)" vs per-series "24h alert (1h comparison unavailable)" on 24h view (and omitted on 7d).
   const subsidedBannerDoc=structuredClone(quietDoc);
   chart('directory_rejections',subsidedBannerDoc).series[0].current.day={value:20,relays:240,expected_relays:240,coverage:1,valid:true};
   chart('directory_rejections',subsidedBannerDoc).series[0].reference.day={n:120,current_percentile:96,flat_zero:false,mean_per_relay:0.05,p10_per_relay:0,p50_per_relay:0.02,p90_per_relay:0.05,start:subsidedBannerDoc.reference_window.start,end:subsidedBannerDoc.reference_window.end};
   chart('exit_stream_rejections',subsidedBannerDoc).series[0].current.day={value:5,relays:240,expected_relays:240,coverage:1,valid:true};
   chart('exit_stream_rejections',subsidedBannerDoc).series[0].reference.day={n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:subsidedBannerDoc.reference_window.start,end:subsidedBannerDoc.reference_window.end};
   const sub24Html=application('?view=overview',subsidedBannerDoc).app.markup();
-  assert.match(sub24Html,/class="hero-status-subsided">Earlier in last 24h \(normal in last 1h\): <a href="#family-directory" data-family-jump="directory">Directory floods<\/a>, <a href="#family-exit" data-family-jump="exit">Exit streams &amp; DNS<\/a><\/div>/);
+  assert.match(sub24Html,/class="hero-status-subsided">24h alert \(normal in last 1h\): <a href="#family-directory" data-family-jump="directory">Directory floods<\/a>, <a href="#family-exit" data-family-jump="exit">Exit streams &amp; DNS<\/a><\/div>/);
+  assert.doesNotMatch(sub24Html,/Earlier in last 24h/);
   assert.doesNotMatch(application('?view=overview&hero_range=7d',subsidedBannerDoc).app.markup(),/hero-status-subsided/);
 
-  // 15h. Collapsible <details class="hero-thresholds"> placed inside <figure> after .hero-panels, with 1-line summary + effective DoSBeginDir* / HSDirOneRequestPerCircuit / DoSConnectionConnectDefenseTimePeriod buckets.
+  const unavail1hSubBannerDoc=structuredClone(subsidedBannerDoc);
+  for(const s of chart('directory_rejections',unavail1hSubBannerDoc).series){
+   s.current.hour={value:null,relays:0,expected_relays:240,coverage:0,valid:false};
+  }
+  const unavail1hSubHtml=application('?view=overview',unavail1hSubBannerDoc).app.markup();
+  assert.match(unavail1hSubHtml,/class="hero-status-subsided">24h alert \(normal in last 1h\): <a href="#family-exit" data-family-jump="exit">Exit streams &amp; DNS<\/a><\/div>/);
+  assert.match(unavail1hSubHtml,/class="hero-status-subsided">24h alert \(1h comparison unavailable\): <a href="#family-directory" data-family-jump="directory">Directory floods<\/a><\/div>/);
+  const shortRef1hSubBannerDoc=structuredClone(subsidedBannerDoc);
+  for(const s of chart('directory_rejections',shortRef1hSubBannerDoc).series){
+   s.reference.hour={n:10,current_percentile:15,flat_zero:false,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:shortRef1hSubBannerDoc.reference_window.start,end:shortRef1hSubBannerDoc.reference_window.end};
+  }
+  assert.match(application('?view=overview',shortRef1hSubBannerDoc).app.markup(),/class="hero-status-subsided">24h alert \(1h comparison unavailable\): <a href="#family-directory" data-family-jump="directory">Directory floods<\/a><\/div>/);
+
+  // 15h. Collapsible <details class="hero-thresholds" data-hero-thresholds> placed inside <figure> after .hero-panels, closed on first visit, preserves open state & summary focus across redraws/replaceRelease, and resets on view switch.
   assert.ok(fullOvHtml.indexOf('class="hero-panels"') < fullOvHtml.indexOf('<details class="hero-thresholds"')
    && fullOvHtml.indexOf('<details class="hero-thresholds"') < fullOvHtml.indexOf('<figcaption>'),
    'collapsible thresholds section renders inside <figure> below .hero-panels and before <figcaption>');
-  assert.match(fullOvHtml,/class="hero-thresholds-summary"[\s\S]*class="hero-thresholds-summary-label">Thresholds &amp; alert cutoffs<\/span><span class="hero-thresholds-summary-line">Conn: 100\/IP \| Circuits: burst 90 \| BeginDir: 5\/s \| Alerts: ≥90th \([^)]+\)<\/span><span class="hero-thresholds-summary-toggle">Details · 4 settings<\/span>/);
+  assert.match(fullOvHtml,/class="hero-thresholds-summary" data-focus-key="hero-thresholds-summary"[\s\S]*class="hero-thresholds-summary-label">Thresholds &amp; alert cutoffs<\/span><span class="hero-thresholds-summary-line">Conn: 100\/IP \| Circuits: burst 90 \| BeginDir: 5\/s \| Alerts: ≥90th \([^)]+\)<\/span><span class="hero-thresholds-summary-toggle">Details · 4 settings<\/span>/);
   assert.match(quietHtml,/class="hero-thresholds-summary-line">Conn: 100\/IP · 20\/s · burst 40\/100 \| Circuits: 3\/s · burst 90\/200 \| BeginDir: 10\/s · burst 60\/100 \| Alerts: ≥90th \([^)]+\) · ≥99th \([^)]+\)<\/span>/);
   assert.match(legacy4Html,/class="hero-thresholds-summary-toggle">Reference cutoffs<\/span>/);
+
+  const thPersistCtrl=application('?view=overview',fullHeroDoc);
+  thPersistCtrl.app.start();
+  const initialThEl=thPersistCtrl.browser.document.querySelector('[data-hero-thresholds]');
+  assert.equal(initialThEl.hasAttribute('open'),false,'threshold disclosure starts closed on first visit');
+  initialThEl.setAttribute('open','');
+  thPersistCtrl.events.get('toggle')({target:initialThEl});
+  thPersistCtrl.browser.document.querySelector('[data-focus-key="hero-thresholds-summary"]').focus({preventScroll:true});
+  assert.equal(thPersistCtrl.browser.document.activeElement.getAttribute('data-focus-key'),'hero-thresholds-summary');
+  const freshThDoc=structuredClone(fullHeroDoc);
+  thPersistCtrl.app.replaceRelease(freshThDoc,releaseContext(freshThDoc,'th-open-new',()=>freshThDoc.end));
+  assert.equal(thPersistCtrl.browser.document.querySelector('[data-hero-thresholds]').hasAttribute('open'),true,'replaceRelease preserves open threshold disclosure');
+  assert.equal(thPersistCtrl.browser.document.activeElement.getAttribute('data-focus-key'),'hero-thresholds-summary','replaceRelease restores focus on threshold summary');
+  click(thPersistCtrl,'[data-hero-scale="symlog"]');
+  assert.equal(thPersistCtrl.browser.document.querySelector('[data-hero-thresholds]').hasAttribute('open'),true,'same-view hero control redraw preserves open threshold disclosure');
+  assert.throws(()=>thPersistCtrl.app.replaceRelease({},releaseContext(freshThDoc,'th-bad',()=>freshThDoc.end)),/Missing chart data/);
+  assert.equal(thPersistCtrl.browser.document.querySelector('[data-hero-thresholds]').hasAttribute('open'),true,'failed replaceRelease rollback preserves open threshold disclosure');
+  click(thPersistCtrl,'[data-view="explorer"]');
+  click(thPersistCtrl,'[data-view="overview"]');
+  assert.equal(thPersistCtrl.browser.document.querySelector('[data-hero-thresholds]').hasAttribute('open'),false,'leaving Overview resets threshold disclosure to closed');
 
   const policyDoc=structuredClone(fullHeroDoc);
   policyDoc.dos_thresholds={
@@ -4071,6 +4144,23 @@ copyCtrl.app.start();
   const unavailSubHtml=application('?view=overview',unavailHrSubDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
   assert.match(unavailSubHtml,/class="card-alert-callout callout-high callout-subsided"/);
   assert.match(unavailSubHtml,/Recent 24h alert in child chart \(last 1h unavailable\)/);
+
+  const mixedHrSubDoc=structuredClone(childSubsidedDoc);
+  for(const s of chart('hsdir_fetches',mixedHrSubDoc).series)if(s.key!=='success'){
+   s.current.day={value:8,relays:240,expected_relays:240,coverage:1,valid:true};
+   s.reference.day={n:120,current_percentile:95,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:mixedHrSubDoc.reference_window.start,end:mixedHrSubDoc.reference_window.end};
+   if(s.current.hour)s.current.hour={value:null,relays:0,expected_relays:240,coverage:0,valid:false};
+   break;
+  }
+  const mixedSubHtml=application('?view=overview',mixedHrSubDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  assert.match(mixedSubHtml,/Recent 24h alerts in child charts \(last 1h partially unavailable\)/);
+
+  const validUnrankedHrSubDoc=structuredClone(childSubsidedDoc);
+  const unrankedDirRejSub=chart('directory_rejections',validUnrankedHrSubDoc).series[0];
+  unrankedDirRejSub.reference.hour={n:10,current_percentile:null,flat_zero:false,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:validUnrankedHrSubDoc.reference_window.start,end:validUnrankedHrSubDoc.reference_window.end};
+  const validUnrankedHtml=application('?view=overview',validUnrankedHrSubDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  assert.match(validUnrankedHtml,/Recent 24h alert in child chart \(1h comparison unavailable\)/);
+  assert.match(validUnrankedHtml,/class="card-alert-chip chip-unknown">1h: 0 events\/s \(percentile unavailable\)<\/span>/);
 
   // 15j. Stylesheet contains status banner, collapsible thresholds, subsided callout, definition-detail, and responsive rules.
   for(const cls of [

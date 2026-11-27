@@ -2847,6 +2847,90 @@ class CollectorTests(unittest.TestCase):
             with self.assertRaisesRegex(collector.CollectionError, 'Missing required routes for primary chart'):
                 collector._ensure_supplemental_charts(solo_supp, subset_routes)
 
+            # Configured SOURCE_SEED_SNAPSHOT using the previous 16-setting schema (with
+            # DoSConnectionDefenseTimePeriod and without DoSBeginDirLimitEnabled / HSDirOneRequestPerCircuit)
+            # migrates cleanly on seed load during plan_collection & collect, while strict output
+            # validate_snapshot still rejects the 16-setting schema and current 18-setting seeds work.
+            legacy_settings = []
+            for s in dt['settings']:
+                if s['key'] in ('dosbegindirlimitenabled', 'hsdironerequestpercircuit'):
+                    continue
+                entry = copy.deepcopy(s)
+                if entry['key'] == 'dosconnectiondefensetimeperiod':
+                    entry['option'] = 'DoSConnectionDefenseTimePeriod'
+                legacy_settings.append(entry)
+            self.assertEqual(len(legacy_settings), 16)
+            legacy_dt = {
+                'as_of': seed_end,
+                'reported_relays': dt['reported_relays'],
+                'settings': legacy_settings,
+            }
+            legacy_seed = copy.deepcopy(base_v4)
+            legacy_seed['dos_thresholds'] = legacy_dt
+            with self.assertRaisesRegex(ValueError, 'canonical settings list'):
+                collector.validate_snapshot(legacy_seed)
+
+            legacy_seed_path = root / 'legacy_seed_16.json'
+            legacy_seed_path.write_text(json.dumps(legacy_seed))
+            legacy_seed_path.chmod(0o600)
+            legacy_cfg = dict(cfg, SOURCE_SEED_SNAPSHOT=str(legacy_seed_path))
+            legacy_cfg_file = root / 'legacy_source.env'
+            legacy_cfg_file.write_text('\n'.join(f'{k}={v}' for k, v in sorted(legacy_cfg.items())) + '\n')
+            legacy_cfg_file.chmod(0o600)
+            legacy_state = root / 'legacy_state'
+            legacy_out = root / 'legacy_out.json'
+            legacy_plan = collector.plan_collection(
+                legacy_cfg, ROOT, legacy_state, end=target_end, config_path=legacy_cfg_file,
+            )
+            self.assertEqual(legacy_plan['snapshot_end'], target_end)
+            legacy_src = SyntheticSource(queries, handlers)
+            collector.collect(
+                legacy_cfg, ROOT, legacy_state, legacy_out,
+                end=target_end, source=legacy_src, config_path=legacy_cfg_file,
+            )
+            legacy_published = json.loads(legacy_out.read_text())
+            collector.validate_snapshot(legacy_published)
+            self.assertEqual(len(legacy_published['dos_thresholds']['settings']), 18)
+
+            # Current 18-setting configured SOURCE_SEED_SNAPSHOT also passes plan_collection & collect.
+            current_seed = copy.deepcopy(base_v4)
+            current_seed['dos_thresholds'] = copy.deepcopy(dt)
+            current_seed['dos_thresholds']['as_of'] = seed_end
+            collector.validate_snapshot(current_seed)
+            current_seed_path = root / 'current_seed_18.json'
+            current_seed_path.write_text(json.dumps(current_seed))
+            current_seed_path.chmod(0o600)
+            current_cfg = dict(cfg, SOURCE_SEED_SNAPSHOT=str(current_seed_path))
+            current_cfg_file = root / 'current_source.env'
+            current_cfg_file.write_text('\n'.join(f'{k}={v}' for k, v in sorted(current_cfg.items())) + '\n')
+            current_cfg_file.chmod(0o600)
+            current_state = root / 'current_state'
+            current_out = root / 'current_out.json'
+            collector.plan_collection(
+                current_cfg, ROOT, current_state, end=target_end, config_path=current_cfg_file,
+            )
+            collector.collect(
+                current_cfg, ROOT, current_state, current_out,
+                end=target_end, source=SyntheticSource(queries, handlers), config_path=current_cfg_file,
+            )
+            collector.validate_snapshot(json.loads(current_out.read_text()))
+
+            # Malformed 16-setting seed (uncoarsened count / extra field) still fails validation after migration.
+            bad_legacy_seed = copy.deepcopy(legacy_seed)
+            bad_legacy_seed['dos_thresholds']['settings'][4]['relays'] = 7
+            bad_legacy_path = root / 'bad_legacy_seed_16.json'
+            bad_legacy_path.write_text(json.dumps(bad_legacy_seed))
+            bad_legacy_path.chmod(0o600)
+            bad_legacy_cfg = dict(cfg, SOURCE_SEED_SNAPSHOT=str(bad_legacy_path))
+            bad_legacy_cfg_file = root / 'bad_legacy_source.env'
+            bad_legacy_cfg_file.write_text('\n'.join(f'{k}={v}' for k, v in sorted(bad_legacy_cfg.items())) + '\n')
+            bad_legacy_cfg_file.chmod(0o600)
+            with self.assertRaisesRegex(ValueError, 'coarsened DoS threshold relay'):
+                collector.plan_collection(
+                    bad_legacy_cfg, ROOT, root / 'bad_legacy_state',
+                    end=target_end, config_path=bad_legacy_cfg_file,
+                )
+
 
 if __name__ == '__main__':
     unittest.main()
