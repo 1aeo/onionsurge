@@ -18,7 +18,7 @@ DOS_THRESHOLD_SETTINGS = (
     ('dosconnectionmaxconcurrentcount', 'DoSConnectionMaxConcurrentCount', 'transport', 'connections/IP'),
     ('dosconnectionconnectrate', 'DoSConnectionConnectRate', 'transport', 'connections/s'),
     ('dosconnectionconnectburst', 'DoSConnectionConnectBurst', 'transport', 'connections'),
-    ('dosconnectiondefensetimeperiod', 'DoSConnectionDefenseTimePeriod', 'transport', 'seconds'),
+    ('dosconnectiondefensetimeperiod', 'DoSConnectionConnectDefenseTimePeriod', 'transport', 'seconds'),
     ('doscircuitcreationenabled', 'DoSCircuitCreationEnabled', 'circuits', 'flag'),
     ('doscircuitcreationrate', 'DoSCircuitCreationRate', 'circuits', 'circuits/s'),
     ('doscircuitcreationburst', 'DoSCircuitCreationBurst', 'circuits', 'circuits'),
@@ -26,10 +26,12 @@ DOS_THRESHOLD_SETTINGS = (
     ('doscircuitcreationdefensetimeperiod', 'DoSCircuitCreationDefenseTimePeriod', 'circuits', 'seconds'),
     ('dos_num_circ_max_outq', 'dos_num_circ_max_outq', 'queues', 'circuits'),
     ('dosrefusesinglehopclientrendezvous', 'DoSRefuseSingleHopClientRendezvous', 'introduction', 'flag'),
+    ('dosbegindirlimitenabled', 'DoSBeginDirLimitEnabled', 'directory', 'flag'),
     ('dosbegindirrateenabled', 'DoSBeginDirRateEnabled', 'directory', 'mode'),
     ('dosbegindirrate', 'DoSBeginDirRate', 'directory', 'requests/s'),
     ('dosbegindirburst', 'DoSBeginDirBurst', 'directory', 'requests'),
     ('dosbegindirdefensetype', 'DoSBeginDirDefenseType', 'directory', 'mode'),
+    ('hsdironerequestpercircuit', 'HSDirOneRequestPerCircuit', 'directory', 'flag'),
 )
 DOS_EFFECTIVE_CONFIG_SETTINGS = DOS_THRESHOLD_SETTINGS[:12]
 DOS_BEGINDIR_CONFIG_SETTINGS = DOS_THRESHOLD_SETTINGS[12:]

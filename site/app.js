@@ -336,7 +336,7 @@ function midrankPercentile(val,sorted,inBase=false){
 function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
  if(!D||!Array.isArray(D.charts)||!Array.isArray(D.families))return null;
  const r=normalizeHeroRange(heroRange,hasHourPayload(D)),meta=HERO_RANGE_META[r];
- const win=r==='24h'?HOUR:DAY,modePrefix=win===HOUR?'h:':'d:';
+ const win=r==='24h'?HOUR:DAY,modePrefix=win===HOUR?'h:':'d:',refPeriod=win===HOUR?'hour':'day';
  const chartsById=new Map();
  for(const c of D.charts)if(c&&typeof c.id==='string')chartsById.set(c.id,c);
  let rawEnd=validTime(D.end)?D.end:-Infinity;
@@ -400,7 +400,13 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
     if(!isAlertEligibleSeries(c,s))continue;
     const idx=indexSeries(cid,s,true);
     if(idx.minTs<earliestTs)earliestTs=idx.minTs;
-    members.push({c,s,idx});
+    let obsMax=0;
+    for(const v of idx.values.values())if(isFiniteNumber(v)&&v>obsMax)obsMax=v;
+    const rawPeak=s.peaks?.[refPeriod]?.fleet_peak;
+    const memberPeak=Math.max(isFiniteNumber(rawPeak)&&rawPeak>0?rawPeak:0,obsMax);
+    const rawScale=displayScale(c);
+    const scale=isFiniteNumber(rawScale)?rawScale:1;
+    members.push({c,s,idx,peak:memberPeak,scale});
    }
   }
   return {id:f.id,icon:f.icon,title:f.title,primary:f.primary,members};
@@ -512,7 +518,7 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
   g.windowPeak=winPeak;
   g.scalePeak=r!=='all'?(winPeak>0?winPeak:1):(g.rawPeak>0?g.rawPeak:1);
  }
- const sevOrder={neutral:1,elevated:2,high:3},refPeriod=win===HOUR?'hour':'day';
+ const sevOrder={neutral:1,elevated:2,high:3};
  const rankSeriesAt=(s,idx,t)=>{
   const v=idx.values.get(t);
   if(v===undefined)return null;
@@ -639,8 +645,8 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
  const families=familySpecs.map(fam=>({
   id:fam.id,icon:fam.icon,title:fam.title,primary:fam.primary,
   rows:times.map(t=>{
-   let bestSev=-1,bestRank=-Infinity,bestState='missing',bestN=0,bestSeries=null,bestChart=null,bestChartId=null,bestSeriesKey=null,alertCount=0;
-   for(const {c,s,idx} of fam.members){
+   let bestSev=-1,bestRank=-Infinity,bestState='missing',bestN=0,bestSeries=null,bestChart=null,bestChartId=null,bestSeriesKey=null,bestValue=null,bestPeak=0,bestScale=1,alertCount=0;
+   for(const {c,s,idx,peak,scale} of fam.members){
     const ranked=rankSeriesAt(s,idx,t);
     if(!ranked)continue;
     hasAnyMeasured=true;notePop(t,ranked.pop);
@@ -649,11 +655,19 @@ function prepareHeroPlot(D,heroRange=null,includeHsdir=true,cachedSeries=null){
     if(state==='high'||state==='elevated')alertCount++;
     const sev=sevOrder[state],candRank=isFiniteNumber(rank)?rank:0;
     if(sev>bestSev||(sev===bestSev&&candRank>bestRank)){
+     const v=idx.values.get(t);
      bestSev=sev;bestRank=candRank;bestState=state;bestN=n;bestSeries=s.name;bestChart=c.title;bestChartId=c.id;bestSeriesKey=s.key;
+     bestValue=isFiniteNumber(v)?v:null;bestPeak=peak;bestScale=scale;
     }
    }
-   if(bestSev<0){hasMissingAlerts=true;return {state:'missing',rank:null,n:0,seriesName:null,chartTitle:null,chartId:null,seriesKey:null,alertCount:0};}
-   return {state:bestState,rank:bestRank,n:bestN,seriesName:bestSeries,chartTitle:bestChart,chartId:bestChartId,seriesKey:bestSeriesKey,alertCount};
+   if(bestSev<0){
+    hasMissingAlerts=true;
+    return {state:'missing',rank:null,n:0,seriesName:null,chartTitle:null,chartId:null,seriesKey:null,alertCount:0,value:null,peak:0,peakRatio:null,displayScale:1};
+   }
+   return {
+    state:bestState,rank:bestRank,n:bestN,seriesName:bestSeries,chartTitle:bestChart,chartId:bestChartId,seriesKey:bestSeriesKey,alertCount,
+    value:bestValue,peak:bestPeak,peakRatio:(bestValue!=null&&bestPeak>0?bestValue/bestPeak:null),displayScale:bestScale,
+   };
   }),
  }));
  if(!hasAnyMeasured)return null;
@@ -794,9 +808,19 @@ const TOR_DOS_DEFAULTS=Object.freeze({
  dos_num_circ_max_outq:Object.freeze({value:'3'}),
  dosrefusesinglehopclientrendezvous:Object.freeze({value:'0',note:'disabled'}),
  dosbegindirrateenabled:Object.freeze({value:'1',note:'enabled',inherit:'auto'}),
+ dosbegindirlimitenabled:Object.freeze({value:'0',note:'disabled'}),
  dosbegindirrate:Object.freeze({value:'10',inherit:'0'}),
  dosbegindirburst:Object.freeze({value:'60',inherit:'0'}),
  dosbegindirdefensetype:Object.freeze({value:'3',note:'close circuit',inherit:'0'}),
+ hsdironerequestpercircuit:Object.freeze({value:'1',note:'always on'}),
+});
+const FAMILY_PLAIN_SUMMARIES=Object.freeze({
+ transport:'Blocked incoming relay connections from IPs tripping connection-rate or concurrent-connection limits, alongside overall incoming OR traffic.',
+ circuits:'Dropped circuit-creation attempts from flagged clients, plus overloaded handshake queues, protocol closes, and open circuit counts.',
+ directory:'Hidden-service directory descriptor traffic, stalled tunneled directory streams, and BEGIN_DIR or HSDir rate/limit refusals.',
+ introduction:'Refused onion-service introduction requests stopped by Tor’s introduction-point DoS defenses before reaching rendezvous.',
+ queues:'Circuits killed because buffered cells exceeded Tor’s outbound cell-queue limit.',
+ exit:'Exit stream and DNS-lookup requests blocked when a single circuit opened too many streams.',
 });
 
 function createObservatory(data,browser,initialRelease=null){
@@ -1202,7 +1226,8 @@ function heroThresholdsSection(h,is24h,isNonMidnightDay){
  const torDefaultFor=item=>{const k=typeof item.key==='string'?item.key.toLowerCase():'',o=typeof item.option==='string'?item.option.toLowerCase():'';return Object.hasOwn(TOR_DOS_DEFAULTS,k)?TOR_DOS_DEFAULTS[k]:(Object.hasOwn(TOR_DOS_DEFAULTS,o)?TOR_DOS_DEFAULTS[o]:null);};
  const fmtThresholdBucket=(b,item,split)=>{
   const def=torDefaultFor(item);
-  if(b.value==='unset'){
+  const isUnsetSentinel=b.value==='unset'||(b.source==='unset'&&b.value==='0'&&def&&def.value!=='0');
+  if(isUnsetSentinel){
    if(def){
     const valText=fmtNum(def.value,item.unit,true);
     const srcLabel=b.source==='unset'?'Tor default':`${b.source} · Tor default`;
@@ -1214,6 +1239,17 @@ function heroThresholdsSection(h,is24h,isNonMidnightDay){
    }
    if(split)return `Tor default <span class="threshold-source">(${escapeHtml(b.source)}: ${count(b.relays)})</span>`;
    return `Tor default (unset)`+(b.source!=='unset'?` <span class="threshold-source">(${escapeHtml(b.source)})</span>`:'');
+  }
+  if(b.source==='unset'){
+   const valText=fmtNum(b.value,item.unit,true);
+   const parts=[];
+   if(def&&b.value===def.value&&def.note)parts.push(def.note);
+   parts.push(split?`Tor default: ${count(b.relays)}`:'Tor default');
+   const titleAttr=def&&b.value===def.value&&def.title?` title="${escapeHtml(def.title)}"`:'';
+   return `${escapeHtml(valText)} <span class="threshold-source"${titleAttr}>(${escapeHtml(parts.join(' · '))})</span>`;
+  }
+  if((item.key?.toLowerCase?.()==='hsdironerequestpercircuit'||def?.note==='always on')&&b.source==='observed'&&b.value==='1'){
+   return `${escapeHtml(fmtNum(b.value,item.unit,false))} <span class="threshold-source">(always on${split?`: ${count(b.relays)}`:''})</span>`;
   }
   if(b.source==='observed'&&def?.inherit&&b.value===def.inherit){
    const defVal=fmtNum(def.value,item.unit,true);
@@ -1259,7 +1295,53 @@ function heroThresholdsSection(h,is24h,isNonMidnightDay){
   }
   optionBHtml=`<div class="hero-threshold-col"><div class="hero-threshold-head"><h3>Reference rate percentiles</h3><span class="hero-threshold-sub" title="Alerts trigger at ≥90th / ≥99th midrank percentile">${winSub} · 90th / 99th pct in events/s</span></div><div class="hero-threshold-list">${bRows.join('')}</div></div>`;
  }
- return `<div class="hero-thresholds" aria-label="DoS thresholds and reference rate percentiles"><div class="hero-thresholds-grid${optionAHtml&&optionBHtml?'':' single-col'}">${optionAHtml}${optionBHtml}</div></div>`;
+ const fmtCompactNum=v=>/^\d+$/.test(v)?count(Number(v)):v;
+ const resolvedValsFor=(...keys)=>{
+  if(!dt)return [];
+  const lowerKeys=keys.map(k=>k.toLowerCase());
+  const item=dt.settings.find(s=>(typeof s.key==='string'&&lowerKeys.includes(s.key.toLowerCase()))||(typeof s.option==='string'&&lowerKeys.includes(s.option.toLowerCase())));
+  if(!item||!Array.isArray(item.values)||!item.values.length)return [];
+  const def=torDefaultFor(item);
+  const sorted=[...item.values].sort((a,b)=>(b.relays??0)-(a.relays??0));
+  const out=[],seen=new Set();
+  for(const b of sorted){
+   let raw=b.value;
+   if(raw==='unset'||(b.source==='unset'&&raw==='0'&&def&&def.value!=='0'))raw=def?.value??null;
+   else if(b.source==='observed'&&def?.inherit&&raw===def.inherit)raw=def.value;
+   if(raw!=null&&raw!=='unset'&&!seen.has(raw)){seen.add(raw);out.push(fmtCompactNum(raw));}
+  }
+  return out;
+ };
+ const firstVal=(...keys)=>resolvedValsFor(...keys)[0]??null;
+ const splitVals=(...keys)=>{const v=resolvedValsFor(...keys);return v.length>1?v.slice(0,2).join('/'):(v[0]??null);};
+ const summaryGroups=[];
+ const connParts=[];
+ const maxConn=firstVal('dosconnectionmaxconcurrentcount','dos_conn_max');
+ const connRate=firstVal('dosconnectionconnectrate');
+ const connBurst=splitVals('dosconnectionconnectburst');
+ if(maxConn)connParts.push(`${maxConn}/IP`);
+ if(connRate)connParts.push(`${connRate}/s`);
+ if(connBurst)connParts.push(`burst ${connBurst}`);
+ if(connParts.length)summaryGroups.push(`Conn: ${connParts.join(' · ')}`);
+ const circParts=[];
+ const circRate=firstVal('doscircuitcreationrate');
+ const circBurst=splitVals('doscircuitcreationburst','dos_circ_burst');
+ if(circRate)circParts.push(`${circRate}/s`);
+ if(circBurst)circParts.push(`burst ${circBurst}`);
+ if(circParts.length)summaryGroups.push(`Circuits: ${circParts.join(' · ')}`);
+ const bdParts=[];
+ const bdRate=firstVal('dosbegindirrate','dos_begindir_rate');
+ const bdBurst=splitVals('dosbegindirburst');
+ if(bdRate)bdParts.push(`${bdRate}/s`);
+ if(bdBurst)bdParts.push(`burst ${bdBurst}`);
+ if(bdParts.length)summaryGroups.push(`BeginDir: ${bdParts.join(' · ')}`);
+ const alertCutParts=[];
+ if(isFiniteNumber(h?.rateRank?.p90Fleet))alertCutParts.push(`≥90th (${number(h.rateRank.p90Fleet)} events/s)`);
+ if(isFiniteNumber(h?.rateRank?.p99Fleet))alertCutParts.push(`≥99th (${number(h.rateRank.p99Fleet)} events/s)`);
+ if(alertCutParts.length)summaryGroups.push(`Alerts: ${alertCutParts.join(' · ')}`);
+ const summaryLine=summaryGroups.join(' | ');
+ const toggleText=dt?(dt.settings.length===1?'Details · 1 setting':`Details · ${count(dt.settings.length)} settings`):'Reference cutoffs';
+ return `<details class="hero-thresholds" aria-label="DoS thresholds and reference rate percentiles"><summary class="hero-thresholds-summary"><span class="hero-thresholds-summary-label">Thresholds &amp; alert cutoffs</span>${summaryLine?`<span class="hero-thresholds-summary-line">${escapeHtml(summaryLine)}</span>`:''}<span class="hero-thresholds-summary-toggle">${escapeHtml(toggleText)}</span></summary><div class="hero-thresholds-grid${optionAHtml&&optionBHtml?'':' single-col'}">${optionAHtml}${optionBHtml}</div></details>`;
 }
 function heroCard(){
  const isHourly=isHourlyRelease(),isAll=heroRange==='all';
@@ -1300,14 +1382,93 @@ function heroCard(){
  const alertWindowLine=isNonMidnightDay?`<div class="hero-kpi-meta">${escapeHtml(endWindow)} · completed UTC day</div>`:'';
  const alertMeta=alerts.length
   ?`${alertWindowLine}<ul class="hero-alert-list" aria-label="Alerted families">${alerts.map(({f,state,row})=>{
+   const unitSuffix=row.displayScale===3600?'/h':'/s';
+   const scaledVal=row.value!=null?row.value*(row.displayScale||1):null;
+   const pk=row.value!=null&&row.peak>0?peakShare(row.value,row.peak):null;
+   const ratePart=scaledVal!=null&&isFiniteNumber(scaledVal)?` · ${formatScaled(row.value,scaledVal)}${unitSuffix}${pk?` (${pk} of peak)`:''}`:'';
    const pct=isFiniteNumber(row.rank)?` · ${formatPercentileOrdinal(row.rank)} pct`:'';
    const chartPrefix=row.chartId&&f.primary&&row.chartId!==f.primary&&row.chartTitle&&row.chartTitle!==row.seriesName?`${row.chartTitle}: `:'';
    const extra=row.alertCount>1?` (+${count(row.alertCount-1)} more)`:'';
    const detail=row.chartId&&row.seriesKey
-    ?` <a class="hero-alert-detail" href="${url('explorer',alertExploreRange,f.id,row.chartId,row.seriesKey)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(row.chartId)}" data-series="${escapeHtml(row.seriesKey)}" data-range="${alertExploreRange}">${escapeHtml(chartPrefix)}${escapeHtml(row.seriesName||row.seriesKey)}${escapeHtml(pct)}${escapeHtml(extra)}</a>`:'';
+    ?` <a class="hero-alert-detail" href="${url('explorer',alertExploreRange,f.id,row.chartId,row.seriesKey)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(row.chartId)}" data-series="${escapeHtml(row.seriesKey)}" data-range="${alertExploreRange}">${escapeHtml(chartPrefix)}${escapeHtml(row.seriesName||row.seriesKey)}${escapeHtml(ratePart)}${escapeHtml(pct)}${escapeHtml(extra)}</a>`:'';
    return `<li><a class="hero-alert-link ${state}" href="#family-${escapeHtml(encodeURIComponent(f.id))}" data-family-jump="${escapeHtml(f.id)}">${escapeHtml(f.icon)} ${escapeHtml(f.title)}</a>${detail}</li>`;
   }).join('')}</ul>`
   :`${alertWindowLine}<div class="hero-kpi-meta">${anyAlertMeasured?'No qualifying family alerts':'No measured family series'}</div>`;
+ const maxPeakRatio=alerts.length?Math.max(...alerts.map(a=>isFiniteNumber(a.row.peakRatio)?a.row.peakRatio:-1)):-1;
+ const hasPeakData=alerts.some(a=>isFiniteNumber(a.row.peakRatio));
+ const compositePeakRatio=ratePeak>0&&total!=null?total/ratePeak:null;
+ const rr=h?.rateRank;
+ const compositeState=rr&&Number.isInteger(rr.n)&&rr.n>=20?alertStateFor(rr.rank,rr.n,rr.flatZero):'neutral';
+ let statusClass,statusLabel;
+ if(!anyAlertMeasured&&total==null){
+  statusClass='status-unknown';statusLabel='Unavailable';
+ }else if(alerts.length===0&&compositeState==='neutral'){
+  statusClass='status-quiet';statusLabel='Quiet';
+ }else if(alerts.length>0&&hasPeakData&&maxPeakRatio<0.05&&compositeState==='neutral'&&!(alerts.length>=2&&maxPeakRatio>=0.02)){
+  statusClass='status-localized';statusLabel='Localized activity';
+ }else if((hasHighAlert||compositeState==='high')&&(!hasPeakData||maxPeakRatio>=0.25)){
+  const severe=maxPeakRatio>=0.50||(isFiniteNumber(compositePeakRatio)&&compositePeakRatio>=0.50)||(alerts.length>=2&&hasHighAlert&&maxPeakRatio>=0.25);
+  statusClass='status-high';statusLabel=severe?'Severe surge':'Active surge';
+ }else{
+  statusClass='status-elevated';statusLabel='Elevated flood activity';
+ }
+ const statusWindowNoun=is24h?'Last hour':isNonMidnightDay?'Latest UTC day':'Last 24h';
+ const compositeRateName=heroHsdir?'composite mitigated &amp; flood rate':'composite mitigated rate';
+ const compositeContext=total!=null
+  ?`${escapeHtml(number(total))} events/s${rateShare?` (${escapeHtml(rateShare)} of peak)`:''}`
+  :'unavailable';
+ const sortedBannerAlerts=[...alerts].sort((a,b)=>((b.state==='high')-(a.state==='high'))||((b.row.peakRatio??-1)-(a.row.peakRatio??-1))||((b.row.rank??-1)-(a.row.rank??-1)));
+ const formatBannerAlert=({f,row})=>{
+  const unitSuffix=row.displayScale===3600?'/h':'/s';
+  const scaledVal=row.value!=null?row.value*(row.displayScale||1):null;
+  const rateStr=scaledVal!=null&&isFiniteNumber(scaledVal)?`${formatScaled(row.value,scaledVal)}${unitSuffix}`:null;
+  const pkStr=row.value!=null&&row.peak>0?`${peakShare(row.value,row.peak)} of peak`:null;
+  const pctStr=isFiniteNumber(row.rank)?`${formatPercentileOrdinal(row.rank)} pct`:null;
+  const parts=[rateStr,pkStr,pctStr].filter(Boolean).join(' · ');
+  return `<a class="hero-status-jump" href="#family-${escapeHtml(encodeURIComponent(f.id))}" data-family-jump="${escapeHtml(f.id)}">${escapeHtml(f.title)}</a>${parts?` (${escapeHtml(parts)})`:''}`;
+ };
+ const alertSummaryList=sortedBannerAlerts.map(formatBannerAlert).join(', ');
+ let statusTextHtml;
+ if(statusClass==='status-unknown'){
+  statusTextHtml=`${escapeHtml(statusWindowNoun)}: no current flood-rate or family alert measurements are available.`;
+ }else if(statusClass==='status-quiet'){
+  statusTextHtml=`${escapeHtml(statusWindowNoun)}: no DoS alert families triggered (0 of ${count(activeFamilyCount)} ≥90th pct); ${compositeRateName} is ${compositeContext}.`;
+ }else if(alerts.length===0){
+  const compPct=isFiniteNumber(rr?.rank)?`${formatPercentileOrdinal(rr.rank)} pct`:'elevated percentile';
+  statusTextHtml=`${escapeHtml(statusWindowNoun)}: ${compositeRateName} reached ${escapeHtml(compPct)} (${compositeContext}), with no single family ≥90th pct.`;
+ }else{
+  const lead=statusClass==='status-localized'?'Small localized activity in':statusClass==='status-elevated'?'Elevated activity in':`${escapeHtml(statusLabel)} in`;
+  statusTextHtml=`${escapeHtml(statusWindowNoun)}: ${lead} ${alertSummaryList}; ${compositeRateName} is ${compositeContext}.`;
+ }
+ let subsidedHtml='';
+ if(isHourly&&is24h&&anyAlertMeasured){
+  const alertingIds=new Set(alerts.map(a=>a.f.id));
+  const subsided=[];
+  for(const f of D.families){
+   if(alertingIds.has(f.id))continue;
+   let hasDayAlert=false;
+   for(const cid of f.children||[]){
+    const c=chart(cid);if(!c)continue;
+    for(const s of c.series||[]){
+     if(!isAlertEligibleSeries(c,s))continue;
+     const ref=s.reference?.day;
+     if(s.current?.day?.valid!==true||!ref||!Number.isInteger(ref.n)||ref.n<=0)continue;
+     const flatZero=!!ref.flat_zero,rank=flatZero?0:ref.current_percentile;
+     if(!flatZero&&(!isFiniteNumber(rank)||rank<0||rank>100))continue;
+     const st=alertStateFor(rank,ref.n,flatZero);
+     if(st==='elevated'||st==='high'){hasDayAlert=true;break;}
+    }
+    if(hasDayAlert)break;
+   }
+   if(hasDayAlert)subsided.push(f);
+  }
+  if(subsided.length){
+   const links=subsided.map(f=>`<a href="#family-${escapeHtml(encodeURIComponent(f.id))}" data-family-jump="${escapeHtml(f.id)}">${escapeHtml(f.title)}</a>`).join(', ');
+   subsidedHtml=`<div class="hero-status-subsided">Earlier in last 24h (normal in last 1h): ${links}</div>`;
+  }
+ }
+ const badgeTitle='Severity combines reference percentile rank with share of retained fleet peak (<5% localized, >=5% / multi-family elevated, >=25% high-pct surge; >=50% or multi-family high >=25% severe).';
+ const statusBannerHtml=`<div class="hero-status-banner ${statusClass}" role="status" aria-label="Current flood status: ${escapeHtml(statusLabel)}"><span class="hero-status-badge" title="${escapeHtml(badgeTitle)}">${escapeHtml(statusLabel)}</span><div class="hero-status-body"><p class="hero-status-text">${statusTextHtml}</p>${subsidedHtml}</div></div>`;
  const windowOpts=[...(isHourly?HERO_HOURLY_LEFT_RANGES:HERO_DAILY_LEFT_RANGES),'all'].map(id=>[id,HERO_RANGE_META[id].label]);
  const windowControl=controlGroup('Window','Concurrent DoS time range','data-hero-range',heroRange,windowOpts);
  const controls=`<div class="hero-controls">${windowControl}${controlGroup('Flow scale','Concurrent DoS flow scale','data-hero-scale',heroScale,[['linear','Linear'],['symlog','Symlog']])}<button class="hero-toggle ${heroHsdir?'active':''}" data-hero-hsdir aria-pressed="${heroHsdir}">HSDir GET/POST ${heroHsdir?'included':'excluded'}</button></div>`;
@@ -1406,15 +1567,15 @@ function heroCard(){
   +`<div class="legend-tier"><span class="legend-tier-label">Resource gauges</span><span><i style="background:#f1d05d"></i>Open circuits (${escapeHtml(openLegendPeak)})</span><span><i class="gauge-dashed-key"></i>Stalled BEGIN_DIR (${escapeHtml(waitLegendPeak)})</span></div>`
   +`</div>`;
  const heroDesc=isHourly
-  ?'Synchronized hourly and daily UTC views across non-overlapping mitigated &amp; flood rates (/s), a 6-family ≥90th/≥99th percentile alert strip, and normalized open-circuit &amp; stalled <code>BEGIN_DIR</code> resource state.'
-  :'Synchronized daily UTC view across non-overlapping mitigated &amp; flood rates (/s), a 6-family ≥90th/≥99th percentile alert strip, and normalized open-circuit &amp; stalled <code>BEGIN_DIR</code> resource state.';
+  ?'Live overview of flood traffic stopped by 1AEO relays, active DoS alert families, and open circuit or directory connection load.'
+  :'Daily overview of flood traffic stopped by 1AEO relays, active DoS alert families, and open circuit or directory connection load.';
  const heroShortCaption=isHourly
   ?'Non-overlapping 1h UTC intervals (Last 24 hours) and 24h UTC intervals (Last 7 days, Last 1 month, Last 6 months, Last 12 months, All time) across non-overlapping mitigated/flood rates, family alerts, and normalized resource gauges.'
   :'Non-overlapping 24h UTC intervals (00:00 UTC) across Last 7 days, Last 1 month, Last 6 months, Last 12 months, and All time for non-overlapping mitigated/flood rates, family alerts, and normalized resource gauges.';
  const heroFootnote=isHourly
   ?'Non-overlapping 1-hour UTC intervals on Last 24 hours and 24-hour UTC intervals (00:00 UTC) on daily windows (Last 7 days, Last 1 month, Last 6 months, Last 12 months, and All time); desktop displays the selected Window alongside All time (or All time full-width when selected), while smaller screens switch among all six views with the same Window control. Counter sums exclude overlapping sub-series (<code>ntor_v3</code> within <code>ntor</code>; exitward queue hits within <code>circuit_killed_max_cell</code>; HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>). Alert lanes mark families with a qualifying DoS counter at rank ≥90 with at least 20 reference windows (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference windows (high), using sampled 1-hour references on Last 24 hours and daily references on daily windows. Bottom resource gauges normalize to each series’ selected window peak on Last 24 hours through Last 12 months and retained fleet record on All time; KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).'
   :'Non-overlapping 24-hour UTC intervals (00:00 UTC); desktop displays the selected Window (Last 7 days, Last 1 month, Last 6 months, or Last 12 months) alongside All time (or All time full-width when selected), while smaller screens switch among all five views with the same Window control. Counter sums exclude overlapping sub-series (<code>ntor_v3</code> within <code>ntor</code>; exitward queue hits within <code>circuit_killed_max_cell</code>; HSDir outcome breakdowns within <code>BEGIN_DIR</code> <code>hs_get</code>/<code>hs_post</code>). Alert lanes mark families with a qualifying DoS counter at rank ≥90 with at least 20 reference days (elevated, unless the high rule applies) or rank ≥99 with at least 100 reference days (high). Bottom resource gauges normalize to each series’ selected window peak on Last 7 days through Last 12 months and retained fleet record on All time; KPI headlines pair latest absolute values with % of retained fleet peak and per-relay reference percentiles (ranked over matching active sources for the composite mitigated rate).';
- return `<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="${escapeHtml(heroRange)}"><div class="card-heading"><div><div class="family-label">All six families · Concurrent DoS overview</div><h2>Concurrent DoS activity</h2></div>${controls}</div><p class="definition">${heroDesc}</p>${kpis}${thresholdsHtml}<figure>${panels}${legendHtml}<figcaption><b>Summary.</b> ${heroShortCaption}</figcaption><details class="method-details"><summary>Methodology &amp; overlap rules</summary><p>${heroFootnote}</p></details></figure></section>`;
+ return `<section id="concurrent-dos-overview" class="chart-card hero-card" data-hero-card-range="${escapeHtml(heroRange)}"><div class="card-heading"><div><div class="family-label">All six families · Concurrent DoS overview</div><h2>Concurrent DoS activity</h2></div>${controls}</div><p class="definition">${heroDesc}</p>${statusBannerHtml}${kpis}<figure>${panels}${legendHtml}${thresholdsHtml}<figcaption><b>Summary.</b> ${heroShortCaption}</figcaption><details class="method-details"><summary>Methodology &amp; overlap rules</summary><p>${heroFootnote}</p></details></figure></section>`;
 }
 function familyActiveAlerts(f,primaryChart,primarySeries){
  const hourly=isHourlyRelease(),sevOrder={neutral:0,elevated:1,high:2},alerts=[];
@@ -1451,7 +1612,11 @@ function familyAlertCallout(f,c,s,r){
  if(!alerts.length)return '';
  const hasHigh=alerts.some(a=>a.maxSev>=2);
  const allChildCharts=alerts.every(a=>a.ch.id!==c.id);
- const title=allChildCharts?(alerts.length>1?'Active alerts in child charts':'Active alert in child chart'):(alerts.length>1?'Active alerts in other series':'Active alert in other series');
+ const anyHrHot=alerts.some(a=>a.hrHot),anyHrValid=alerts.some(a=>a.hr?.valid);
+ const subsided=isHourlyRelease()&&!anyHrHot;
+ const title=subsided
+  ?(allChildCharts?(alerts.length>1?'Recent 24h alerts in child charts':'Recent 24h alert in child chart'):(alerts.length>1?'Recent 24h alerts in other series':'Recent 24h alert in other series'))+' '+(anyHrValid?'(normal in last 1h)':'(last 1h unavailable)')
+  :(allChildCharts?(alerts.length>1?'Active alerts in child charts':'Active alert in child chart'):(alerts.length>1?'Active alerts in other series':'Active alert in other series'));
  const dayLbl=isHourlyRelease()&&validTime(D.end)&&D.end%DAY!==0?'Rolling 24h':'24h';
  const fallbackDaily=timeRanges.card_slots.fallback_dynamic||timeRanges.periods.find(p=>p.window.unit!=='hours')?.id||r;
  const items=alerts.map(({ch,item,hr,day,hrHot})=>{
@@ -1464,7 +1629,7 @@ function familyAlertCallout(f,c,s,r){
   const chips=[hr?chip('1h',hr):'',chip(dayLbl,day)].filter(Boolean).join('');
   return `<li class="card-alert-item"><a class="card-alert-link" href="${href}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(ch.id)}" data-series="${escapeHtml(item.key)}" data-range="${escapeHtml(linkRange)}">${escapeHtml(label)} →</a><div class="card-alert-chips">${chips}</div></li>`;
  }).join('');
- return `<div class="card-alert-callout ${hasHigh?'callout-high':'callout-elevated'}" role="region" aria-label="${escapeHtml(title)}"><div class="card-alert-title">${escapeHtml(title)}</div><ul class="card-alert-list">${items}</ul></div>`;
+ return `<div class="card-alert-callout ${hasHigh?'callout-high':'callout-elevated'}${subsided?' callout-subsided':''}" role="region" aria-label="${escapeHtml(title)}"><div class="card-alert-title">${escapeHtml(title)}</div><ul class="card-alert-list">${items}</ul></div>`;
 }
 function childStrip(f,r){
  if(f.children.length<=1)return '';
@@ -1531,7 +1696,11 @@ function card(c,f,r){
  const incomingCtx=f.id==='transport'?incomingContextCard(f,r):'';
  const familyTotal=String(D.families.length).padStart(2,'0');
  const childCountLabel=f.children.length>1?` (${count(f.children.length)} charts)`:'';
- return `<article id="family-${escapeHtml(f.id)}" class="chart-card" data-family-range="${escapeHtml(r)}" tabindex="-1"><div class="card-heading"><div><div class="family-label">Family ${escapeHtml(f.icon)} of ${familyTotal}</div><h2>${escapeHtml(f.title)}</h2></div></div><div class="card-summary"><div class="card-context"><p class="definition">${escapeHtml(c.definition)}</p><div class="metric-subtitle">${metricSubtitle(c,r)}</div>${alertCallout}${zeroExitNote}${incomingCtx}</div><div class="reading-block">${reading(c,s)}</div></div>${childStrip(f,r)}${figure(c,r)}<div class="card-actions"><a href="${url('explorer',r,f.id,c.id)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(c.id)}" data-range="${escapeHtml(r)}">Explore ${escapeHtml(f.title)}${childCountLabel} →</a><span>${count(relayCount)} reporting relays</span></div></article>`;
+ const plainSummary=Object.hasOwn(FAMILY_PLAIN_SUMMARIES,f.id)?FAMILY_PLAIN_SUMMARIES[f.id]:null;
+ const defHtml=plainSummary
+  ?`<p class="definition">${escapeHtml(plainSummary)}</p><p class="definition-detail">${escapeHtml(c.definition)}</p>`
+  :`<p class="definition">${escapeHtml(c.definition)}</p>`;
+ return `<article id="family-${escapeHtml(f.id)}" class="chart-card" data-family-range="${escapeHtml(r)}" tabindex="-1"><div class="card-heading"><div><div class="family-label">Family ${escapeHtml(f.icon)} of ${familyTotal}</div><h2>${escapeHtml(f.title)}</h2></div></div><div class="card-summary"><div class="card-context">${defHtml}<div class="metric-subtitle">${metricSubtitle(c,r)}</div>${alertCallout}${zeroExitNote}${incomingCtx}</div><div class="reading-block">${reading(c,s)}</div></div>${childStrip(f,r)}${figure(c,r)}<div class="card-actions"><a href="${url('explorer',r,f.id,c.id)}" data-explore="${escapeHtml(f.id)}" data-chart="${escapeHtml(c.id)}" data-range="${escapeHtml(r)}">Explore ${escapeHtml(f.title)}${childCountLabel} →</a><span>${count(relayCount)} reporting relays</span></div></article>`;
 }
 function chartControls(){return `<div class="overview-controls">${controlGroup('Time range','Chart time range','data-all-range',range,timeRanges.periods.map(p=>[p.id,p.label]))}${view==='overview'?controlGroup('Layout','Chart layout','data-layout',layout,[['grid','Grid'],['full','Full width']]):''}</div>`;}
 function overview(){return `<h2 class="sr-only" data-view-heading tabindex="-1">Overview</h2>${fleetOpsStrip()}${heroCard()}<div class="overview-toolbar"><div><h2>Six chart families</h2><p>A percentile shows where a value sits among reference windows. The ruler runs from 0 to 100. <a href="${url('methods')}#reference" data-methods>How it is calculated</a></p></div>${chartControls()}</div><div class="chart-stack chart-${layout}">${D.families.map(f=>card(chart(f.primary),f,range)).join('')}</div>`;}
@@ -2035,7 +2204,7 @@ function startObservatory(browser){
 }
 
 if(typeof module!=='undefined'&&module.exports){
- module.exports={metricSelectorTokens,createObservatory,startObservatory,parseLocation,preparePlot,prepareHeroPlot,validateTimeRanges,LEGACY_V5_TIME_RANGES,HERO_RANGE_META,HERO_HOURLY_LEFT_RANGES,HERO_DAILY_LEFT_RANGES,TOR_DOS_DEFAULTS,isHeroRange,normalizeHeroRange,quantileSorted,calendarWindowStart,periodWindowStart,HOUR,DAY,RESERVED_JSON_KEYS,FORBIDDEN_HOURLY_KEYS,req,isPlainRecord,hasExactKeys,isFiniteNumber,number,ordinal,percentile,niceScale,axisNumber,xAxisTicks};
+  module.exports={metricSelectorTokens,createObservatory,startObservatory,parseLocation,preparePlot,prepareHeroPlot,validateTimeRanges,LEGACY_V5_TIME_RANGES,HERO_RANGE_META,HERO_HOURLY_LEFT_RANGES,HERO_DAILY_LEFT_RANGES,TOR_DOS_DEFAULTS,FAMILY_PLAIN_SUMMARIES,isHeroRange,normalizeHeroRange,quantileSorted,calendarWindowStart,periodWindowStart,HOUR,DAY,RESERVED_JSON_KEYS,FORBIDDEN_HOURLY_KEYS,req,isPlainRecord,hasExactKeys,isFiniteNumber,number,ordinal,percentile,niceScale,axisNumber,xAxisTicks};
 }else{
  if(document.documentElement.dataset.mode!=='live')startObservatory(window);
 }

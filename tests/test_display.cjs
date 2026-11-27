@@ -2033,7 +2033,9 @@ for(const cid of baselineCapLow.families.find(f=>f.id==='transport').children){
 }
 const candLow=ui.prepareHeroPlot(baselineCapLow,'7d',true).families.find(f=>f.id==='transport').rows[3];
 assert.equal(candLow.state,'elevated');assert.equal(candLow.rank,90);
-assert.deepEqual(ui.prepareHeroPlot(baselineCapHigh,'7d',true).families.find(f=>f.id==='transport').rows[3],candLow,'latest UTC interval excluded from baseline');
+const candHigh=ui.prepareHeroPlot(baselineCapHigh,'7d',true).families.find(f=>f.id==='transport').rows[3];
+assert.equal(candHigh.peak,50000);assert.equal(candHigh.peakRatio,10000/50000);
+assert.deepEqual({...candHigh,peak:candLow.peak,peakRatio:candLow.peakRatio},candLow,'latest UTC interval excluded from baseline');
 
 // Duplicate historical rows never inflate baseline denominator or shift ranks.
 const dupBaseline=structuredClone(baselineCapLow);
@@ -2931,7 +2933,7 @@ copyCtrl.app.start();
    const multiDoc=makeAlertDataset(baseDoc,period,states);
    const ctrl=application('?view=overview',multiDoc);
    ctrl.app.start();
-   const links=ctrl.browser.document.querySelectorAll('[data-family-jump]');
+   const links=ctrl.browser.document.querySelectorAll('.hero-alert-link');
    const expectedFams=multiDoc.families.filter((_,i)=>states[i]==='high'||states[i]==='elevated');
    assert.equal(links.length,expectedFams.length,'lists every alerted family without truncation');
    assert.doesNotMatch(ctrl.page.innerHTML,/>\+\d+</,'never truncates extra alerted families with +N');
@@ -3055,7 +3057,7 @@ copyCtrl.app.start();
   const alertDeepDoc=makeAlertDataset(v7NonMidnight,'hour',['high','neutral','neutral','neutral','neutral','neutral']);
   const alertDeepCtrl=application('?view=overview',alertDeepDoc);
   alertDeepCtrl.app.start();
-  const famJumpEl=alertDeepCtrl.browser.document.querySelector('[data-family-jump="transport"]');
+  const famJumpEl=alertDeepCtrl.browser.document.querySelector('.hero-alert-link');
   assert.equal(decode(famJumpEl.textContent.trim()),'01 Connection floods');
   const detailDeepEl=alertDeepCtrl.browser.document.querySelector('.hero-alert-detail');
   assert.ok(detailDeepEl,'hero alert includes sibling Explorer detail link');
@@ -3198,9 +3200,9 @@ copyCtrl.app.start();
   dirRejSer.reference.hour={n:100,current_percentile:95,flat_zero:false,mean_per_relay:0.2,p10_per_relay:0,p50_per_relay:0.1,p90_per_relay:0.5,start:childHeroDoc.reference_window.start,end:childHeroDoc.reference_window.end};
   const childHeroCtrl=application('?view=overview',childHeroDoc);
   childHeroCtrl.app.start();
-  assert.equal(decode(childHeroCtrl.browser.document.querySelector('[data-family-jump="directory"]').textContent.trim()),'03 Directory floods');
+  assert.equal(decode(childHeroCtrl.browser.document.querySelector('.hero-alert-link').textContent.trim()),'03 Directory floods');
   const dirDetailEl=childHeroCtrl.browser.document.querySelector('.hero-alert-detail');
-  assert.match(decode(dirDetailEl.textContent),/^HSDir GET request handling: Descriptor not found · 100th pct \(\+1 more\)$/);
+  assert.match(decode(dirDetailEl.textContent),/^HSDir GET request handling: Descriptor not found · 2,400\/s \(\d+(?:\.\d+)?% of peak\) · 100th pct \(\+1 more\)$/);
   assert.match(inspectHero(childHeroDoc,'24h',['End']).steps[0].tooltipHtml,/03 Directory floods \(high, 100th\) — HSDir GET request handling: Descriptor not found/);
 
   // 3. Hero gauge legend accurately displays left-panel window peak alongside All-time record.
@@ -3310,7 +3312,8 @@ copyCtrl.app.start();
   noReq.current.day={value:5,relays:240,expected_relays:240,coverage:1,valid:true};
   noReq.reference.day={n:100,current_percentile:95,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:flatHrCalloutDoc.reference_window.start,end:flatHrCalloutDoc.reference_window.end};
   const flatHrDirHtml=application('?view=overview',flatHrCalloutDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
-  assert.match(flatHrDirHtml,/Active alert in other series/);
+  assert.match(flatHrDirHtml,/class="card-alert-callout callout-elevated callout-subsided"/);
+  assert.match(flatHrDirHtml,/Recent 24h alert in other series \(normal in last 1h\)/);
   assert.match(flatHrDirHtml,/1h: 0 streams\/s \(flat zero\)/);
   assert.doesNotMatch(flatHrDirHtml,/\b0th pct/);
   const dailyCalloutDoc=makeAlertDataset(v6Data,'day',['neutral','neutral','neutral','neutral','neutral','neutral']);
@@ -3827,6 +3830,258 @@ copyCtrl.app.start();
 
   assert.ok(latestCss.includes('.hero-kpi-grid.hero-kpi-6')&&latestCss.includes('.hero-thresholds-grid')&&latestCss.includes('.incoming-context-card'),
    'stylesheet defines 6-tile KPI grid, thresholds grid, and incoming context card rules');
+
+  // 15. Hero status banner tiers, 24h subsided line, enriched alert bullets, collapsible thresholds below Hero charts, effective policy buckets, 24h vs 1h callouts, plain-English summaries, and CSS rules.
+  const makeStatusDoc=(period='hour',{
+   rateVals={},ratePeaks={},rateRefs={},rateRankN=120,rateBaselineVals=null,includeHsdir=false,
+  }={})=>{
+   const doc=makeAlertDataset(period==='hour'?v7NonMidnight:v6Data,period,Array(v7NonMidnight.families.length).fill('neutral'));
+   const dayEnd=Math.floor(doc.end/86400)*86400;
+   for(const c of doc.charts)if(c.kind.startsWith('counter_'))for(const s of c.series){
+    const key=`${c.id}:${s.key}`,v=Object.hasOwn(rateVals,key)?rateVals[key]:0;
+    const pk=Object.hasOwn(ratePeaks,key)?ratePeaks[key]:(v>0?v:0);
+    if(period==='hour'){
+     s.values=s.values.map(([t],i)=>[t,i===23?v:0]);
+     s.hourly_relays=s.hourly_relays.map(([t])=>[t,240]);
+     s.hourly_expected_relays=s.hourly_expected_relays.map(([t])=>[t,240]);
+     const baseSeries=rateBaselineVals?.[key];
+     s.history.sampled_hour=Array.from({length:rateRankN},(_,k)=>[doc.reference_window.start+(k+1)*21600,baseSeries?baseSeries[k]:0,240,1,true]);
+     s.current.hour={value:v,relays:240,expected_relays:240,coverage:1,valid:true};
+     s.peaks.hour={fleet_peak:pk,fleet_peak_at:doc.end-3600,fleet_peak_relays:240,current_is_record:false};
+     s.reference.hour=rateRefs[key]||{n:rateRankN,current_percentile:0,flat_zero:v===0&&!baseSeries,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:doc.reference_window.start,end:doc.reference_window.end};
+     s.current.day={value:0,relays:240,expected_relays:240,coverage:1,valid:true};
+     s.reference.day={n:120,current_percentile:0,flat_zero:true,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:doc.reference_window.start,end:doc.reference_window.end};
+    }else{
+     const baseSeries=rateBaselineVals?.[key];
+     s.history.daily=Array.from({length:rateRankN},(_,k)=>[doc.reference_window.start+(k+1)*86400,baseSeries?baseSeries[k]:0,240,1,true]);
+     s.history.daily.push([dayEnd,v,240,1,true]);
+     s.current.day={value:v,relays:240,expected_relays:240,coverage:1,valid:true};
+     s.peaks.day={fleet_peak:pk,fleet_peak_at:dayEnd-86400,fleet_peak_relays:240,current_is_record:false};
+     s.reference.day=rateRefs[key]||{n:rateRankN,current_percentile:0,flat_zero:v===0&&!baseSeries,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:doc.reference_window.start,end:doc.reference_window.end};
+    }
+   }
+   if(!includeHsdir){
+    for(const s of chart('directory_requests',doc).series)if(s.key==='hs_get'||s.key==='hs_post'){
+     if(s.current.hour)s.current.hour.value=0;
+     s.current.day.value=0;
+    }
+   }
+   return doc;
+  };
+
+  // 15a. Quiet status banner + placement between heroDesc and hero-kpi-grid + plain-English heroDesc & family summaries.
+  const quietDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':12},
+   ratePeaks:{'transport_rejections:conn_rejected':1200},
+   rateBaselineVals:{'transport_rejections:conn_rejected':Array.from({length:120},(_,k)=>k===0?1200:50)},
+   rateRefs:{'transport_rejections:conn_rejected':{n:120,current_percentile:25,flat_zero:false,mean_per_relay:0.2,p10_per_relay:0.1,p50_per_relay:0.2,p90_per_relay:0.4,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end}},
+  });
+  const quietCtrl=application('?view=overview',quietDoc);
+  quietCtrl.app.start();
+  const quietHtml=quietCtrl.page.innerHTML;
+  assert.match(quietHtml,/Live overview of flood traffic stopped by 1AEO relays, active DoS alert families, and open circuit or directory connection load\./);
+  assert.match(quietHtml,/class="hero-status-banner status-quiet"[\s\S]*class="hero-status-badge" title="[^"]*&lt;5% localized[^"]*">Quiet<\/span>/);
+  assert.match(quietHtml,/class="hero-status-text">Last hour: no DoS alert families triggered \(0 of 5 ≥90th pct\); composite mitigated rate is 12 events\/s \(1% of peak\)\.</);
+  assert.ok(quietHtml.indexOf('Live overview of flood traffic') < quietHtml.indexOf('class="hero-status-banner')
+   && quietHtml.indexOf('class="hero-status-banner') < quietHtml.indexOf('class="hero-kpi-grid'),
+   'hero status banner renders below heroDesc and above hero-kpi-grid');
+  const dailyQuietHtml=application('?view=overview',makeStatusDoc('day')).app.markup();
+  assert.match(dailyQuietHtml,/Daily overview of flood traffic stopped by 1AEO relays, active DoS alert families, and open circuit or directory connection load\./);
+  for(const fam of quietDoc.families){
+   const famCardHtml=quietHtml.match(new RegExp(`<article id="family-${fam.id}"[\\s\\S]*?</article>`))[0];
+   assert.ok(famCardHtml.includes(`<p class="definition">${ui.FAMILY_PLAIN_SUMMARIES[fam.id]}</p>`),`${fam.id} renders plain-English summary`);
+   assert.match(famCardHtml,/<p class="definition-detail">[^<]+<\/p>/,`${fam.id} renders technical definition-detail`);
+  }
+  const unmappedFamDoc=structuredClone(quietDoc);
+  unmappedFamDoc.families[5].id='custom_exit';
+  for(const cid of unmappedFamDoc.families[5].children)chart(cid,unmappedFamDoc).family_id='custom_exit';
+  const unmappedCardHtml=application('?view=overview',unmappedFamDoc).app.markup().match(/<article id="family-custom_exit"[\s\S]*?<\/article>/)[0];
+  assert.doesNotMatch(unmappedCardHtml,/class="definition-detail"/,'unmapped family falls back to single definition paragraph');
+
+  // 15b. Localized activity (<5% of peak at 99th pct with neutral composite) + clickable jump link + Hero alert bullet rate & % of peak.
+  const locDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':62,'introduction_rejections:introduction_rejections':0},
+   ratePeaks:{'transport_rejections:conn_rejected':10689},
+   rateBaselineVals:{
+    'transport_rejections:conn_rejected':Array.from({length:120},(_,k)=>k===119?12000:10),
+    'introduction_rejections:introduction_rejections':Array.from({length:120},()=>500),
+   },
+   rateRefs:{'transport_rejections:conn_rejected':{n:120,current_percentile:99,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end}},
+  });
+  const locCtrl=application('?view=overview',locDoc);
+  locCtrl.app.start();
+  const locHtml=locCtrl.page.innerHTML;
+  assert.match(locHtml,/class="hero-status-banner status-localized"[\s\S]*class="hero-status-badge"[^>]*>Localized activity<\/span>/);
+  assert.match(locHtml,/Small localized activity in <a class="hero-status-jump" href="#family-transport" data-family-jump="transport">Connection floods<\/a> \(62\/s · 0\.58% of peak · 99th pct\); composite mitigated rate is 62 events\/s \(0\.5% of peak\)\./);
+  assert.equal(decode(locCtrl.browser.document.querySelector('.hero-alert-detail').textContent),'Connection-rate rule · 62/s (0.58% of peak) · 99th pct');
+  const locJump=locCtrl.browser.document.querySelector('.hero-status-jump');
+  locCtrl.events.get('click')({target:locJump,button:0,preventDefault(){}});
+  assert.equal(locCtrl.browser.location.hash,'#family-transport');
+  assert.equal(locCtrl.browser.document.activeElement.getAttribute('id'),'family-transport');
+
+  // 15c. Elevated flood activity: (a) 2 families at >=2% (<5%) overrides localized even with neutral composite; (b) 99th pct at 10% (<25%) with neutral composite is elevated, not surge.
+  const multiSmallDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':30,'circuit_rejections:circuit_rejections':10,'introduction_rejections:introduction_rejections':0},
+   ratePeaks:{'transport_rejections:conn_rejected':1000,'circuit_rejections:circuit_rejections':1000},
+   rateBaselineVals:{
+    'introduction_rejections:introduction_rejections':Array.from({length:120},()=>500),
+   },
+   rateRefs:{
+    'transport_rejections:conn_rejected':{n:120,current_percentile:92,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.1,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+    'circuit_rejections:circuit_rejections':{n:120,current_percentile:93,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.1,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+   },
+  });
+  assert.match(application('?view=overview',multiSmallDoc).app.markup(),/class="hero-status-banner status-elevated"[\s\S]*>Elevated flood activity<\/span>/);
+
+  const highSmallPeakDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':100,'introduction_rejections:introduction_rejections':0},
+   ratePeaks:{'transport_rejections:conn_rejected':1000},
+   rateBaselineVals:{'introduction_rejections:introduction_rejections':Array.from({length:120},()=>500)},
+   rateRefs:{'transport_rejections:conn_rejected':{n:120,current_percentile:99,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end}},
+  });
+  assert.match(application('?view=overview',highSmallPeakDoc).app.markup(),/class="hero-status-banner status-elevated"[\s\S]*>Elevated flood activity<\/span>/);
+
+  // 15d. Active surge (99th pct + >=25% & <50% peak) vs Severe surge (>=50% peak, or >=2 high alerts >=25%, or composite >=50%).
+  const activeSurgeDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':300},
+   ratePeaks:{'transport_rejections:conn_rejected':1000},
+   rateBaselineVals:{'transport_rejections:conn_rejected':Array.from({length:120},(_,k)=>k===119?1000:5)},
+   rateRefs:{'transport_rejections:conn_rejected':{n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end}},
+  });
+  assert.match(application('?view=overview',activeSurgeDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Active surge<\/span>[\s\S]*Active surge in <a class="hero-status-jump"[^>]*>Connection floods<\/a>/);
+
+  const severeOneDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':550},
+   ratePeaks:{'transport_rejections:conn_rejected':1000},
+   rateBaselineVals:{'transport_rejections:conn_rejected':Array.from({length:120},(_,k)=>k>=119?550:5)},
+   rateRefs:{'transport_rejections:conn_rejected':{n:120,current_percentile:100,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end}},
+  });
+  assert.match(application('?view=overview',severeOneDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Severe surge<\/span>[\s\S]*Severe surge in <a class="hero-status-jump"[^>]*>Connection floods<\/a>/);
+
+  const severeMultiDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':300,'circuit_rejections:circuit_rejections':100},
+   ratePeaks:{'transport_rejections:conn_rejected':1000,'circuit_rejections:circuit_rejections':1000},
+   rateBaselineVals:{
+    'transport_rejections:conn_rejected':Array.from({length:120},(_,k)=>k===119?1200:5),
+    'circuit_rejections:circuit_rejections':Array.from({length:120},(_,k)=>k===119?1200:5),
+   },
+   rateRefs:{
+    'transport_rejections:conn_rejected':{n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+    'circuit_rejections:circuit_rejections':{n:120,current_percentile:99.2,flat_zero:false,mean_per_relay:0.1,p10_per_relay:0,p50_per_relay:0.05,p90_per_relay:0.2,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end},
+   },
+  });
+  assert.match(application('?view=overview',severeMultiDoc).app.markup(),/class="hero-status-banner status-high"[\s\S]*>Severe surge<\/span>/);
+
+  // 15e. Unavailable status banner when no alert series and no total rate are measured.
+  assert.match(empty24Kpi,/class="hero-status-banner status-unknown"[\s\S]*>Unavailable<\/span>[\s\S]*no current flood-rate or family alert measurements are available/);
+
+  // 15f. Queue-limit /h scaling in Hero alert bullet & status banner, plus graceful omission of (% of peak) when peak === 0.
+  const queueAlertDoc=makeStatusDoc('hour',{
+   rateVals:{'queue_limit_circuits:circuit_killed_max_cell':0.5},
+   ratePeaks:{'queue_limit_circuits:circuit_killed_max_cell':2},
+   rateBaselineVals:{'queue_limit_circuits:circuit_killed_max_cell':Array.from({length:120},(_,k)=>k>=119?1:0.05)},
+   rateRefs:{'queue_limit_circuits:circuit_killed_max_cell':{n:120,current_percentile:99,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end}},
+  });
+  const queueHtml=application('?view=overview',queueAlertDoc).app.markup();
+  assert.match(queueHtml,/Cell &amp; buffer pressure<\/a> \(1,800\/h · 25% of peak · 99th pct\)/);
+  assert.match(queueHtml,/class="hero-alert-detail"[^>]*>All queue-limit hits · 1,800\/h \(25% of peak\) · 99th pct</);
+
+  const zeroPeakAlertDoc=makeStatusDoc('hour',{
+   rateVals:{'transport_rejections:conn_rejected':0},
+   ratePeaks:{'transport_rejections:conn_rejected':0},
+   rateRefs:{'transport_rejections:conn_rejected':{n:120,current_percentile:95,flat_zero:false,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:v7NonMidnight.reference_window.start,end:v7NonMidnight.reference_window.end}},
+  });
+  const zeroPeakHtml=application('?view=overview',zeroPeakAlertDoc).app.markup();
+  assert.match(zeroPeakHtml,/class="hero-alert-detail"[^>]*>Connection-rate rule · 0\/s · 95th pct</);
+  assert.doesNotMatch(zeroPeakHtml,/class="hero-alert-detail"[^>]*>[^<]*of peak/);
+
+  // 15g. Earlier in last 24h (normal in last 1h) subsided line on 24h view (and omitted on 7d).
+  const subsidedBannerDoc=structuredClone(quietDoc);
+  chart('directory_rejections',subsidedBannerDoc).series[0].current.day={value:20,relays:240,expected_relays:240,coverage:1,valid:true};
+  chart('directory_rejections',subsidedBannerDoc).series[0].reference.day={n:120,current_percentile:96,flat_zero:false,mean_per_relay:0.05,p10_per_relay:0,p50_per_relay:0.02,p90_per_relay:0.05,start:subsidedBannerDoc.reference_window.start,end:subsidedBannerDoc.reference_window.end};
+  chart('exit_stream_rejections',subsidedBannerDoc).series[0].current.day={value:5,relays:240,expected_relays:240,coverage:1,valid:true};
+  chart('exit_stream_rejections',subsidedBannerDoc).series[0].reference.day={n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:subsidedBannerDoc.reference_window.start,end:subsidedBannerDoc.reference_window.end};
+  const sub24Html=application('?view=overview',subsidedBannerDoc).app.markup();
+  assert.match(sub24Html,/class="hero-status-subsided">Earlier in last 24h \(normal in last 1h\): <a href="#family-directory" data-family-jump="directory">Directory floods<\/a>, <a href="#family-exit" data-family-jump="exit">Exit streams &amp; DNS<\/a><\/div>/);
+  assert.doesNotMatch(application('?view=overview&hero_range=7d',subsidedBannerDoc).app.markup(),/hero-status-subsided/);
+
+  // 15h. Collapsible <details class="hero-thresholds"> placed inside <figure> after .hero-panels, with 1-line summary + effective DoSBeginDir* / HSDirOneRequestPerCircuit / DoSConnectionConnectDefenseTimePeriod buckets.
+  assert.ok(fullOvHtml.indexOf('class="hero-panels"') < fullOvHtml.indexOf('<details class="hero-thresholds"')
+   && fullOvHtml.indexOf('<details class="hero-thresholds"') < fullOvHtml.indexOf('<figcaption>'),
+   'collapsible thresholds section renders inside <figure> below .hero-panels and before <figcaption>');
+  assert.match(fullOvHtml,/class="hero-thresholds-summary"[\s\S]*class="hero-thresholds-summary-label">Thresholds &amp; alert cutoffs<\/span><span class="hero-thresholds-summary-line">Conn: 100\/IP \| Circuits: burst 90 \| BeginDir: 5\/s \| Alerts: ≥90th \([^)]+\)<\/span><span class="hero-thresholds-summary-toggle">Details · 4 settings<\/span>/);
+  assert.match(quietHtml,/class="hero-thresholds-summary-line">Conn: 100\/IP · 20\/s · burst 40\/100 \| Circuits: 3\/s · burst 90\/200 \| BeginDir: 10\/s · burst 60\/100 \| Alerts: ≥90th \([^)]+\) · ≥99th \([^)]+\)<\/span>/);
+  assert.match(legacy4Html,/class="hero-thresholds-summary-toggle">Reference cutoffs<\/span>/);
+
+  const policyDoc=structuredClone(fullHeroDoc);
+  policyDoc.dos_thresholds={
+   as_of:policyDoc.end,
+   reported_relays:240,
+   settings:[
+    {key:'dosconnectionmaxconcurrentcount',option:'DoSConnectionMaxConcurrentCount',family_id:'transport',unit:'connections/IP',relays:240,suppressed_relays:0,values:[{value:'50',source:'consensus',relays:240}]},
+    {key:'dosconnectionconnectrate',option:'DoSConnectionConnectRate',family_id:'transport',unit:'connections/s',relays:240,suppressed_relays:0,values:[{value:'0',source:'unset',relays:240}]},
+    {key:'dosconnectionconnectburst',option:'DoSConnectionConnectBurst',family_id:'transport',unit:'connections',relays:240,suppressed_relays:0,values:[{value:'40',source:'unset',relays:240}]},
+    {key:'dosconnectiondefensetimeperiod',option:'DoSConnectionConnectDefenseTimePeriod',family_id:'transport',unit:'seconds',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+    {key:'doscircuitcreationrate',option:'DoSCircuitCreationRate',family_id:'circuits',unit:'circuits/s',relays:240,suppressed_relays:0,values:[{value:'2',source:'consensus',relays:240}]},
+    {key:'doscircuitcreationburst',option:'DoSCircuitCreationBurst',family_id:'circuits',unit:'circuits',relays:240,suppressed_relays:0,values:[{value:'60',source:'consensus',relays:200},{value:'20',source:'torrc',relays:40}]},
+    {key:'dosbegindirrateenabled',option:'DoSBeginDirRateEnabled',family_id:'directory',unit:'mode',relays:240,suppressed_relays:0,values:[{value:'1',source:'unset',relays:240}]},
+    {key:'dosbegindirlimitenabled',option:'DoSBeginDirLimitEnabled',family_id:'directory',unit:'mode',relays:240,suppressed_relays:0,values:[{value:'0',source:'unset',relays:240}]},
+    {key:'dosbegindirrate',option:'DoSBeginDirRate',family_id:'directory',unit:'requests/s',relays:240,suppressed_relays:0,values:[{value:'10',source:'unset',relays:240}]},
+    {key:'dosbegindirburst',option:'DoSBeginDirBurst',family_id:'directory',unit:'requests',relays:240,suppressed_relays:0,values:[{value:'60',source:'unset',relays:240}]},
+    {key:'dosbegindirdefensetype',option:'DoSBeginDirDefenseType',family_id:'directory',unit:'mode',relays:240,suppressed_relays:0,values:[{value:'3',source:'unset',relays:240}]},
+    {key:'hsdironerequestpercircuit',option:'HSDirOneRequestPerCircuit',family_id:'directory',unit:'flag',relays:240,suppressed_relays:0,values:[{value:'1',source:'observed',relays:240}]},
+   ],
+  };
+  const policyHtml=application('?view=overview',policyDoc).app.markup();
+  assert.match(policyHtml,/class="hero-thresholds-summary-line">Conn: 50\/IP · 20\/s · burst 40 \| Circuits: 2\/s · burst 60\/20 \| BeginDir: 10\/s · burst 60 \| Alerts: /);
+  assert.match(policyHtml,/class="hero-thresholds-summary-toggle">Details · 12 settings<\/span>/);
+  assert.match(policyHtml,/DoSConnectionConnectRate[\s\S]*20 connections\/s <span class="threshold-source">\(Tor default\)<\/span>/);
+  assert.match(policyHtml,/DoSConnectionConnectDefenseTimePeriod[\s\S]*86,400 seconds <span class="threshold-source" title="[^"]*base 86,400s \(24h\)[^"]*">\(24h · Tor default\)<\/span>/);
+  assert.match(policyHtml,/DoSBeginDirRateEnabled[\s\S]*1 <span class="threshold-source">\(enabled · Tor default\)<\/span>/);
+  assert.match(policyHtml,/DoSBeginDirLimitEnabled[\s\S]*0 <span class="threshold-source">\(disabled · Tor default\)<\/span>/);
+  assert.match(policyHtml,/DoSBeginDirRate[\s\S]*10 requests\/s <span class="threshold-source">\(Tor default\)<\/span>/);
+  assert.match(policyHtml,/DoSBeginDirBurst[\s\S]*60 requests <span class="threshold-source">\(Tor default\)<\/span>/);
+  assert.match(policyHtml,/DoSBeginDirDefenseType[\s\S]*3 <span class="threshold-source">\(close circuit · Tor default\)<\/span>/);
+  assert.match(policyHtml,/HSDirOneRequestPerCircuit[\s\S]*1 <span class="threshold-source">\(always on\)<\/span>/);
+
+  const splitHsdirPolicyDoc=structuredClone(policyDoc);
+  splitHsdirPolicyDoc.dos_thresholds.settings=[
+   {key:'hsdironerequestpercircuit',option:'HSDirOneRequestPerCircuit',family_id:'directory',unit:'flag',relays:240,suppressed_relays:0,values:[{value:'1',source:'observed',relays:200},{value:'0',source:'torrc',relays:40}]},
+   {key:'dosconnectionconnectdefensealias',option:'DoSConnectionConnectDefenseTimePeriod',family_id:'transport',unit:'seconds',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+  ];
+  const splitHsdirHtml=application('?view=overview',splitHsdirPolicyDoc).app.markup();
+  assert.match(splitHsdirHtml,/HSDirOneRequestPerCircuit[\s\S]*1 <span class="threshold-source">\(always on: 200\)<\/span> · 0 <span class="threshold-source">\(torrc: 40\)<\/span>/);
+  assert.match(splitHsdirHtml,/DoSConnectionConnectDefenseTimePeriod[\s\S]*86,400 seconds[\s\S]*\(24h · Tor default\)/);
+
+  // 15i. 24h-only vs 1h unavailable familyAlertCallout titles & callout-subsided class.
+  const childSubsidedDoc=structuredClone(flatHrCalloutDoc);
+  for(const c of childSubsidedDoc.charts)for(const s of c.series){
+   if(s.current.hour)s.current.hour={value:0,relays:240,expected_relays:240,coverage:1,valid:true};
+   if(s.reference.hour)s.reference.hour={n:100,current_percentile:10,flat_zero:false,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:childSubsidedDoc.reference_window.start,end:childSubsidedDoc.reference_window.end};
+  }
+  chart('directory_requests',childSubsidedDoc).series.find(s=>s.key==='no_request').reference.day={n:100,current_percentile:10,flat_zero:false,mean_per_relay:0,p10_per_relay:0,p50_per_relay:0,p90_per_relay:0,start:childSubsidedDoc.reference_window.start,end:childSubsidedDoc.reference_window.end};
+  const dirRejSub=chart('directory_rejections',childSubsidedDoc).series[0];
+  dirRejSub.current.day={value:10,relays:240,expected_relays:240,coverage:1,valid:true};
+  dirRejSub.reference.day={n:120,current_percentile:99.5,flat_zero:false,mean_per_relay:0.01,p10_per_relay:0,p50_per_relay:0.01,p90_per_relay:0.02,start:childSubsidedDoc.reference_window.start,end:childSubsidedDoc.reference_window.end};
+  const childSubHtml=application('?view=overview',childSubsidedDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  assert.match(childSubHtml,/class="card-alert-callout callout-high callout-subsided"/);
+  assert.match(childSubHtml,/Recent 24h alert in child chart \(normal in last 1h\)/);
+  const unavailHrSubDoc=structuredClone(childSubsidedDoc);
+  for(const s of chart('directory_rejections',unavailHrSubDoc).series)if(s.current.hour)s.current.hour={value:null,relays:0,expected_relays:240,coverage:0,valid:false};
+  const unavailSubHtml=application('?view=overview',unavailHrSubDoc).app.markup().match(/<article id="family-directory"[\s\S]*?<\/article>/)[0];
+  assert.match(unavailSubHtml,/class="card-alert-callout callout-high callout-subsided"/);
+  assert.match(unavailSubHtml,/Recent 24h alert in child chart \(last 1h unavailable\)/);
+
+  // 15j. Stylesheet contains status banner, collapsible thresholds, subsided callout, definition-detail, and responsive rules.
+  for(const cls of [
+   '.hero-status-banner','.status-quiet','.status-localized','.status-elevated','.status-high','.status-unknown',
+   '.hero-status-badge','.hero-status-text','.hero-status-subsided',
+   '.hero-thresholds-summary','.hero-thresholds[open]','.callout-subsided','.definition-detail',
+  ]){
+   assert.ok(latestCss.includes(cls),`stylesheet includes ${cls}`);
+  }
+  assert.ok(cssMobTail.includes('.hero-thresholds-summary')&&cssMobTail.includes('.hero-status-banner')&&cssMobTail.includes('.hero-controls'),
+   'mobile <=600px media query wraps status banner, thresholds summary, and hero controls');
  }finally{
   globalThis.setTimeout=origSetTimeout;
  }

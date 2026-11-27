@@ -129,6 +129,12 @@ _ATTESTED_BUILD_RE = re.compile(r'attested-(?:[0-9]+_){3}[0-9]+')
 _TOR_VERSION_RE = re.compile(r'[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
 _DOS_DIGITS_RE = re.compile(r'[0-9]{1,8}\Z')
 _BEGINDIR_VAL_RE = re.compile(r'(?:auto|[0-9]{1,8})\Z')
+_BEGINDIR_POLICY_SOURCE_MAP = {
+    'configuration': 'torrc',
+    'consensus_parameter': 'consensus',
+    'binary_default_after_consensus': 'unset',
+    'binary_always_on': 'observed',
+}
 
 
 class CollectionError(ValueError):
@@ -974,10 +980,14 @@ class Collector:
             metric = row['metric']
             option = metric.get('option')
             val = metric.get('value')
+            raw_source = metric.get('source')
             _require(isinstance(option, str) and option in bg_buckets, 'Unexpected BeginDir config option')
             _require(isinstance(val, str) and _BEGINDIR_VAL_RE.fullmatch(val), 'Unexpected BeginDir config value')
+            _require(isinstance(raw_source, str) and raw_source in _BEGINDIR_POLICY_SOURCE_MAP,
+                     'Unexpected BeginDir config source')
+            mapped_source = _BEGINDIR_POLICY_SOURCE_MAP[raw_source]
             cnt = number(row['values'][0][1], count=True)
-            bg_buckets[option][(val, 'observed')] += cnt
+            bg_buckets[option][(val, mapped_source)] += cnt
             bg_raw_totals[option] += cnt
 
         settings = []

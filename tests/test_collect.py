@@ -250,8 +250,16 @@ def _snapshot_handlers(seed, routes, *, live_native=None, rate_val=2.0):
             eff_labels[key] = '1'
         handlers[routes['dos.effective_config']] = lambda t, lbl=eff_labels: [(dict(lbl), native_pop)]
     if 'dos.begindir_config' in routes:
+        bg_defaults = {
+            'DoSBeginDirLimitEnabled': ('consensus_parameter', '1'),
+            'DoSBeginDirRateEnabled': ('binary_default_after_consensus', '1'),
+            'DoSBeginDirRate': ('configuration', '10'),
+            'DoSBeginDirBurst': ('binary_default_after_consensus', '60'),
+            'DoSBeginDirDefenseType': ('consensus_parameter', '3'),
+            'HSDirOneRequestPerCircuit': ('binary_always_on', '1'),
+        }
         handlers[routes['dos.begindir_config']] = lambda t: [
-            ({'option': opt, 'value': 'auto' if opt.endswith('Enabled') else '10'}, seed['defense'])
+            ({'option': opt, 'source': bg_defaults[opt][0], 'value': bg_defaults[opt][1]}, seed['defense'])
             for _, opt, _, _ in collector.DOS_BEGINDIR_CONFIG_SETTINGS
         ]
     return handlers
@@ -2647,14 +2655,17 @@ class CollectorTests(unittest.TestCase):
         ]
         # Total = 234 -> coarsen_count(234) = 232!
         handlers[routes['dos.begindir_config']] = lambda t: [
-            ({'option': 'DoSBeginDirRateEnabled', 'value': 'auto'}, 72),
-            ({'option': 'DoSBeginDirRateEnabled', 'value': '1'}, 5),
-            ({'option': 'DoSBeginDirRateEnabled', 'value': '0'}, 3),
-            ({'option': 'DoSBeginDirRate', 'value': '10'}, 64),
-            ({'option': 'DoSBeginDirRate', 'value': '20'}, 16),
+            ({'option': 'DoSBeginDirLimitEnabled', 'source': 'consensus_parameter', 'value': '1'}, 64),
+            ({'option': 'DoSBeginDirLimitEnabled', 'source': 'configuration', 'value': '0'}, 16),
+            ({'option': 'DoSBeginDirRateEnabled', 'source': 'binary_default_after_consensus', 'value': 'auto'}, 72),
+            ({'option': 'DoSBeginDirRateEnabled', 'source': 'configuration', 'value': '1'}, 5),
+            ({'option': 'DoSBeginDirRateEnabled', 'source': 'consensus_parameter', 'value': '0'}, 3),
+            ({'option': 'DoSBeginDirRate', 'source': 'binary_default_after_consensus', 'value': '10'}, 64),
+            ({'option': 'DoSBeginDirRate', 'source': 'configuration', 'value': '20'}, 16),
             # DoSBeginDirBurst omitted -> 0 relays, [], 0
-            ({'option': 'DoSBeginDirDefenseType', 'value': '2'}, 4),
-            ({'option': 'DoSBeginDirDefenseType', 'value': '1'}, 4),
+            ({'option': 'DoSBeginDirDefenseType', 'source': 'consensus_parameter', 'value': '2'}, 4),
+            ({'option': 'DoSBeginDirDefenseType', 'source': 'configuration', 'value': '1'}, 4),
+            ({'option': 'HSDirOneRequestPerCircuit', 'source': 'binary_always_on', 'value': '1'}, 80),
         ]
 
         with tempfile.TemporaryDirectory() as folder:
@@ -2671,7 +2682,9 @@ class CollectorTests(unittest.TestCase):
             dt = published['dos_thresholds']
             self.assertEqual(dt['as_of'], target_end)
             self.assertEqual(dt['reported_relays'], 232)
+            self.assertEqual(len(dt['settings']), 18)
             by_key = {s['key']: s for s in dt['settings']}
+            self.assertEqual(by_key['dosconnectiondefensetimeperiod']['option'], 'DoSConnectionConnectDefenseTimePeriod')
             self.assertEqual(by_key['dosconnectionenabled']['values'], [
                 {'value': '1', 'source': 'consensus', 'relays': 200},
                 {'value': '0', 'source': 'torrc', 'relays': 24},
@@ -2688,11 +2701,31 @@ class CollectorTests(unittest.TestCase):
                 {'value': '1', 'source': 'consensus', 'relays': 224},
             ])
             self.assertEqual(by_key['dos_num_circ_max_outq']['suppressed_relays'], 8)
+            self.assertEqual(by_key['dosbegindirlimitenabled'], {
+                'key': 'dosbegindirlimitenabled', 'option': 'DoSBeginDirLimitEnabled',
+                'family_id': 'directory', 'unit': 'flag',
+                'relays': 80,
+                'values': [
+                    {'value': '1', 'source': 'consensus', 'relays': 64},
+                    {'value': '0', 'source': 'torrc', 'relays': 16},
+                ],
+                'suppressed_relays': 0,
+            })
             self.assertEqual(by_key['dosbegindirrateenabled']['relays'], 80)
             self.assertEqual(by_key['dosbegindirrateenabled']['values'], [
-                {'value': 'auto', 'source': 'observed', 'relays': 72},
+                {'value': 'auto', 'source': 'unset', 'relays': 72},
             ])
             self.assertEqual(by_key['dosbegindirrateenabled']['suppressed_relays'], 8)
+            self.assertEqual(by_key['dosbegindirrate'], {
+                'key': 'dosbegindirrate', 'option': 'DoSBeginDirRate',
+                'family_id': 'directory', 'unit': 'requests/s',
+                'relays': 80,
+                'values': [
+                    {'value': '10', 'source': 'unset', 'relays': 64},
+                    {'value': '20', 'source': 'torrc', 'relays': 16},
+                ],
+                'suppressed_relays': 0,
+            })
             self.assertEqual(by_key['dosbegindirburst'], {
                 'key': 'dosbegindirburst', 'option': 'DoSBeginDirBurst',
                 'family_id': 'directory', 'unit': 'requests',
@@ -2702,6 +2735,13 @@ class CollectorTests(unittest.TestCase):
                 'key': 'dosbegindirdefensetype', 'option': 'DoSBeginDirDefenseType',
                 'family_id': 'directory', 'unit': 'mode',
                 'relays': 8, 'values': [], 'suppressed_relays': 8,
+            })
+            self.assertEqual(by_key['hsdironerequestpercircuit'], {
+                'key': 'hsdironerequestpercircuit', 'option': 'HSDirOneRequestPerCircuit',
+                'family_id': 'directory', 'unit': 'flag',
+                'relays': 80,
+                'values': [{'value': '1', 'source': 'observed', 'relays': 80}],
+                'suppressed_relays': 0,
             })
 
             # Verify hourly_archive stores and exports dos_thresholds.
@@ -2718,6 +2758,14 @@ class CollectorTests(unittest.TestCase):
             with self.assertRaisesRegex(collector.CollectionError, 'invalid_label_value'):
                 collector.collect(cfg, ROOT, root / 'bad_state', root / 'bad_out.json',
                                   end=target_end + HOUR, source=bad_src, config_path=cfg_file)
+            bad_bg_handlers = dict(handlers)
+            bad_bg_handlers[routes['dos.begindir_config']] = lambda t: [
+                ({'option': 'DoSBeginDirRate', 'source': 'guessed', 'value': '10'}, 16),
+            ]
+            bad_bg_src = SyntheticSource(queries, bad_bg_handlers)
+            with self.assertRaisesRegex(collector.CollectionError, 'invalid_label_value'):
+                collector.collect(cfg, ROOT, root / 'bad_bg_state', root / 'bad_bg_out.json',
+                                  end=target_end + HOUR, source=bad_bg_src, config_path=cfg_file)
             worker_fixture = CollectorFixture()
             worker, cache = worker_fixture.instance(root / 'direct.sqlite3')
             try:
@@ -2731,6 +2779,21 @@ class CollectorTests(unittest.TestCase):
                 ):
                     with self.assertRaisesRegex(collector.CollectionError, 'Unexpected DoS config value'):
                         worker.dos_thresholds(END, 80)
+                for bad_bg_metric in (
+                    {'option': 'DoSBeginDirRate', 'value': '10'},
+                    {'option': 'DoSBeginDirRate', 'source': 'consensus', 'value': '10'},
+                    {'option': 'DoSBeginDirRate', 'source': '', 'value': '10'},
+                ):
+                    with self.subTest(bad_bg_metric=bad_bg_metric), mock.patch.object(
+                        worker, 'endpoint',
+                        side_effect=lambda name, ts, m=bad_bg_metric: (
+                            {'data': {'result': [{'metric': m, 'values': [[ts, '16']]}]}}
+                            if name == 'dos.begindir_config'
+                            else {'data': {'result': []}}
+                        ),
+                    ):
+                        with self.assertRaisesRegex(collector.CollectionError, 'Unexpected BeginDir config source'):
+                            worker.dos_thresholds(END, 80)
             finally:
                 cache.close()
 
