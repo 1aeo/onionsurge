@@ -3752,11 +3752,51 @@ copyCtrl.app.start();
   assert.match(fullOvHtml,/class="hero-thresholds"[\s\S]*<div class="hero-thresholds-grid">/);
   assert.match(fullOvHtml,/Tor trigger thresholds[\s\S]*consensus \/ torrc · 240 relays/);
   assert.match(fullOvHtml,/Connection limits[\s\S]*DoSConnectionMaxConcurrentCount[\s\S]*100 connections[\s\S]*torrc: 160[\s\S]*200 connections[\s\S]*consensus: 72[\s\S]*\+8 other/);
-  assert.match(fullOvHtml,/Circuit creation[\s\S]*DoSCircuitCreationBurst[\s\S]*Tor default \(unset\)/);
+  assert.match(fullOvHtml,/Circuit creation[\s\S]*DoSCircuitCreationBurst[\s\S]*90 circuits[\s\S]*\(Tor default\)/);
   assert.match(fullOvHtml,/Queues &amp; Intro[\s\S]*DoSCircuitMaxCellQueueSize[\s\S]*50000 cells[\s\S]*\(consensus\)/);
   assert.match(fullOvHtml,/Directory \(BEGIN_DIR\)[\s\S]*DoSBeginDirRatePerSec[\s\S]*5 req\/s[\s\S]*\(observed\)/);
   assert.match(fullOvHtml,/Reference rate percentiles[\s\S]*90th \/ 99th pct in events\/s[\s\S]*Composite mitigated rate[\s\S]*90th:[\s\S]*events\/s[\s\S]*99th:[\s\S]*events\/s/);
   assert.match(fullOvHtml,/01 Connection floods · Connection-rate rule[\s\S]*90th:[\s\S]*events\/s/);
+
+  // Compiled Tor defaults render actual fallback values for unset thresholds and DoSBeginDir inherit sentinels.
+  const defThDoc=structuredClone(fullHeroDoc);
+  defThDoc.dos_thresholds={
+   as_of:defThDoc.end,
+   reported_relays:240,
+   settings:[
+    {key:'dosconnectionconnectrate',option:'DoSConnectionConnectRate',family_id:'transport',unit:'connections/s',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+    {key:'dosconnectionconnectburst',option:'DoSConnectionConnectBurst',family_id:'transport',unit:'connections',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+    {key:'dosconnectiondefensetimeperiod',option:'DoSConnectionDefenseTimePeriod',family_id:'transport',unit:'seconds',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+    {key:'doscircuitcreationdefensetimeperiod',option:'DoSCircuitCreationDefenseTimePeriod',family_id:'circuits',unit:'seconds',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+    {key:'dosbegindirrateenabled',option:'DoSBeginDirRateEnabled',family_id:'directory',unit:'mode',relays:240,suppressed_relays:0,values:[{value:'auto',source:'observed',relays:240}]},
+    {key:'dosbegindirrate',option:'DoSBeginDirRate',family_id:'directory',unit:'requests/s',relays:240,suppressed_relays:0,values:[{value:'0',source:'observed',relays:240}]},
+    {key:'dosbegindirburst',option:'DoSBeginDirBurst',family_id:'directory',unit:'requests',relays:240,suppressed_relays:0,values:[{value:'0',source:'observed',relays:240}]},
+    {key:'dosbegindirdefensetype',option:'DoSBeginDirDefenseType',family_id:'directory',unit:'mode',relays:240,suppressed_relays:0,values:[{value:'0',source:'observed',relays:240}]},
+    {key:'dosfuturemystery',option:'DoSFutureMystery',family_id:'transport',unit:'connections',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:240}]},
+   ],
+  };
+  const defThHtml=application('?view=overview',defThDoc).app.markup();
+  assert.match(defThHtml,/DoSConnectionConnectRate[\s\S]*20 connections\/s <span class="threshold-source">\(Tor default\)<\/span>/);
+  assert.match(defThHtml,/DoSConnectionConnectBurst[\s\S]*40 connections <span class="threshold-source">\(Tor default\)<\/span>/);
+  assert.match(defThHtml,/DoSConnectionDefenseTimePeriod[\s\S]*86,400 seconds <span class="threshold-source" title="[^"]*base 86,400s \(24h\)[^"]*">\(24h · Tor default\)<\/span>/);
+  assert.match(defThHtml,/DoSCircuitCreationDefenseTimePeriod[\s\S]*3,600 seconds <span class="threshold-source" title="[^"]*base 3,600s \(1h\)[^"]*">\(1h · Tor default\)<\/span>/);
+  assert.match(defThHtml,/DoSBeginDirRateEnabled[\s\S]*auto <span class="threshold-source" title="[^"]*">\(observed · consensus \/ Tor default: 1, enabled\)<\/span>/);
+  assert.match(defThHtml,/DoSBeginDirRate[\s\S]*0 <span class="threshold-source" title="[^"]*">\(observed · consensus \/ Tor default: 10 requests\/s\)<\/span>/);
+  assert.doesNotMatch(defThHtml,/<span class="hero-threshold-key">DoSBeginDirRate<\/span><span class="hero-threshold-val">0 requests\/s/);
+  assert.match(defThHtml,/DoSBeginDirBurst[\s\S]*0 <span class="threshold-source" title="[^"]*">\(observed · consensus \/ Tor default: 60 requests\)<\/span>/);
+  assert.match(defThHtml,/DoSBeginDirDefenseType[\s\S]*0 <span class="threshold-source" title="[^"]*">\(observed · consensus \/ Tor default: 3, close circuit\)<\/span>/);
+  assert.match(defThHtml,/DoSFutureMystery[\s\S]*Tor default \(unset\)/);
+
+  const splitThDoc=structuredClone(defThDoc);
+  splitThDoc.dos_thresholds.settings=[
+   {key:'dosconnectionconnectrate',option:'DoSConnectionConnectRate',family_id:'transport',unit:'connections/s',relays:240,suppressed_relays:0,values:[{value:'unset',source:'unset',relays:224},{value:'30',source:'torrc',relays:16}]},
+   {key:'dosbegindirrateenabled',option:'DoSBeginDirRateEnabled',family_id:'directory',unit:'mode',relays:240,suppressed_relays:0,values:[{value:'0',source:'observed',relays:240}]},
+  ];
+  const splitThHtml=application('?view=overview',splitThDoc).app.markup();
+  assert.match(splitThHtml,/DoSConnectionConnectRate[\s\S]*20 connections\/s <span class="threshold-source">\(Tor default: 224\)<\/span> · 30 connections\/s <span class="threshold-source">\(torrc: 16\)<\/span>/);
+  assert.match(splitThHtml,/DoSBeginDirRateEnabled[\s\S]*0 <span class="threshold-source">\(observed\)<\/span>/);
+  assert.doesNotMatch(splitThHtml,/DoSBeginDirRateEnabled[\s\S]*consensus \/ Tor default/);
+  assert.equal(ui.TOR_DOS_DEFAULTS.dosconnectiondefensetimeperiod.value,'86400');
 
   // Unequal-population rateRank & p90Fleet use the same population-weighted composite statistic.
   const skewDoc=structuredClone(v7NonMidnight);
